@@ -66,11 +66,15 @@ Optional serial auto-configuration through CH340 requires `pyserial`:
 python3 -m pip install pyserial
 python3 tools/aiwb2_net_tool.py configure-at \
   --serial-port /dev/cu.wchusbserialXXXX \
-  --ssid misakachiyo3 \
-  --password stm32h743vit6 \
-  --pc-ip 192.168.223.205 \
+  --ssid YOUR_WIFI_SSID \
+  --password YOUR_WIFI_PASSWORD \
+  --pc-ip YOUR_PC_LAN_IP \
   --pc-port 6666
 ```
+
+For local convenience, `configure-at` and the loop test also read
+`AIWB2_WIFI_SSID`, `AIWB2_WIFI_PASSWORD`, and `AIWB2_TCP_PORT` from the
+environment. Do not commit real WiFi credentials.
 
 ## VOFA bridge
 

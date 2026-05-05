@@ -1,6 +1,9 @@
 #include "bsp_uart.h"
 
+#include "bsp_led.h"
 #include "usart.h"
+
+static volatile uint32_t bsp_uart_usart1_tx_count;
 
 void BSP_UART_Release_USART1_ForExternalDebug(void)
 {
@@ -23,6 +26,13 @@ HAL_StatusTypeDef BSP_UART_Transmit_USART1(const uint8_t *data,
         return HAL_OK;
     }
 
+    ++bsp_uart_usart1_tx_count;
+    BSP_LED_On(LED_1);
     return HAL_UART_Transmit(&huart1, (uint8_t *)data, length, timeout_ms);
 #endif
+}
+
+uint32_t BSP_UART_GetUSART1TxCount(void)
+{
+    return bsp_uart_usart1_tx_count;
 }

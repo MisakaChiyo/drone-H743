@@ -9,11 +9,29 @@ This script treats the CH340 serial port as the MCU side and verifies:
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import threading
 import time
 
 import serial
+
+
+DEFAULT_WIFI_SSID = os.getenv("AIWB2_WIFI_SSID")
+DEFAULT_WIFI_PASSWORD = os.getenv("AIWB2_WIFI_PASSWORD")
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+DEFAULT_TCP_PORT = env_int("AIWB2_TCP_PORT", 6666)
 
 
 def read_idle(port: serial.Serial, idle_s: float = 0.5, total_s: float = 8.0) -> bytes:
@@ -65,7 +83,6 @@ def configure_module(port: serial.Serial, ssid: str, password: str, pc_ip: str, 
         ("AT+WAUTOCONN=1", 2.0),
         (f"AT+SOCKETAUTOTT=4,{pc_ip},{pc_port}", 3.0),
         ("AT+SOCKETDEL=1", 2.0),
-        ("AT+RST", 6.0),
     ]
     for command, timeout_s in commands:
         response = send_at(port, command, total_s=timeout_s)
@@ -114,10 +131,14 @@ def read_serial_until_contains(port: serial.Serial, needle: bytes, timeout_s: fl
 def main() -> int:
     parser = argparse.ArgumentParser(description="Ai-WB2 TCP transparent-mode loop test")
     parser.add_argument("--serial-port", required=True)
-    parser.add_argument("--ssid", required=True)
-    parser.add_argument("--password", required=True)
+    parser.add_argument("--ssid",
+                        default=DEFAULT_WIFI_SSID,
+                        required=DEFAULT_WIFI_SSID is None)
+    parser.add_argument("--password",
+                        default=DEFAULT_WIFI_PASSWORD,
+                        required=DEFAULT_WIFI_PASSWORD is None)
     parser.add_argument("--pc-ip", required=True)
-    parser.add_argument("--pc-port", type=int, default=6667)
+    parser.add_argument("--pc-port", type=int, default=DEFAULT_TCP_PORT)
     parser.add_argument("--baud", type=int, default=115200)
     args = parser.parse_args()
 
@@ -134,6 +155,8 @@ def main() -> int:
         server.listen(1)
         print(f"TCP server listening on 0.0.0.0:{args.pc_port}")
 
+        print(">>> AT+RST")
+        print(send_at(port, "AT+RST", total_s=6.0) or "<empty>")
         client = wait_for_client(server, timeout_s=25.0)
         try:
             port.reset_input_buffer()

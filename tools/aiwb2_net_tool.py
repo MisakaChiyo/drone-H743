@@ -9,11 +9,30 @@ to the module, and optionally configure the module over a CH340 serial port.
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import sys
 import threading
 import time
 from dataclasses import dataclass
+
+
+DEFAULT_WIFI_SSID = os.getenv("AIWB2_WIFI_SSID")
+DEFAULT_WIFI_PASSWORD = os.getenv("AIWB2_WIFI_PASSWORD")
+DEFAULT_MODULE_IP = os.getenv("AIWB2_MODULE_IP", "192.168.223.181")
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+DEFAULT_TCP_PORT = env_int("AIWB2_TCP_PORT", 6666)
 
 
 def local_ip_for(target_ip: str) -> str:
@@ -209,7 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_ip = sub.add_parser("ip", help="print the PC IP selected for reaching a target")
-    p_ip.add_argument("--target", default="192.168.223.181")
+    p_ip.add_argument("--target", default=DEFAULT_MODULE_IP)
 
     p_udp = sub.add_parser("udp-server", help="listen for UDP data from the module")
     p_udp.add_argument("--bind", default="0.0.0.0")
@@ -234,15 +253,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_tcp = sub.add_parser("tcp-server", help="listen for a TCP client from the module")
     p_tcp.add_argument("--bind", default="0.0.0.0")
-    p_tcp.add_argument("--port", type=int, default=6666)
+    p_tcp.add_argument("--port", type=int, default=DEFAULT_TCP_PORT)
 
     p_at = sub.add_parser("configure-at", help="configure module over CH340 serial")
     p_at.add_argument("--serial-port", required=True)
     p_at.add_argument("--baud", type=int, default=115200)
-    p_at.add_argument("--ssid", required=True)
-    p_at.add_argument("--password", required=True)
+    p_at.add_argument("--ssid",
+                      default=DEFAULT_WIFI_SSID,
+                      required=DEFAULT_WIFI_SSID is None)
+    p_at.add_argument("--password",
+                      default=DEFAULT_WIFI_PASSWORD,
+                      required=DEFAULT_WIFI_PASSWORD is None)
     p_at.add_argument("--pc-ip", required=True)
-    p_at.add_argument("--pc-port", type=int, default=6666)
+    p_at.add_argument("--pc-port", type=int, default=DEFAULT_TCP_PORT)
 
     return parser
 

@@ -1,3 +1,20 @@
-build
-mx.scratch
-!.settings
+build/
+mx.scratch/
+
+# Generated compiler/build artifacts
+*.su
+*.elf
+*.bin
+*.hex
+*.map
+
+# Python runtime cache
+__pycache__/
+*.py[cod]
+
+# Local OS and IDE state
+.DS_Store
+.vscode/
+.settings/
+.mxproject
+CMakeUserPresets.json

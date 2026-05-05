@@ -20,6 +20,7 @@
 #include "main.h"
 #include "FreeRTOS.h"
 #include "cmsis_os2.h"
+#include "dma.h"
 #include "i2c.h"
 #include "spi.h"
 #include "tim.h"
@@ -67,6 +68,11 @@ void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN 0 */
 static void Main_StagePulse(uint32_t stage)
 {
+  if (osKernelGetState() != osKernelInactive)
+  {
+    return;
+  }
+
   for (uint32_t i = 0; i < stage; ++i)
   {
     HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
@@ -131,7 +137,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  Main_StagePulse(1U);
+  MX_DMA_Init();
   MX_I2C1_Init();
   MX_I2C2_Init();
   MX_TIM1_Init();
@@ -141,7 +147,6 @@ int main(void)
   MX_UART7_Init();
   MX_UART8_Init();
   MX_USART1_UART_Init();
-  Main_DebugUartPrint("\r\nBOOT usart1_ready\r\n");
   MX_USART2_UART_Init();
   MX_SPI1_Init();
   MX_SPI2_Init();
@@ -162,20 +167,11 @@ int main(void)
   /* USER CODE END 2 */
 
   /* Init scheduler */
-  Main_DebugUartPrint("BOOT os_kernel_init_begin\r\n");
   osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
-  Main_DebugUartPrint("BOOT os_kernel_init_done\r\n");
-  Main_StagePulse(5U);
-  Main_DebugUartPrint("BOOT freertos_init_begin\r\n");
   MX_FREERTOS_Init();
-  Main_DebugUartPrint("BOOT freertos_init_done\r\n");
-  Main_StagePulse(6U);
 
   /* Start scheduler */
-  Main_DebugUartPrint("BOOT os_start\r\n");
   osKernelStart();
-  Main_DebugUartPrint("BOOT os_start_returned\r\n");
-  Main_StagePulse(7U);
 
   /* We should never get here as control is now taken by the scheduler */
 
