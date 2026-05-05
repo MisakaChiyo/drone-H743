@@ -5,7 +5,7 @@
 
 #include <stdint.h>
 
-#define BSP_UART_USART1_OUTPUT_ENABLED 1U
+#define BSP_UART_USART1_OUTPUT_ENABLED 0U
 
 void BSP_UART_Release_USART1_ForExternalDebug(void);
 

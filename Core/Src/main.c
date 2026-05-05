@@ -80,6 +80,10 @@ static void Main_StagePulse(uint32_t stage)
 
 static void Main_DebugUartPrint(const char *text)
 {
+#if (BSP_UART_USART1_OUTPUT_ENABLED == 0U)
+  (void)text;
+  return;
+#else
   if (text == NULL)
   {
     return;
@@ -89,6 +93,7 @@ static void Main_DebugUartPrint(const char *text)
                           (uint8_t *)text,
                           (uint16_t)strlen(text),
                           100U);
+#endif
 }
 
 /* USER CODE END 0 */
