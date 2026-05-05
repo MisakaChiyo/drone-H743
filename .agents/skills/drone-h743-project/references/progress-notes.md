@@ -178,3 +178,242 @@ Temporary SPL06 diagnostic added:
   - `BARO dbg cs=... miso=... split(st=... id=0x..) txrx(st=... id=0x..)`
 - split read uses transmit command then receive data
 - txrx read uses one full-duplex `HAL_SPI_TransmitReceive()` transaction
+
+Observed after deeper SPL06 test:
+- user reported:
+  - `BARO dbg cs=1 miso=0 split(st=3 id=0x00) txrx(st=3 id=0x00)`
+- meaning at that stage:
+  - SPI4 startup path and UART report path were alive
+  - both split and txrx probe styles still read all-zero ID
+  - this is more consistent with board-side wiring, soldering, footprint/pinout mismatch, or device mismatch than with a simple register-access bug
+
+Current decision:
+- pause SPL06 bring-up for now
+- keep current minimal driver and diagnostic code in repo as a checkpoint
+- revisit after more peripherals are validated or after hardware rework
+
+## 2026-05-05 Ai-WB2-12F Wi-Fi module bring-up preparation
+
+Current repo path:
+- `drone-H743`
+
+Module:
+- `Ai-WB2-12F` Wi-Fi + BLE module based on `BL602`
+
+Reference path:
+- datasheet: `driver_doc/A82852E3370C90F4DD91995C889100A2.pdf`
+
+Goal:
+- bring the module up in current project
+- make it connect to a PC-side Wi-Fi network or hotspot and transmit data
+
+Datasheet facts for first bring-up:
+- supports generic `AT` command workflow for quick start
+- default UART baud rate is `115200 bps`
+- supply range is `2.7V ~ 3.6V`
+- recommended external supply capability is at least `500mA`
+- module UART pins:
+  - pin 21 `RXD`
+  - pin 22 `TXD`
+- `EN` is active high when exposed and used
+- `GPIO8` bootstrap high at power-on enters programming mode; low at power-on is normal boot
+
+Current current-project UART resources already enabled in CubeMX:
+- `UART4`: `PD0/PD1`
+- `UART5`: `PD2/PB13`
+- `UART7`: `PE7/PE8`
+- `UART8`: `PE0/PE1`
+- `USART1`: `PB14/PB15` currently used for debug output
+- `USART2`: `PD5/PD6`
+
+Current decision for first software path:
+- do not start with BL602 SDK porting or SPI/SDIO integration
+- first use plain UART `AT` probe and response forwarding
+- keep `USART1` as debug uplink to the PC
+- choose one dedicated UART to the module after confirming real board wiring
+
+Open hardware questions to resolve before coding:
+- which MCU UART instance is physically wired to the module `RXD/TXD`
+- whether module `EN`, `RST`, or bootstrap-related pins are wired to MCU GPIOs
+- whether the module is intended to join an existing PC hotspot/router or expose its own AP
+
+User-selected first test path:
+- test the module directly with a `CH340` USB-UART adapter before adding STM32-side code
+- keep STM32-side Wi-Fi driver work paused until the AT command sequence is verified manually
+- first target is to join a PC-provided 2.4GHz Wi-Fi hotspot and send UDP/TCP test data to the PC
+
+Manual CH340 test status:
+- STM32-side `USART1` output was temporarily disabled in current project code so it does not drive the shared UART line while CH340 talks to the module
+- user observed `AT` returns `OK`, so the module UART path is alive
+- sending multiple commands in one block produced `[Busy]Cmd running` and partial `Unknown cmd` responses
+- conclusion: send one AT command at a time, wait for `OK`/`ERROR` before sending the next command
+- module firmware identified as:
+  - `at version: release/V4.18_P2.19.1`
+  - `sdk version: release_bl_iot_sdk_1.6.36`
+  - `firmware version: V4.18_P1.4.4-e15d67b`
+
+Automatic module-side configuration completed from the PC:
+- CH340 port used: `/dev/cu.usbserial-1110`
+- PC hotspot-side IP used for UDP target: `192.168.223.205`
+- Wi-Fi auto-connect was set and verified:
+  - `AT+WAUTOCONN=1`
+  - readback: `+WAUTOCONN:1`
+- auto socket transparent transmission was set and verified:
+  - `AT+SOCKETAUTOTT=2,192.168.223.205,6666`
+  - readback: `+SOCKETAUTOTT:2,192.168.223.205,6666`
+
+Power-on persistence and auto-traffic result:
+- after `AT+RST`, module booted and automatically produced:
+  - `+EVENT:WIFI_CONNECT`
+  - `+EVENT:WIFI_GOT_IP`
+  - `connect success ConID=1`
+  - prompt `>` indicating transparent mode entered
+- PC-side UDP listener received:
+  - `boot-auto-udp-test-01\\r\\n`
+- therefore current confirmed working path is:
+  - module auto-connects to hotspot `misakachiyo3`
+  - module auto-connects as UDP client to PC `192.168.223.205:6666`
+  - serial payload after boot is forwarded to PC without manual AT steps
+
+Bidirectional UDP transparent test result:
+- PC UDP listener received serial payload from module:
+  - source: `192.168.223.181:56056`
+  - payload: `wb2-to-pc-probe-01\\r\\n`
+- PC replied to that exact source address and source port
+- CH340 serial side received:
+  - `pc-to-wb2-reply-01\\r\\n`
+- therefore bidirectional traffic is confirmed in the current auto UDP-client transparent mode
+
+Important PC-side rule:
+- because the module is configured as UDP client transparent mode, the PC should reply to the module's observed source port, not to a fixed `7777`
+- helper command added:
+  - `python3 tools/aiwb2_net_tool.py udp-reply-console --port 6666`
+
+VOFA workflow added:
+- helper bridge added:
+  - `python3 tools/vofa_udp_bridge.py`
+- default bridge behavior:
+  - receives module UDP packets on PC port `6666`
+  - remembers the module's latest dynamic source endpoint
+  - forwards module data to VOFA at `127.0.0.1:6668`
+  - receives VOFA data on bridge port `6667`
+  - forwards VOFA data back to the remembered module endpoint
+- suggested VOFA UDP settings:
+  - remote IP: `127.0.0.1`
+  - remote port: `6667`
+  - local port: `6668`
+
+TCP transparent mode update:
+- user confirmed VOFA supports both TCP client and TCP server
+- module was reconfigured from UDP auto transparent mode to TCP-client auto transparent mode:
+  - `AT+SOCKETAUTOTT=4,192.168.223.205,6666`
+  - readback: `+SOCKETAUTOTT:4,192.168.223.205,6666`
+- PC-side Python TCP server verified bidirectional traffic:
+  - module connected from `192.168.223.181:52674`
+  - PC received serial payload `tcp-auto-test-01\\r\\n`
+  - PC sent `pc-tcp-reply-01\\r\\n`
+  - CH340 serial side received `pc-tcp-reply-01\\r\\n`
+- recommended final VOFA path:
+  - VOFA runs as TCP server on local port `6666`
+  - Ai-WB2 auto-connects as TCP client to `192.168.223.205:6666`
+  - once connected, serial payload is bidirectional through the TCP stream
+
+H7 resource note:
+- this first AT-command probe is light control-plane traffic only
+- no DMA is required yet
+- no special cache handling is needed yet
+- if a long-running Wi-Fi uplink task is added later, prefer a dedicated communication task rather than folding it into an existing sensor or message task
+
+## Bus servo / Zhongling serial servo
+
+Source references:
+- external reference project: `/Users/misakachiyo/STM32VScodeProject/duojitest`
+- current target project: `/Users/misakachiyo/STM32VScodeProject/drone-H743`
+- local manual: `driver_doc/众灵舵机使用手册-250508.pdf`
+
+Hardware assumption for current board:
+- single-wire servo UART signal is on `PE8 / UART7_TX`
+- current CubeMX-generated UART7 config already exists:
+  - `PE8 = UART7_TX`
+  - `PE7 = UART7_RX`
+  - `huart7`, 115200, 8N1, no flow control
+- first driver pass uses transmit-only commands, so no CubeMX change was needed
+- if servo feedback/readback is required on the physical single-wire bus, review whether UART7 needs half-duplex/open-drain or external direction/diode handling before writing RX code
+
+Protocol notes from the manual:
+- default baud rate: 115200
+- command format example: `#000P1500T1000!`
+- multi-servo command can be wrapped as `{#001P0500T1000!#002P2500T1000!}`
+- position range used by the manual: `0500` to `2500`
+- time field range: `0000` to `9999`
+- normal servo IDs cover `0..254`; `255` is broadcast
+- default ID may be `0`, so test one servo at a time and change IDs before chaining servos on the same bus
+
+Current implementation:
+- added BSP driver:
+  - `BSP/Inc/bsp_bus_servo.h`
+  - `BSP/Src/bsp_bus_servo.c`
+- added build and umbrella include wiring:
+  - `CMakeLists.txt`
+  - `BSP/Inc/bsp.h`
+- temporary demo hook:
+  - `App/Src/app_led.c`
+  - sends alternating two-servo commands every few LED-task cycles
+- build verified with Debug CMake build
+
+Next recommended cleanup:
+- for real control logic, add a dedicated `servoTask` in CubeMX instead of keeping servo traffic in the LED task
+- use a queue/message buffer from control logic to the servo task
+- keep UART7 command formatting in BSP, not in generated `Core/*`
+
+## TCP control panel and two-servo control protocol
+
+Current goal:
+- PC-side upper computer connects to the board through Ai-WB2 TCP transparent mode
+- upper computer can view hardware init/error status
+- upper computer can control two Zhongling serial bus servos
+- servo parameters can be saved to GD25Q32 and loaded after power-on
+
+Current default servo mapping:
+- servo slot `0` -> physical bus servo ID `1`
+- servo slot `1` -> physical bus servo ID `2`
+- both default to `pulse=1500`, `time=500`, `mode=1`, `enabled=1`
+
+Board-side line protocol over transparent TCP:
+- `PING`
+- `STATUS?`
+- `CONFIG?`
+- `SAVE`
+- `LOAD`
+- `DEFAULTS`
+- `SERVO ID <slot> <id>`
+- `SERVO SETID <slot> <new_id>`
+- `SERVO MOVE <slot> <pulse_us> <time_ms>`
+- `SERVO MOVEALL`
+- `SERVO MODE <slot> <mode_1_to_8>`
+- `SERVO ENABLE <slot> <0_or_1>`
+- `SERVO CMD <slot> <VER|PID|RAD|MOD?|ULK|ULR|DPT|DCT|DST|SCK|CSD|CSM|CSR|SMI|SMX|CLEO|CLE>`
+- `SERVO CMD <slot> BD <baud_code>`
+- `SERVO RAW <raw_servo_command>`
+
+PC-side tool:
+- `tools/drone_tcp_panel.py`
+- default listens as TCP server on `0.0.0.0:6666`
+- expects Ai-WB2 to connect as TCP client transparent mode
+
+Implementation notes:
+- current receive parser is temporarily folded into existing `UARTTask` because `USART1` is already generated as TX/RX
+- if control traffic grows, add a dedicated CubeMX `controlTask` and move protocol work out of `UARTTask`
+- GD25Q32 persistent config uses the last 4KB sector: `0x3FF000`
+- config record has magic, version, size, and checksum
+
+2026-05-05 link-debug update:
+- user reported the Python TCP panel sees the Ai-WB2 TCP client connect, but board commands such as `PING`, `STATUS?`, `CONFIG?`, `SAVE`, and `LOAD` do not get responses
+- important distinction: TCP connection only proves Ai-WB2 reached the PC; it does not prove the STM32 USART1 transparent path is alive
+- firmware now sends:
+  - `READY ...` heartbeat every 2 seconds
+  - first heartbeat also emits `HW FLASH`, `HW SPL06`, `HW ICM42688`
+  - `UART1 rx_bytes=... rx_lines=... rx_overflows=... rx_errors=...` every 2 seconds
+  - `ACK <cmd>` immediately after a complete line reaches the STM32 parser
+- GUI now shows `USART1 透明链路` health so we can tell whether bytes are arriving at PB15 and whether newline parsing is working
+- next physical check if `READY` appears but `rx_bytes` stays 0 after clicking buttons: Ai-WB2 TX must go to STM32 PB15, Ai-WB2 RX must go to STM32 PB14, both at 115200 8N1

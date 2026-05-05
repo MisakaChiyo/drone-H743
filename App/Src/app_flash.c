@@ -10,6 +10,7 @@
 #define APP_FLASH_REPORT_READ_LENGTH 16U
 
 static uint8_t flash_report_done;
+static APP_Flash_Status flash_status;
 
 static void app_flash_queue_text(const char *format, ...)
 {
@@ -60,8 +61,13 @@ void APP_Flash_ReportStartup(void)
     }
 
     flash_report_done = 1U;
+    flash_status.report_done = 1U;
 
     probe_status = BSP_FLASH_ProbeJedecId(&jedec_id);
+    flash_status.probe_status = (int32_t)probe_status;
+    flash_status.manufacturer_id = jedec_id.manufacturer_id;
+    flash_status.memory_type = jedec_id.memory_type;
+    flash_status.capacity_id = jedec_id.capacity_id;
     if (probe_status != BSP_GD25Q32_OK) {
         app_flash_queue_text("FLASH probe st=%d mid=0x%02X type=0x%02X cap=0x%02X\r\n",
                              (int)probe_status,
@@ -72,6 +78,8 @@ void APP_Flash_ReportStartup(void)
     }
 
     status_status = BSP_FLASH_ReadStatus1(&status1);
+    flash_status.status1_status = (int32_t)status_status;
+    flash_status.status1 = status1;
     if (status_status != BSP_GD25Q32_OK) {
         app_flash_queue_text("FLASH status st=%d mid=0x%02X type=0x%02X cap=0x%02X\r\n",
                              (int)status_status,
@@ -88,6 +96,7 @@ void APP_Flash_ReportStartup(void)
                          (unsigned int)status1);
 
     read_status = BSP_FLASH_ReadData(0U, data, sizeof(data));
+    flash_status.read_status = (int32_t)read_status;
     if (read_status != BSP_GD25Q32_OK) {
         app_flash_queue_text("FLASH read st=%d addr=0x000000\r\n", (int)read_status);
         return;
@@ -110,4 +119,13 @@ void APP_Flash_ReportStartup(void)
                          (unsigned int)data[13],
                          (unsigned int)data[14],
                          (unsigned int)data[15]);
+}
+
+void APP_Flash_GetStatus(APP_Flash_Status *status)
+{
+    if (status == 0) {
+        return;
+    }
+
+    *status = flash_status;
 }

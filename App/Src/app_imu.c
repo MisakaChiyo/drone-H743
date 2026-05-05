@@ -135,3 +135,22 @@ void APP_IMU_Task_Step(void)
 
     osDelay(1);
 }
+
+void APP_IMU_GetStatus(APP_IMU_Status *status)
+{
+    if (status == 0) {
+        return;
+    }
+
+    status->initialized = imu_state.initialized;
+    status->who_am_i = imu_state.who_am_i;
+    status->last_status = (int32_t)imu_state.last_status;
+    status->sample_count = imu_state.sample_count;
+    status->temperature_cdeg = APP_IMU_ScaleToInt16(imu_state.last_sample.temperature_c, 100.0f);
+    status->accel_x_mg = APP_IMU_ScaleToInt16(imu_state.last_sample.accel_x_g, 1000.0f);
+    status->accel_y_mg = APP_IMU_ScaleToInt16(imu_state.last_sample.accel_y_g, 1000.0f);
+    status->accel_z_mg = APP_IMU_ScaleToInt16(imu_state.last_sample.accel_z_g, 1000.0f);
+    status->gyro_x_mdps = APP_IMU_ScaleToInt32(imu_state.last_sample.gyro_x_dps, 1000.0f);
+    status->gyro_y_mdps = APP_IMU_ScaleToInt32(imu_state.last_sample.gyro_y_dps, 1000.0f);
+    status->gyro_z_mdps = APP_IMU_ScaleToInt32(imu_state.last_sample.gyro_z_dps, 1000.0f);
+}

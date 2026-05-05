@@ -10,6 +10,7 @@
 #define APP_BARO_BMP280_ID_REG 0xD0U
 
 static uint8_t baro_report_done;
+static APP_Baro_Status baro_status;
 
 static void app_baro_queue_text(const char *format, ...)
 {
@@ -64,11 +65,19 @@ void APP_Baro_ReportStartup(void)
     }
 
     baro_report_done = 1U;
+    baro_status.report_done = 1U;
 
     BSP_BARO_DebugReadLevels(&cs_level, &miso_level);
     split_status = BSP_BARO_ProbeId(&split_id);
     txrx_status = BSP_BARO_ProbeIdTxRx(&txrx_id);
     (void)BSP_BARO_ReadRawRegister(APP_BARO_BMP280_ID_REG, &bmp280_id);
+    baro_status.cs_level = cs_level;
+    baro_status.miso_level = miso_level;
+    baro_status.split_status = (int32_t)split_status;
+    baro_status.txrx_status = (int32_t)txrx_status;
+    baro_status.split_id = split_id;
+    baro_status.txrx_id = txrx_id;
+    baro_status.bmp280_id = bmp280_id;
 
     app_baro_queue_text("BARO dbg cs=%u miso=%u split(st=%d id=0x%02X) txrx(st=%d id=0x%02X) bmp=0x%02X\r\n",
                         (unsigned int)cs_level,
@@ -84,6 +93,8 @@ void APP_Baro_ReportStartup(void)
     if (dev != NULL) {
         product_id = dev->product_id;
     }
+    baro_status.init_status = (int32_t)status;
+    baro_status.product_id = product_id;
 
     if (status != BSP_SPL06_OK) {
         app_baro_queue_text("BARO probe st=%d id=0x%02X\r\n",
@@ -93,4 +104,13 @@ void APP_Baro_ReportStartup(void)
     }
 
     app_baro_queue_text("BARO ok id=0x%02X\r\n", (unsigned int)product_id);
+}
+
+void APP_Baro_GetStatus(APP_Baro_Status *status)
+{
+    if (status == 0) {
+        return;
+    }
+
+    *status = baro_status;
 }

@@ -12,5 +12,6 @@ void APP_LED_Task_Step(void)
     BSP_LED_Toggle(LED_2);
     BSP_LED_Toggle(LED_3);
     BSP_LED_Toggle(LED_4);
+
     osDelay(1000);
 }

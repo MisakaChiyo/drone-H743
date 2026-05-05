@@ -1,6 +1,7 @@
 ---
 name: drone-h743-project
 description: Use when working on this repository's STM32H743 firmware project based on STM32CubeMX and FreeRTOS, especially for CubeMX-managed hardware changes, generated-code review, RTOS task design, STM32H7 memory/domain planning, and migrating code from other STM32 projects into this repo.
+type: project
 ---
 
 # drone-H743 Project Skill

@@ -1,0 +1,1 @@
+../../.agents/skills/drone-h743-project/SKILL.md

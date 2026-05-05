@@ -52,6 +52,16 @@ BSP_GD25Q32_Status BSP_GD25Q32_ReadData(BSP_GD25Q32_Device *dev,
                                         uint32_t address,
                                         uint8_t *data,
                                         uint32_t length);
+BSP_GD25Q32_Status BSP_GD25Q32_EraseSector(BSP_GD25Q32_Device *dev,
+                                           uint32_t address);
+BSP_GD25Q32_Status BSP_GD25Q32_PageProgram(BSP_GD25Q32_Device *dev,
+                                           uint32_t address,
+                                           const uint8_t *data,
+                                           uint16_t length);
+BSP_GD25Q32_Status BSP_GD25Q32_WriteData(BSP_GD25Q32_Device *dev,
+                                         uint32_t address,
+                                         const uint8_t *data,
+                                         uint32_t length);
 
 #ifdef __cplusplus
 }

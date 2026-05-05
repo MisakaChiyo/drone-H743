@@ -4,11 +4,19 @@
 
 #define GD25Q32_CMD_RELEASE_POWER_DOWN 0xABU
 #define GD25Q32_CMD_READ_STATUS1       0x05U
+#define GD25Q32_CMD_WRITE_ENABLE       0x06U
 #define GD25Q32_CMD_READ_DATA          0x03U
+#define GD25Q32_CMD_PAGE_PROGRAM       0x02U
+#define GD25Q32_CMD_SECTOR_ERASE       0x20U
 #define GD25Q32_CMD_READ_JEDEC_ID      0x9FU
 
 #define GD25Q32_DEFAULT_TIMEOUT_MS     100U
 #define GD25Q32_WAKE_DELAY_MS          1U
+#define GD25Q32_BUSY_POLL_DELAY_MS     1U
+#define GD25Q32_PROGRAM_TIMEOUT_MS     500U
+#define GD25Q32_ERASE_TIMEOUT_MS       5000U
+#define GD25Q32_PAGE_SIZE_BYTES        256U
+#define GD25Q32_STATUS1_BUSY           0x01U
 
 static uint32_t gd25q32_timeout_ms(const BSP_GD25Q32_Device *dev)
 {
@@ -75,6 +83,50 @@ static BSP_GD25Q32_Status gd25q32_read_after_command(BSP_GD25Q32_Device *dev,
     gd25q32_cs_high(dev);
 
     return gd25q32_from_hal_status(hal_status);
+}
+
+static BSP_GD25Q32_Status gd25q32_write_enable(BSP_GD25Q32_Device *dev)
+{
+    HAL_StatusTypeDef hal_status;
+    uint8_t command = GD25Q32_CMD_WRITE_ENABLE;
+
+    if (dev == NULL) {
+        return BSP_GD25Q32_INVALID_ARG;
+    }
+
+    gd25q32_cs_low(dev);
+    hal_status = HAL_SPI_Transmit(dev->bus.hspi, &command, 1U, gd25q32_timeout_ms(dev));
+    gd25q32_cs_high(dev);
+
+    return gd25q32_from_hal_status(hal_status);
+}
+
+static BSP_GD25Q32_Status gd25q32_wait_while_busy(BSP_GD25Q32_Device *dev,
+                                                  uint32_t timeout_ms)
+{
+    uint32_t start_tick;
+    BSP_GD25Q32_Status status;
+    uint8_t status1;
+
+    if (dev == NULL) {
+        return BSP_GD25Q32_INVALID_ARG;
+    }
+
+    start_tick = HAL_GetTick();
+    do {
+        status = BSP_GD25Q32_ReadStatus1(dev, &status1);
+        if (status != BSP_GD25Q32_OK) {
+            return status;
+        }
+
+        if ((status1 & GD25Q32_STATUS1_BUSY) == 0U) {
+            return BSP_GD25Q32_OK;
+        }
+
+        gd25q32_delay_ms(dev, GD25Q32_BUSY_POLL_DELAY_MS);
+    } while ((HAL_GetTick() - start_tick) < timeout_ms);
+
+    return BSP_GD25Q32_TIMEOUT;
 }
 
 BSP_GD25Q32_Status BSP_GD25Q32_Init(BSP_GD25Q32_Device *dev,
@@ -210,4 +262,133 @@ BSP_GD25Q32_Status BSP_GD25Q32_ReadData(BSP_GD25Q32_Device *dev,
     gd25q32_cs_high(dev);
 
     return gd25q32_from_hal_status(hal_status);
+}
+
+BSP_GD25Q32_Status BSP_GD25Q32_EraseSector(BSP_GD25Q32_Device *dev,
+                                           uint32_t address)
+{
+    uint8_t command[4];
+    HAL_StatusTypeDef hal_status;
+    BSP_GD25Q32_Status status;
+
+    if ((dev == NULL) || (address >= BSP_GD25Q32_FLASH_SIZE_BYTES)) {
+        return BSP_GD25Q32_INVALID_ARG;
+    }
+
+    status = gd25q32_wait_while_busy(dev, GD25Q32_DEFAULT_TIMEOUT_MS);
+    if (status != BSP_GD25Q32_OK) {
+        return status;
+    }
+
+    status = gd25q32_write_enable(dev);
+    if (status != BSP_GD25Q32_OK) {
+        return status;
+    }
+
+    command[0] = GD25Q32_CMD_SECTOR_ERASE;
+    command[1] = (uint8_t)(address >> 16U);
+    command[2] = (uint8_t)(address >> 8U);
+    command[3] = (uint8_t)address;
+
+    gd25q32_cs_low(dev);
+    hal_status = HAL_SPI_Transmit(dev->bus.hspi,
+                                  command,
+                                  sizeof(command),
+                                  gd25q32_timeout_ms(dev));
+    gd25q32_cs_high(dev);
+    if (hal_status != HAL_OK) {
+        return gd25q32_from_hal_status(hal_status);
+    }
+
+    return gd25q32_wait_while_busy(dev, GD25Q32_ERASE_TIMEOUT_MS);
+}
+
+BSP_GD25Q32_Status BSP_GD25Q32_PageProgram(BSP_GD25Q32_Device *dev,
+                                           uint32_t address,
+                                           const uint8_t *data,
+                                           uint16_t length)
+{
+    uint8_t command[4];
+    HAL_StatusTypeDef hal_status;
+    BSP_GD25Q32_Status status;
+    uint32_t page_remaining;
+
+    if ((dev == NULL) || (data == NULL) || (length == 0U) ||
+        (length > GD25Q32_PAGE_SIZE_BYTES) ||
+        (address >= BSP_GD25Q32_FLASH_SIZE_BYTES) ||
+        ((address + length) > BSP_GD25Q32_FLASH_SIZE_BYTES)) {
+        return BSP_GD25Q32_INVALID_ARG;
+    }
+
+    page_remaining = GD25Q32_PAGE_SIZE_BYTES - (address % GD25Q32_PAGE_SIZE_BYTES);
+    if (length > page_remaining) {
+        return BSP_GD25Q32_INVALID_ARG;
+    }
+
+    status = gd25q32_wait_while_busy(dev, GD25Q32_DEFAULT_TIMEOUT_MS);
+    if (status != BSP_GD25Q32_OK) {
+        return status;
+    }
+
+    status = gd25q32_write_enable(dev);
+    if (status != BSP_GD25Q32_OK) {
+        return status;
+    }
+
+    command[0] = GD25Q32_CMD_PAGE_PROGRAM;
+    command[1] = (uint8_t)(address >> 16U);
+    command[2] = (uint8_t)(address >> 8U);
+    command[3] = (uint8_t)address;
+
+    gd25q32_cs_low(dev);
+    hal_status = HAL_SPI_Transmit(dev->bus.hspi,
+                                  command,
+                                  sizeof(command),
+                                  gd25q32_timeout_ms(dev));
+    if (hal_status == HAL_OK) {
+        hal_status = HAL_SPI_Transmit(dev->bus.hspi,
+                                      (uint8_t *)(uintptr_t)data,
+                                      length,
+                                      gd25q32_timeout_ms(dev));
+    }
+    gd25q32_cs_high(dev);
+    if (hal_status != HAL_OK) {
+        return gd25q32_from_hal_status(hal_status);
+    }
+
+    return gd25q32_wait_while_busy(dev, GD25Q32_PROGRAM_TIMEOUT_MS);
+}
+
+BSP_GD25Q32_Status BSP_GD25Q32_WriteData(BSP_GD25Q32_Device *dev,
+                                         uint32_t address,
+                                         const uint8_t *data,
+                                         uint32_t length)
+{
+    uint32_t offset = 0U;
+
+    if ((dev == NULL) || (data == NULL) || (length == 0U) ||
+        (address >= BSP_GD25Q32_FLASH_SIZE_BYTES) ||
+        (length > BSP_GD25Q32_FLASH_SIZE_BYTES) ||
+        ((address + length) > BSP_GD25Q32_FLASH_SIZE_BYTES)) {
+        return BSP_GD25Q32_INVALID_ARG;
+    }
+
+    while (offset < length) {
+        uint32_t page_remaining = GD25Q32_PAGE_SIZE_BYTES -
+                                  ((address + offset) % GD25Q32_PAGE_SIZE_BYTES);
+        uint32_t remaining = length - offset;
+        uint16_t chunk = (remaining < page_remaining) ? (uint16_t)remaining
+                                                      : (uint16_t)page_remaining;
+        BSP_GD25Q32_Status status = BSP_GD25Q32_PageProgram(dev,
+                                                            address + offset,
+                                                            &data[offset],
+                                                            chunk);
+        if (status != BSP_GD25Q32_OK) {
+            return status;
+        }
+
+        offset += chunk;
+    }
+
+    return BSP_GD25Q32_OK;
 }

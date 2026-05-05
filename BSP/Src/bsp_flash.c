@@ -66,6 +66,18 @@ BSP_GD25Q32_Status BSP_FLASH_ReadData(uint32_t address, uint8_t *data, uint32_t 
     return BSP_GD25Q32_ReadData(&flash_dev, address, data, length);
 }
 
+BSP_GD25Q32_Status BSP_FLASH_EraseSector(uint32_t address)
+{
+    flash_bind_bus();
+    return BSP_GD25Q32_EraseSector(&flash_dev, address);
+}
+
+BSP_GD25Q32_Status BSP_FLASH_WriteData(uint32_t address, const uint8_t *data, uint32_t length)
+{
+    flash_bind_bus();
+    return BSP_GD25Q32_WriteData(&flash_dev, address, data, length);
+}
+
 const BSP_GD25Q32_Device *BSP_FLASH_GetDevice(void)
 {
     flash_bind_bus();

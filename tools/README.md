@@ -1,0 +1,94 @@
+# Ai-WB2-12F PC Tools
+
+This folder contains PC-side helpers for testing the Ai-WB2-12F module before
+the STM32 firmware owns the link.
+
+Print the PC IP used to reach the module:
+
+```bash
+python3 tools/aiwb2_net_tool.py ip --target 192.168.223.181
+```
+
+Listen for UDP data from the module:
+
+```bash
+python3 tools/aiwb2_net_tool.py udp-server --port 6666
+```
+
+Listen for UDP data and type replies back to the module:
+
+```bash
+python3 tools/aiwb2_net_tool.py udp-reply-console --port 6666
+```
+
+For the current Ai-WB2 auto transparent UDP-client mode, the PC must reply to
+the module's source port. This command remembers the last source address and
+uses it for replies.
+
+Send one UDP packet to the module:
+
+```bash
+python3 tools/aiwb2_net_tool.py udp-send --module-ip 192.168.223.181 --module-port 7777 --message PING1234
+```
+
+Run a two-way UDP console:
+
+```bash
+python3 tools/aiwb2_net_tool.py udp-bridge --local-port 6666 --module-ip 192.168.223.181 --module-port 7777
+```
+
+Run a TCP server for the module to connect:
+
+```bash
+python3 tools/aiwb2_net_tool.py tcp-server --port 6666
+```
+
+## drone-H743 TCP panel
+
+After the Ai-WB2 is configured as TCP client transparent mode to the PC, run
+the GUI panel:
+
+```bash
+python3 tools/drone_tcp_panel.py
+```
+
+Default panel behavior:
+
+- listens as a TCP server on `0.0.0.0:6666`
+- displays board status and startup logs
+- sends line commands such as `STATUS?`, `CONFIG?`, `SERVO MOVE 0 1500 500`
+- controls two Zhongling bus servos, mapped by default to IDs `1` and `2`
+- can ask the board to save/load servo config in the onboard GD25Q32 flash
+
+Optional serial auto-configuration through CH340 requires `pyserial`:
+
+```bash
+python3 -m pip install pyserial
+python3 tools/aiwb2_net_tool.py configure-at \
+  --serial-port /dev/cu.wchusbserialXXXX \
+  --ssid misakachiyo3 \
+  --password stm32h743vit6 \
+  --pc-ip 192.168.223.205 \
+  --pc-port 6666
+```
+
+## VOFA bridge
+
+VOFA is awkward with the module's current UDP-client transparent mode because
+the module sends from a dynamic source port. Use this bridge to convert that
+into fixed local ports for VOFA:
+
+```bash
+python3 tools/vofa_udp_bridge.py
+```
+
+Suggested VOFA settings with the default bridge ports:
+
+- `数据接口`: `UDP`
+- `远程IP`: `127.0.0.1`
+- `远程端口`: `6667`
+- `本地端口`: `6668`
+
+The bridge listens for module data on PC port `6666`, forwards it to VOFA on
+`127.0.0.1:6668`, and forwards VOFA packets from `127.0.0.1:6667` back to the
+module's latest source address.

@@ -31,6 +31,7 @@
 /* USER CODE BEGIN Includes */
 #include "bsp.h"
 #include "app.h"
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -64,6 +65,31 @@ void MX_FREERTOS_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void Main_StagePulse(uint32_t stage)
+{
+  for (uint32_t i = 0; i < stage; ++i)
+  {
+    HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+    HAL_Delay(80);
+    HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+    HAL_Delay(80);
+  }
+
+  HAL_Delay(220);
+}
+
+static void Main_DebugUartPrint(const char *text)
+{
+  if (text == NULL)
+  {
+    return;
+  }
+
+  (void)HAL_UART_Transmit(&huart1,
+                          (uint8_t *)text,
+                          (uint16_t)strlen(text),
+                          100U);
+}
 
 /* USER CODE END 0 */
 
@@ -94,11 +120,13 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+  /* clock configured */
 
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  Main_StagePulse(1U);
   MX_I2C1_Init();
   MX_I2C2_Init();
   MX_TIM1_Init();
@@ -108,6 +136,7 @@ int main(void)
   MX_UART7_Init();
   MX_UART8_Init();
   MX_USART1_UART_Init();
+  Main_DebugUartPrint("\r\nBOOT usart1_ready\r\n");
   MX_USART2_UART_Init();
   MX_SPI1_Init();
   MX_SPI2_Init();
@@ -115,16 +144,33 @@ int main(void)
   MX_SPI4_Init();
   MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
+  Main_DebugUartPrint("BOOT user2_begin\r\n");
+  Main_StagePulse(2U);
+  BSP_UART_Release_USART1_ForExternalDebug();
+  Main_DebugUartPrint("BOOT bsp_release_done\r\n");
   BSP_Init();
+  Main_DebugUartPrint("BOOT bsp_init_done\r\n");
+  Main_StagePulse(3U);
   APP_Init();
+  Main_DebugUartPrint("BOOT app_init_done\r\n");
+  Main_StagePulse(4U);
   /* USER CODE END 2 */
 
   /* Init scheduler */
+  Main_DebugUartPrint("BOOT os_kernel_init_begin\r\n");
   osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
+  Main_DebugUartPrint("BOOT os_kernel_init_done\r\n");
+  Main_StagePulse(5U);
+  Main_DebugUartPrint("BOOT freertos_init_begin\r\n");
   MX_FREERTOS_Init();
+  Main_DebugUartPrint("BOOT freertos_init_done\r\n");
+  Main_StagePulse(6U);
 
   /* Start scheduler */
+  Main_DebugUartPrint("BOOT os_start\r\n");
   osKernelStart();
+  Main_DebugUartPrint("BOOT os_start_returned\r\n");
+  Main_StagePulse(7U);
 
   /* We should never get here as control is now taken by the scheduler */
 

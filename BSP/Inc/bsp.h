@@ -17,6 +17,7 @@ extern "C" {
 #include "bsp_icm42688.h"
 #include "bsp_imu.h"
 #include "bsp_pwm.h"
+#include "bsp_bus_servo.h"
 #include "bsp_system.h"
 
 void BSP_Init(void);
