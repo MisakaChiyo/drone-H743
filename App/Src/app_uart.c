@@ -6,6 +6,7 @@
 #include "app_proto.h"
 #include "app_tasks.h"
 #include "bsp_led.h"
+#include "bsp_gps.h"
 #include "bsp_uart.h"
 
 #include "usart.h"
@@ -889,11 +890,13 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
+    BSP_GPS_OnUartRxCplt(huart);
     APP_MaintUART_OnRxCplt(huart);
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     APP_UART_OnError(huart);
+    BSP_GPS_OnUartError(huart);
     APP_MaintUART_OnError(huart);
 }

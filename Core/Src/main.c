@@ -383,7 +383,6 @@ int main(void)
   /* USER CODE END 1 */
 
   /* MPU Configuration--------------------------------------------------------*/
-
   MPU_Config();
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -405,14 +404,6 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  /* USER CODE BEGIN 2_PRE */
-#if MAIN_IMU_SPI_WAVEFORM_ONLY
-  Main_ImuWaveLoop();
-#endif
-#if MAIN_IMU_I2C_PROBE_ONLY
-  Main_ImuI2cProbeLoop();
-#endif
-  /* USER CODE END 2_PRE */
   MX_DMA_Init();
   MX_I2C1_Init();
   MX_I2C2_Init();

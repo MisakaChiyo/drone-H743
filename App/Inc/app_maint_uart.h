@@ -7,6 +7,7 @@
 void APP_MaintUART_Init(void);
 void APP_MaintUART_Step(void);
 void APP_MaintUART_Write(const char *text, uint16_t length);
+void APP_MaintUART_WriteFormat(const char *format, ...);
 void APP_MaintUART_OnRxCplt(UART_HandleTypeDef *huart);
 void APP_MaintUART_OnError(UART_HandleTypeDef *huart);
 

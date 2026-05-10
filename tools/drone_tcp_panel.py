@@ -19,6 +19,7 @@ from tkinter import filedialog, messagebox, ttk
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 6666
 MAX_BARO_SAMPLES = 2000
+MAX_GPS_TRACK_POINTS = 5000
 BARO_STREAM_PERIOD_MS = 50
 IMU_POLL_PERIOD_MS = 100
 CMD_REPLY_TIMEOUT_MS = 2500
@@ -53,6 +54,9 @@ PROTO_REQ_SERVO_MODE = 0x1014
 PROTO_REQ_SERVO_ENABLE = 0x1015
 PROTO_REQ_SERVO_ACTION = 0x1016
 PROTO_REQ_SERVO_RAW = 0x1017
+PROTO_REQ_WIFI = 0x1018
+PROTO_REQ_GPS = 0x1019
+PROTO_REQ_MAG = 0x101A
 PROTO_MSG_CMD_LINE = 0x2000
 PROTO_MSG_TEXT_LINE = 0x2001
 PROTO_MSG_CMD_RX = 0x2100
@@ -85,6 +89,9 @@ PROTO_MSG_SAVE_RESULT = 0x2216
 PROTO_MSG_LOAD_RESULT = 0x2217
 PROTO_MSG_DEFAULTS_RESULT = 0x2218
 PROTO_MSG_SERVO_RESULT = 0x2219
+PROTO_MSG_WIFI_RECORD = 0x221A
+PROTO_MSG_GPS_RECORD = 0x221B
+PROTO_MSG_MAG_RECORD = 0x221C
 
 try:
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -114,6 +121,8 @@ MODULES = [
     ("FLASH", "GD25Q32 Flash", "STATUS?"),
     ("SPL06", "SPL06 气压计", "STATUS?"),
     ("ICM42688", "ICM42688 IMU", "STATUS?"),
+    ("GPS", "M9N GPS", "GPS?"),
+    ("MAG", "I2C1 Magnetometer", "MAG?"),
     ("UART1", "USART1 链路", "STATUS?"),
     ("WIFI", "Ai-WB2 WiFi", "WIFI?"),
 ]
@@ -125,6 +134,15 @@ MODULE_ALIASES = {
     "BARO": "SPL06",
     "ICM42688": "ICM42688",
     "IMU": "ICM42688",
+    "GPS": "GPS",
+    "GPS_USART2": "GPS",
+    "M9N": "GPS",
+    "UBX": "GPS",
+    "MAG": "MAG",
+    "MAG_I2C1": "MAG",
+    "IST8310": "MAG",
+    "HMC5883": "MAG",
+    "QMC5883L": "MAG",
     "UART1": "UART1",
     "USART1": "UART1",
     "WIFI": "WIFI",
@@ -134,8 +152,8 @@ MODULE_ALIASES = {
 
 def parse_kv(line: str) -> dict[str, str]:
     result: dict[str, str] = {}
-    for match in re.finditer(r"([A-Za-z0-9_.-]+)=([^ ,\r\n]+)", line):
-        result[match.group(1)] = match.group(2)
+    for match in re.finditer(r"([A-Za-z0-9_.-]+)=([^ \r\n]+)", line):
+        result[match.group(1)] = match.group(2).rstrip(",")
     return result
 
 
@@ -551,6 +569,10 @@ class DronePanel(tk.Tk):
         self.baro_buffer: list[dict[str, float | str]] = []
         self._baro_dirty = False
         self._last_baro_plot_ns = 0
+        self.gps_track: list[dict[str, float | str | int]] = []
+        self.gps_origin_lat: float | None = None
+        self.gps_origin_lon: float | None = None
+        self.gps_last_plot_ns = 0
         self.imu_poll_enabled = tk.BooleanVar(value=False)
         self.imu_last_poll = 0.0
         self.imu_last_sample_time = 0.0
@@ -569,6 +591,8 @@ class DronePanel(tk.Tk):
         self.config_summary_var = tk.StringVar(value="尚未读取配置")
         self.baro_count_var = tk.StringVar(value="暂存样本: 0")
         self.plot_var = tk.StringVar(value="pressure")
+        self.gps_count_var = tk.StringVar(value="轨迹点: 0")
+        self.gps_status_var = tk.StringVar(value="等待 GPS")
         self.transport_var = tk.StringVar(value="tcp")
         self._serial_port_map: dict[str, str] = {}
         self.serial_port_var = tk.StringVar(value=self._default_serial_port())
@@ -577,6 +601,8 @@ class DronePanel(tk.Tk):
         self.module_state: dict[str, dict[str, tk.StringVar]] = {}
         self.baro_vars: dict[str, tk.StringVar] = {}
         self.imu_vars: dict[str, tk.StringVar] = {}
+        self.gps_vars: dict[str, tk.StringVar] = {}
+        self.mag_vars: dict[str, tk.StringVar] = {}
 
         self._build_ui()
         self.after(1000, self._check_link_health)
@@ -661,11 +687,13 @@ class DronePanel(tk.Tk):
         overview = ttk.Frame(self.notebook, padding=10)
         baro = ttk.Frame(self.notebook, padding=10)
         imu = ttk.Frame(self.notebook, padding=10)
+        gps = ttk.Frame(self.notebook, padding=10)
         params = ttk.Frame(self.notebook, padding=10)
         servos = ttk.Frame(self.notebook, padding=10)
         commands = ttk.Frame(self.notebook, padding=10)
         self.baro_tab = baro
         self.imu_tab = imu
+        self.gps_tab = gps
 
         self.notebook.add(overview, text="模块总览")
         self.notebook.add(baro, text="SPL06 气压计")
@@ -674,9 +702,12 @@ class DronePanel(tk.Tk):
         self.notebook.add(servos, text="舵机控制")
         self.notebook.add(commands, text="日志 / 原始命令")
 
+        self.notebook.add(gps, text="GPS 轨迹")
+
         self._build_overview_page(overview)
         self._build_baro_page(baro)
         self._build_imu_page(imu)
+        self._build_gps_page(gps)
         self._build_params_page(params)
         self._build_servo_page(servos)
         self._build_command_page(commands)
@@ -818,6 +849,7 @@ class DronePanel(tk.Tk):
         ttk.Button(actions, text="请求该模块详情", command=self._request_selected_module).pack(side=tk.LEFT)
         ttk.Button(actions, text="打开气压计页", command=self._open_baro_tab).pack(side=tk.LEFT, padx=6)
         ttk.Button(actions, text="打开姿态页", command=self._open_imu_tab).pack(side=tk.LEFT)
+        ttk.Button(actions, text="打开 GPS 页", command=self._open_gps_tab).pack(side=tk.LEFT, padx=6)
         detail.columnconfigure(1, weight=1)
 
     def _detail_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, wrap: int = 0) -> None:
@@ -956,6 +988,81 @@ class DronePanel(tk.Tk):
         values.columnconfigure(1, weight=1)
         self._draw_imu_attitude()
 
+    def _build_gps_page(self, parent: ttk.Frame) -> None:
+        top = ttk.Frame(parent)
+        top.pack(fill=tk.X)
+        ttk.Button(top, text="请求 GPS", command=lambda: self._send_proto(PROTO_REQ_GPS, "GPS?")).pack(side=tk.LEFT)
+        ttk.Button(top, text="请求磁力计", command=lambda: self._send_proto(PROTO_REQ_MAG, "MAG?")).pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text="清空轨迹", command=self._clear_gps_track).pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text="导出轨迹 CSV", command=self._export_gps_csv).pack(side=tk.LEFT)
+        ttk.Label(top, textvariable=self.gps_count_var).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(top, textvariable=self.gps_status_var).pack(side=tk.LEFT, padx=(12, 0))
+
+        panes = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
+        panes.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+
+        left = ttk.Frame(panes)
+        right = ttk.Frame(panes)
+        panes.add(left, weight=3)
+        panes.add(right, weight=2)
+
+        plot_box = ttk.LabelFrame(left, text="XY 轨迹图 (m)", padding=8)
+        plot_box.pack(fill=tk.BOTH, expand=True)
+
+        if HAS_MATPLOTLIB and Figure is not None and FigureCanvasTkAgg is not None:
+            self.gps_figure = Figure(figsize=(6, 4), dpi=100)
+            self.gps_axis = self.gps_figure.add_subplot(111)
+            self.gps_canvas = FigureCanvasTkAgg(self.gps_figure, master=plot_box)
+            self.gps_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            self._update_gps_plot()
+        else:
+            ttk.Label(
+                plot_box,
+                text=f"未安装 matplotlib，轨迹图区停用。\npython -m pip install matplotlib\n{MATPLOTLIB_ERROR}",
+                wraplength=560,
+            ).pack(fill=tk.X, pady=(12, 0))
+            self.gps_figure = None
+            self.gps_axis = None
+            self.gps_canvas = None
+
+        info = ttk.LabelFrame(right, text="GPS / MAG 状态", padding=10)
+        info.pack(fill=tk.BOTH, expand=True)
+
+        gps_fields = [
+            ("state", "GPS 状态"),
+            ("fix", "Fix"),
+            ("sv", "卫星数"),
+            ("lon", "经度"),
+            ("lat", "纬度"),
+            ("hmsl", "海拔 mm"),
+            ("x", "X (m)"),
+            ("y", "Y (m)"),
+            ("spd", "地速 mm/s"),
+            ("hdg", "航向 deg"),
+            ("age", "数据时延"),
+        ]
+        for row, (key, label) in enumerate(gps_fields):
+            self.gps_vars[key] = tk.StringVar(value="-")
+            ttk.Label(info, text=label).grid(row=row, column=0, sticky=tk.W, padx=(0, 8), pady=2)
+            ttk.Label(info, textvariable=self.gps_vars[key]).grid(row=row, column=1, sticky=tk.W, pady=2)
+
+        mag_title = ttk.Label(info, text="MAG", font=("Segoe UI", 10, "bold"))
+        mag_title.grid(row=len(gps_fields), column=0, columnspan=2, sticky=tk.W, pady=(10, 2))
+
+        mag_fields = [
+            ("state", "磁力计状态"),
+            ("type", "型号"),
+            ("raw", "Raw xyz"),
+            ("scaled", "mGauss xyz"),
+        ]
+        base = len(gps_fields) + 1
+        for row, (key, label) in enumerate(mag_fields):
+            self.mag_vars[key] = tk.StringVar(value="-")
+            ttk.Label(info, text=label).grid(row=base + row, column=0, sticky=tk.W, padx=(0, 8), pady=2)
+            ttk.Label(info, textvariable=self.mag_vars[key]).grid(row=base + row, column=1, sticky=tk.W, pady=2)
+
+        info.columnconfigure(1, weight=1)
+
     def _build_params_page(self, parent: ttk.Frame) -> None:
         top = ttk.Frame(parent)
         top.pack(fill=tk.X)
@@ -1037,6 +1144,8 @@ class DronePanel(tk.Tk):
             ("PARAM?", "PARAM?"),
             ("PID?", "PID?"),
             ("BARO?", "BARO?"),
+            ("GPS?", "GPS?"),
+            ("MAG?", "MAG?"),
             ("SAVE", "SAVE"),
             ("LOAD", "LOAD"),
         ]:
@@ -1205,7 +1314,7 @@ class DronePanel(tk.Tk):
         self._append(f"> {line}")
         if not self.transport.send_line(line):
             self._append("[上位机] 发送失败")
-        elif line in {"PING", "STATUS?", "CONFIG?", "PARAM?", "PID?", "BARO?"}:
+        elif line in {"PING", "STATUS?", "CONFIG?", "PARAM?", "PID?", "BARO?", "GPS?", "MAG?"}:
             sent_at = time.monotonic()
             self.after(CMD_REPLY_TIMEOUT_MS, lambda sent=line, start=sent_at: self._warn_if_no_reply(sent, start))
 
@@ -1337,6 +1446,8 @@ class DronePanel(tk.Tk):
     def _should_show_raw_log(self, line: str) -> bool:
         if line.startswith(("READY", "UART1 ")):
             return False
+        if line.startswith(("GPS_USART2 ", "MAG_I2C1 ")):
+            return False
         if line.startswith("BARO ok="):
             return False
         if re.search(r"(^|[ ,])ax=", line) and re.search(r"(^|[ ,])az=", line):
@@ -1404,6 +1515,9 @@ class DronePanel(tk.Tk):
             PROTO_MSG_LOAD_RESULT: self._handle_board_line,
             PROTO_MSG_DEFAULTS_RESULT: self._handle_board_line,
             PROTO_MSG_SERVO_RESULT: self._handle_board_line,
+            PROTO_MSG_WIFI_RECORD: self._update_wifi_line,
+            PROTO_MSG_GPS_RECORD: self._handle_board_line,
+            PROTO_MSG_MAG_RECORD: self._handle_board_line,
             PROTO_MSG_TEXT_LINE: self._handle_board_line,
         }
 
@@ -1429,6 +1543,18 @@ class DronePanel(tk.Tk):
             return self._ensure_line_prefix(stripped, "PONG")
         if function == PROTO_MSG_READY:
             return self._ensure_line_prefix(stripped, "READY")
+        if function == PROTO_MSG_WIFI_RECORD:
+            if stripped.startswith(("WIFI ", "RSP ")):
+                return stripped
+            return self._ensure_line_prefix(stripped, "WIFI")
+        if function == PROTO_MSG_GPS_RECORD:
+            if stripped.startswith(("GPS ", "GPS_USART2 ", "M9N ", "HW ", "STATUS ", "RSP ")):
+                return stripped
+            return self._ensure_line_prefix(stripped, "GPS")
+        if function == PROTO_MSG_MAG_RECORD:
+            if stripped.startswith(("MAG ", "MAG_I2C1 ", "HW ", "STATUS ", "RSP ")):
+                return stripped
+            return self._ensure_line_prefix(stripped, "MAG")
 
         prefix_map = {
             PROTO_MSG_HW_FLASH: "HW FLASH",
@@ -1519,6 +1645,12 @@ class DronePanel(tk.Tk):
         if self.selected_module == "ICM42688":
             self._send_proto(PROTO_REQ_IMU, "IMU?")
             return
+        if self.selected_module == "GPS":
+            self._send_proto(PROTO_REQ_GPS, "GPS?")
+            return
+        if self.selected_module == "MAG":
+            self._send_proto(PROTO_REQ_MAG, "MAG?")
+            return
         if self.selected_module == "WIFI":
             self._send_proto(PROTO_REQ_WIFI, "WIFI?")
             return
@@ -1531,6 +1663,10 @@ class DronePanel(tk.Tk):
     def _open_imu_tab(self) -> None:
         self.notebook.select(self.imu_tab)
         self._send_proto(PROTO_REQ_IMU, "IMU?")
+
+    def _open_gps_tab(self) -> None:
+        self.notebook.select(self.gps_tab)
+        self._send_proto(PROTO_REQ_GPS, "GPS?")
 
     def _refresh_detail(self) -> None:
         state = self.module_state[self.selected_module]
@@ -1600,6 +1736,14 @@ class DronePanel(tk.Tk):
             self._update_baro_line(line)
         elif line.startswith("IMU "):
             self._update_imu_line(line)
+        elif line.startswith(("GPS ", "GPS_USART2 ", "M9N ")):
+            self._update_gps_line(line)
+            self.last_reply_rx = time.monotonic()
+            self.last_cmd_var.set(f"最近回包: {line}")
+        elif line.startswith(("MAG ", "MAG_I2C1 ")):
+            self._update_mag_line(line)
+            self.last_reply_rx = time.monotonic()
+            self.last_cmd_var.set(f"最近回包: {line}")
         elif re.search(r"(^|[ ,])ax=", line) and re.search(r"(^|[ ,])az=", line):
             self._update_imu_line("IMU " + line)
         elif line.startswith("WIFI "):
@@ -1617,7 +1761,7 @@ class DronePanel(tk.Tk):
         elif line.startswith("OK ") or line.startswith("ERR ") or line.startswith("ACK ") or line.startswith("RX "):
             self.last_reply_rx = time.monotonic()
             self.last_cmd_var.set(f"最近命令: {line}")
-        elif line.startswith("PONG ") or line.startswith("READY ") or line.startswith("FLASH ") or line.startswith("BARO ") or line.startswith("IMU "):
+        elif line.startswith(("PONG ", "READY ", "FLASH ", "BARO ", "IMU ", "GPS ", "GPS_USART2 ", "M9N ", "MAG ", "MAG_I2C1 ")):
             self.last_reply_rx = time.monotonic()
 
     def _handle_ready_line(self, line: str) -> None:
@@ -1845,6 +1989,14 @@ class DronePanel(tk.Tk):
             self._update_imu_line("IMU " + " ".join(f"{key}={value}" for key, value in payload.items()))
             return
 
+        if mod in {"GPS", "M9N"}:
+            self._update_gps_line("GPS " + " ".join(f"{key}={value}" for key, value in payload.items()))
+            return
+
+        if mod == "MAG":
+            self._update_mag_line("MAG " + " ".join(f"{key}={value}" for key, value in payload.items()))
+            return
+
         if mod == "FLASH":
             self._update_flash_line("FLASH " + " ".join(f"{key}={value}" for key, value in payload.items()))
             return
@@ -1881,6 +2033,30 @@ class DronePanel(tk.Tk):
                 state="正常" if ok else "异常",
                 stage=self._stage_text(values.get("imu_stage", "-")),
                 hint=self._hardware_hint("ICM42688", ok, values),
+                line=line,
+            )
+
+        if "gps" in values or "gps_fix" in values or "gps_sv" in values:
+            ok = safe_int(first_value(values, "gps", "gps_ok"), 0) != 0
+            self._update_module(
+                "GPS",
+                state="已初始化" if ok else "等待",
+                stage=f"fix={first_value(values, 'gps_fix', 'fix')}",
+                value=f"sv={first_value(values, 'gps_sv', 'sv')}",
+                code=f"init={first_value(values, 'gps', 'gps_ok')}",
+                hint=self._hardware_hint("GPS", ok, values),
+                line=line,
+            )
+
+        if "mag" in values or "mag_type" in values:
+            ok = safe_int(first_value(values, "mag", "mag_ok"), 0) != 0
+            self._update_module(
+                "MAG",
+                state="正常" if ok else "异常",
+                stage=first_value(values, "mag_type", "type"),
+                value=f"type={first_value(values, 'mag_type', 'type')}",
+                code=f"init={first_value(values, 'mag', 'mag_ok')}",
+                hint=self._hardware_hint("MAG", ok, values),
                 line=line,
             )
 
@@ -1928,6 +2104,14 @@ class DronePanel(tk.Tk):
         elif key == "ICM42688":
             value = f"WHO={values.get('who', '-')} 期望={values.get('exp', '-')} n={values.get('n', '-')}"
             code = f"st={values.get('st', '-')}"
+        elif key == "GPS":
+            value = f"fix={first_value(values, 'fix', 'fix_type')} sv={first_value(values, 'sv', 'num_sv')} lat={values.get('lat', '-')} lon={values.get('lon', '-')}"
+            code = f"init={values.get('init', '-')} nav={values.get('nav', '-')}"
+            self._update_gps_line("GPS " + " ".join(f"{name}={value}" for name, value in values.items()))
+        elif key == "MAG":
+            value = f"type={values.get('type', '-')} addr={values.get('addr', '-')} n={values.get('n', '-')}"
+            code = f"init={values.get('init', '-')} st={values.get('st', '-')}"
+            self._update_mag_line("MAG " + " ".join(f"{name}={value}" for name, value in values.items()))
         else:
             value = "-"
             code = "-"
@@ -1974,6 +2158,10 @@ class DronePanel(tk.Tk):
                 hint=self._hardware_hint("ICM42688", ok, values),
                 line=line,
             )
+        elif subject == "gps":
+            self._update_gps_line("GPS " + " ".join(f"{key}={value}" for key, value in values.items()))
+        elif subject == "mag":
+            self._update_mag_line("MAG " + " ".join(f"{key}={value}" for key, value in values.items()))
 
     def _update_wifi_line(self, line: str) -> None:
         values = parse_kv(line)
@@ -2200,6 +2388,241 @@ class DronePanel(tk.Tk):
                 writer.writerow(sample)
         self._append(f"[上位机] 已导出气压计暂存数据: {filename}")
 
+    def _gps_lat_lon_from_values(self, values: dict[str, str]) -> tuple[float | None, float | None]:
+        lat = first_float(values, "lat_deg", "latitude_deg", "latitude")
+        lon = first_float(values, "lon_deg", "longitude_deg", "longitude")
+        if lat is None:
+            lat = first_float(values, "lat", "lat_deg_e7")
+        if lon is None:
+            lon = first_float(values, "lon", "lon_deg_e7")
+        if lat is not None and abs(lat) > 90.0:
+            lat /= 10000000.0
+        if lon is not None and abs(lon) > 180.0:
+            lon /= 10000000.0
+        return lat, lon
+
+    def _gps_xy_from_lat_lon(self, lat: float, lon: float) -> tuple[float, float]:
+        if self.gps_origin_lat is None or self.gps_origin_lon is None:
+            self.gps_origin_lat = lat
+            self.gps_origin_lon = lon
+        radius_m = 6378137.0
+        lat0 = self.gps_origin_lat
+        lon0 = self.gps_origin_lon
+        x = math.radians(lon - lon0) * radius_m * math.cos(math.radians(lat0))
+        y = math.radians(lat - lat0) * radius_m
+        return x, y
+
+    def _update_gps_line(self, line: str) -> None:
+        values = parse_kv(line)
+        lat, lon = self._gps_lat_lon_from_values(values)
+        fix_text = first_value(values, "fix", "fix_type")
+        previous_fix = self.gps_vars.get("fix").get() if "fix" in self.gps_vars else "0"
+        fix = safe_int(fix_text, safe_int(previous_fix, 0))
+        valid = safe_int(first_value(values, "valid", "valid_fix"), 0) != 0
+        if "ok" in values:
+            initialized = safe_int(values.get("ok"), 0) != 0
+        elif line.startswith("STATUS gps"):
+            initialized = safe_int(values.get("init"), 0) != 0
+        elif "init" in values:
+            initialized = safe_int(values.get("init"), 1) == 0
+        else:
+            initialized = False
+        sv_text = first_value(values, "sv", "num_sv")
+        previous_sv = self.gps_vars.get("sv").get() if "sv" in self.gps_vars else "0"
+        sv = safe_int(sv_text, safe_int(previous_sv, 0))
+        now = time.time()
+        x: float | None = None
+        y: float | None = None
+
+        if lat is not None and lon is not None and abs(lat) <= 90.0 and abs(lon) <= 180.0:
+            if abs(lat) > 0.000001 or abs(lon) > 0.000001:
+                x, y = self._gps_xy_from_lat_lon(lat, lon)
+                self.gps_track.append(
+                    {
+                        "time": now,
+                        "lat": lat,
+                        "lon": lon,
+                        "x_m": x,
+                        "y_m": y,
+                        "fix": fix,
+                        "sv": sv,
+                        "hmsl_mm": safe_int(first_value(values, "hmsl_mm", "hmsl"), 0),
+                        "hacc_mm": safe_int(first_value(values, "hacc_mm", "hacc"), 0),
+                        "line": line,
+                    }
+                )
+                if len(self.gps_track) > MAX_GPS_TRACK_POINTS:
+                    del self.gps_track[: len(self.gps_track) - MAX_GPS_TRACK_POINTS]
+
+        previous_state = self.gps_vars.get("state").get() if "state" in self.gps_vars else "-"
+        if valid or fix >= 2:
+            state = "已定位"
+        elif initialized:
+            state = "已初始化"
+        elif previous_state not in {"-", "等待 GPS"} and not ({"ok", "init", "valid", "valid_fix", "fix", "fix_type"} & values.keys()):
+            state = previous_state
+        else:
+            state = "等待 GPS"
+        age = first_value(values, "age_ms", "age")
+        if age != "-" and age.isdigit():
+            age = f"{age} ms"
+        speed = first_value(values, "gspd", "ground_speed_mm_s", "speed_mm_s")
+        if speed == "-":
+            vn = first_float(values, "vn", "vel_n_mm_s")
+            ve = first_float(values, "ve", "vel_e_mm_s")
+            if vn is not None and ve is not None:
+                speed = f"{math.hypot(vn, ve):.0f}"
+
+        updates = {
+            "state": state,
+            "fix": str(fix) if fix_text != "-" else "-",
+            "sv": str(sv) if sv_text != "-" else "-",
+            "lon": f"{lon:.7f}" if lon is not None else "-",
+            "lat": f"{lat:.7f}" if lat is not None else "-",
+            "hmsl": first_value(values, "hmsl_mm", "hmsl"),
+            "x": f"{x:.2f}" if x is not None else "-",
+            "y": f"{y:.2f}" if y is not None else "-",
+            "spd": speed,
+            "hdg": "-",
+            "age": age,
+        }
+        heading = first_float(values, "head_e5", "heading_motion_deg_e5", "heading_deg_e5")
+        if heading is not None:
+            updates["hdg"] = f"{heading / 100000.0:.2f}"
+        for key, value in updates.items():
+            if key in self.gps_vars and value != "-":
+                self.gps_vars[key].set(value)
+
+        value_text = f"fix={fix} sv={sv}"
+        if lat is not None and lon is not None:
+            value_text += f" lat={lat:.7f} lon={lon:.7f}"
+        code_parts = [
+            f"nav={values.get('nav', '-')}",
+            f"pkts={first_value(values, 'pkts', 'packets')}",
+        ]
+        if "nmea" in values or "gga" in values:
+            code_parts.append(f"nmea={values.get('nmea', '-')}")
+            code_parts.append(f"gga={values.get('gga', '-')}")
+
+        self._update_module(
+            "GPS",
+            state=state,
+            stage=f"fix={fix}",
+            value=value_text,
+            code=" ".join(code_parts),
+            hint=self._hardware_hint("GPS", valid or initialized, values),
+            line=line,
+        )
+        self.gps_count_var.set(f"轨迹点: {len(self.gps_track)}")
+        self.gps_status_var.set(f"{state}  fix={fix}  sv={sv}")
+
+        now_ns = time.monotonic_ns()
+        if now_ns - self.gps_last_plot_ns > 200_000_000:
+            self.gps_last_plot_ns = now_ns
+            self._update_gps_plot()
+
+    def _update_mag_line(self, line: str) -> None:
+        values = parse_kv(line)
+        has_state_fields = bool({"ok", "init", "st", "raw", "mgauss", "x", "y", "z"} & values.keys())
+        if "ok" in values:
+            ok = safe_int(values.get("ok"), 0) != 0
+        elif line.startswith("STATUS mag"):
+            ok = safe_int(values.get("init"), 0) != 0
+        elif "init" not in values:
+            ok = self.mag_vars.get("state").get() == "正常" if "state" in self.mag_vars else False
+        else:
+            ok = safe_int(values.get("init"), 1) == 0
+        raw = first_value(values, "raw")
+        scaled = first_value(values, "mgauss")
+        if raw == "-":
+            raw = f"{first_value(values, 'raw_x', 'x_raw')},{first_value(values, 'raw_y', 'y_raw')},{first_value(values, 'raw_z', 'z_raw')}"
+        if scaled == "-":
+            scaled = f"{first_value(values, 'x_mgauss', 'x')},{first_value(values, 'y_mgauss', 'y')},{first_value(values, 'z_mgauss', 'z')}"
+        if raw == "-,-,-":
+            raw = "-"
+        if scaled == "-,-,-":
+            scaled = "-"
+
+        updates = {
+            "state": ("正常" if ok else "异常") if has_state_fields else "-",
+            "type": first_value(values, "type"),
+            "raw": raw,
+            "scaled": scaled,
+        }
+        for key, value in updates.items():
+            if key in self.mag_vars and value != "-":
+                self.mag_vars[key].set(value)
+
+        module_state = ("正常" if ok else "异常") if has_state_fields else None
+        if {"ist", "hmc", "qmc"} & values.keys():
+            value_text = f"probe ist={values.get('ist', '-')} hmc={values.get('hmc', '-')} qmc={values.get('qmc', '-')}"
+            code_text = f"hmc_id={values.get('hmc_id', '-')}"
+        else:
+            value_text = f"type={first_value(values, 'type')} addr={values.get('addr', '-')} n={values.get('n', '-')}"
+            code_text = f"init={values.get('init', '-')} st={values.get('st', '-')}"
+        self._update_module(
+            "MAG",
+            state=module_state,
+            stage=first_value(values, "type"),
+            value=value_text,
+            code=code_text,
+            hint=self._hardware_hint("MAG", ok, values) if has_state_fields else None,
+            line=line,
+        )
+
+    def _update_gps_plot(self) -> None:
+        if not HAS_MATPLOTLIB or self.gps_axis is None or self.gps_canvas is None:
+            return
+        self.gps_axis.clear()
+        self.gps_axis.set_title("M9N XY track")
+        self.gps_axis.set_xlabel("X east (m)")
+        self.gps_axis.set_ylabel("Y north (m)")
+        self.gps_axis.grid(True, alpha=0.3)
+        self.gps_axis.set_aspect("equal", adjustable="datalim")
+
+        if self.gps_track:
+            xs = [float(point["x_m"]) for point in self.gps_track]
+            ys = [float(point["y_m"]) for point in self.gps_track]
+            self.gps_axis.plot(xs, ys, linewidth=1.2, marker=".", markersize=3)
+            self.gps_axis.scatter([xs[-1]], [ys[-1]], s=45, color="#d62728", zorder=3)
+            pad = max(max(xs) - min(xs), max(ys) - min(ys), 2.0) * 0.08
+            self.gps_axis.set_xlim(min(xs) - pad, max(xs) + pad)
+            self.gps_axis.set_ylim(min(ys) - pad, max(ys) + pad)
+        else:
+            self.gps_axis.text(0.5, 0.5, "waiting for GPS points", ha="center", va="center", transform=self.gps_axis.transAxes)
+
+        self.gps_figure.tight_layout()
+        self.gps_canvas.draw_idle()
+
+    def _clear_gps_track(self) -> None:
+        self.gps_track.clear()
+        self.gps_origin_lat = None
+        self.gps_origin_lon = None
+        self.gps_count_var.set("轨迹点: 0")
+        self.gps_status_var.set("等待 GPS")
+        self.gps_last_plot_ns = time.monotonic_ns()
+        self._update_gps_plot()
+
+    def _export_gps_csv(self) -> None:
+        if not self.gps_track:
+            messagebox.showinfo("没有数据", "GPS 轨迹为空")
+            return
+        initial = Path.cwd() / f"gps_track_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        filename = filedialog.asksaveasfilename(
+            title="导出 GPS 轨迹",
+            defaultextension=".csv",
+            initialfile=initial.name,
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+        )
+        if not filename:
+            return
+        with open(filename, "w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=["time", "lat", "lon", "x_m", "y_m", "fix", "sv", "hmsl_mm", "hacc_mm", "line"])
+            writer.writeheader()
+            for point in self.gps_track:
+                writer.writerow(point)
+        self._append(f"[上位机] 已导出 GPS 轨迹: {filename}")
+
     def _update_config_line(self, line: str) -> None:
         values = parse_kv(line)
         if "loaded" in values or "valid" in values:
@@ -2394,6 +2817,10 @@ class DronePanel(tk.Tk):
             return "重点看 SPI4、CS、MISO、器件方向或焊接型号；SPL06 ID 通常应为 0x10。"
         if key == "ICM42688":
             return "重点看 SPI2/IMU 硬件链路；CHIP_ID ?? 0xA1。"
+        if key == "GPS":
+            return "确认 M9N 接 USART2: PD5 TX 到 GPS RX，PD6 RX 接 GPS TX，115200 8N1，且 USART2 IRQ 已开。"
+        if key == "MAG":
+            return "确认磁力计在 I2C1: PB6 SCL / PB7 SDA，外部上拉、电源和地址匹配。"
         if key == "UART1":
             return "确认 USART1: PB14 TX 接 Ai-WB2 RX，PB15 RX 接 Ai-WB2 TX，115200 8N1。"
         if key == "WIFI":

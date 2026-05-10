@@ -3,7 +3,9 @@
 #include "app_aiwb2.h"
 #include "app_baro.h"
 #include "app_flash.h"
+#include "app_gps.h"
 #include "app_imu.h"
+#include "app_mag.h"
 #include "app_maint_uart.h"
 #include "app_messages.h"
 #include "app_proto.h"
@@ -57,6 +59,7 @@ static uint8_t control_maint_output_active;
 static void app_control_handle_param(char **tokens, uint32_t count);
 static void app_control_report_pid_legacy(void);
 static void app_control_report_wifi(void);
+static void app_control_queue_text(const char *format, ...);
 static void app_control_queue_proto_text(uint16_t function, const char *format, ...);
 static void app_control_process_proto_request(uint16_t function,
                                               const uint8_t *payload,
@@ -71,6 +74,11 @@ static uint8_t app_control_payload_to_line(const uint8_t *payload,
 static void app_control_handle_wifi(char **tokens, uint32_t count);
 static void app_control_service_wifi_reset(void);
 static void app_control_tick_common(uint8_t emit_heartbeat);
+static void app_control_report_gps(void);
+static void app_control_report_mag(void);
+static void app_control_req_m9n(uint32_t id, const char *op);
+static void app_control_req_mag(uint32_t id, const char *op);
+static const char *app_control_age_text(uint32_t age_ms, char *buffer, uint16_t size);
 
 static uint16_t app_control_detect_function(const char *format)
 {
@@ -128,6 +136,21 @@ static uint8_t app_control_flash_ok(const APP_Flash_Status *status)
             (status->probe_status == 0) &&
             (status->status1_status == 0) &&
             (status->read_status == 0)) ? 1U : 0U;
+}
+
+static const char *app_control_age_text(uint32_t age_ms, char *buffer, uint16_t size)
+{
+    if ((buffer == NULL) || (size == 0U)) {
+        return "?";
+    }
+
+    if (age_ms == 0xFFFFFFFFUL) {
+        (void)snprintf(buffer, size, "none");
+    } else {
+        (void)snprintf(buffer, size, "%lu", (unsigned long)age_ms);
+    }
+
+    return buffer;
 }
 
 static const char *app_control_flash_stage(const APP_Flash_Status *status)
@@ -399,6 +422,10 @@ static uint16_t app_control_response_function_for_request(uint16_t function)
         return APP_PROTO_MSG_SERVO_RESULT;
     case APP_PROTO_REQ_WIFI:
         return APP_PROTO_MSG_WIFI_RECORD;
+    case APP_PROTO_REQ_GPS:
+        return APP_PROTO_MSG_GPS_RECORD;
+    case APP_PROTO_REQ_MAG:
+        return APP_PROTO_MSG_MAG_RECORD;
     default:
         return 0U;
     }
@@ -613,9 +640,9 @@ static void app_control_report_caps(void)
     app_control_queue_proto_text(APP_PROTO_MSG_CAPS_RECORD,
                                  "RSP id=0 mod=CAPS op=LIST legacy=PING,STATUS?,CONFIG?,SAVE,LOAD,SERVO raw=custom-tab\r\n");
     app_control_queue_proto_text(APP_PROTO_MSG_CAPS_RECORD,
-                                 "RSP id=0 mod=CAPS op=LIST mods=MODULES,SPL06,ICM42688,PARAM,FLASH,WIFI\r\n");
+                                 "RSP id=0 mod=CAPS op=LIST mods=MODULES,SPL06,ICM42688,M9N,MAG,PARAM,FLASH,WIFI\r\n");
     app_control_queue_proto_text(APP_PROTO_MSG_CAPS_RECORD,
-                                 "RSP id=0 mod=CAPS op=LIST ops=SPL06:STATUS,READ,SAMPLE ICM42688:STATUS,DIAG\r\n");
+                                 "RSP id=0 mod=CAPS op=LIST ops=SPL06:STATUS,READ,SAMPLE ICM42688:STATUS,DIAG M9N:STATUS,DIAG MAG:STATUS,DIAG\r\n");
     app_control_queue_proto_text(APP_PROTO_MSG_CAPS_RECORD,
                                  "RSP id=0 mod=CAPS op=LIST ops=WIFI:STATUS,EN,RESET legacy=WIFI?,WIFI_EN?\r\n");
 }
@@ -817,26 +844,114 @@ static void app_control_report_imu(void)
                                  (unsigned int)imu_status.diag_burst_m3_tok_4);
 }
 
+static void app_control_report_gps(void)
+{
+    APP_GPS_Status gps_status;
+    uint32_t now_ms = HAL_GetTick();
+    uint32_t age_ms = 0U;
+    char age_text[16];
+
+    APP_GPS_GetStatus(&gps_status);
+    if (gps_status.last_rx_ms != 0U) {
+        age_ms = now_ms - gps_status.last_rx_ms;
+    } else {
+        age_ms = 0xFFFFFFFFUL;
+    }
+
+    app_control_queue_text("GPS ok=%u init=%ld fix=%u valid=%u sv=%u pkts=%lu nav=%lu nmea=%lu gga=%lu age_ms=%s\r\n",
+                           (unsigned int)gps_status.initialized,
+                           (long)gps_status.init_status,
+                           (unsigned int)gps_status.fix_type,
+                           (unsigned int)gps_status.valid_fix,
+                           (unsigned int)gps_status.num_sv,
+                           (unsigned long)gps_status.packets,
+                           (unsigned long)gps_status.nav_pvt_packets,
+                           (unsigned long)gps_status.nmea_sentences,
+                           (unsigned long)gps_status.nmea_gga_sentences,
+                           app_control_age_text(age_ms, age_text, (uint16_t)sizeof(age_text)));
+    app_control_queue_text("GPS diag bytes=%lu cksum=%lu nmea_ck=%lu ovf=%lu nmea_ovf=%lu rst=%lu uerr=%lu cfg=%lu\r\n",
+                           (unsigned long)gps_status.bytes,
+                           (unsigned long)gps_status.checksum_errors,
+                           (unsigned long)gps_status.nmea_checksum_errors,
+                           (unsigned long)gps_status.payload_overflows,
+                           (unsigned long)gps_status.nmea_overflows,
+                           (unsigned long)gps_status.rx_restarts,
+                           (unsigned long)gps_status.uart_errors,
+                           (unsigned long)gps_status.config_writes);
+    app_control_queue_text("GPS pos lon=%ld lat=%ld hmsl_mm=%ld hacc_mm=%lu vacc_mm=%lu vn=%ld ve=%ld vd=%ld head_e5=%ld utc=%04u-%02u-%02uT%02u:%02u:%02u\r\n",
+                           (long)gps_status.lon_deg_e7,
+                           (long)gps_status.lat_deg_e7,
+                           (long)gps_status.hmsl_mm,
+                           (unsigned long)gps_status.hacc_mm,
+                           (unsigned long)gps_status.vacc_mm,
+                           (long)gps_status.vel_n_mm_s,
+                           (long)gps_status.vel_e_mm_s,
+                           (long)gps_status.vel_d_mm_s,
+                           (long)gps_status.heading_motion_deg_e5,
+                           (unsigned int)gps_status.year,
+                           (unsigned int)gps_status.month,
+                           (unsigned int)gps_status.day,
+                           (unsigned int)gps_status.hour,
+                           (unsigned int)gps_status.minute,
+                           (unsigned int)gps_status.second);
+}
+
+static void app_control_report_mag(void)
+{
+    APP_MAG_Status mag_status;
+
+    APP_MAG_GetStatus(&mag_status);
+
+    app_control_queue_text("MAG ok=%u init=%ld st=%ld type=%s addr=0x%02X who=0x%02X n=%lu raw=%d,%d,%d mgauss=%ld,%ld,%ld\r\n",
+                           (unsigned int)mag_status.initialized,
+                           (long)mag_status.init_status,
+                           (long)mag_status.last_status,
+                           APP_MAG_GetTypeName(mag_status.type),
+                           (unsigned int)mag_status.address,
+                           (unsigned int)mag_status.who_am_i,
+                           (unsigned long)mag_status.sample_count,
+                           (int)mag_status.raw_x,
+                           (int)mag_status.raw_y,
+                           (int)mag_status.raw_z,
+                           (long)mag_status.x_mgauss,
+                           (long)mag_status.y_mgauss,
+                           (long)mag_status.z_mgauss);
+    app_control_queue_text("MAG probe ist=%u hmc=%u qmc=%u hmc_id=%02X%02X%02X\r\n",
+                           (unsigned int)mag_status.detected_ist8310,
+                           (unsigned int)mag_status.detected_hmc5883,
+                           (unsigned int)mag_status.detected_qmc5883,
+                           (unsigned int)mag_status.hmc_id_a,
+                           (unsigned int)mag_status.hmc_id_b,
+                           (unsigned int)mag_status.hmc_id_c);
+}
+
 static void app_control_report_modules(void)
 {
     APP_Flash_Status flash_status;
     APP_Baro_Status baro_status;
     APP_IMU_Status imu_status;
+    APP_GPS_Status gps_status;
+    APP_MAG_Status mag_status;
 
     APP_Flash_GetStatus(&flash_status);
     APP_Baro_GetStatus(&baro_status);
     APP_IMU_GetStatus(&imu_status);
+    APP_GPS_GetStatus(&gps_status);
+    APP_MAG_GetStatus(&mag_status);
 
     app_control_queue_proto_text(APP_PROTO_MSG_MODULES_SUMMARY,
-                                 "RSP id=0 mod=MODULES op=STATUS flash=%u flash_stage=%s baro=%u baro_stage=%s imu=%u\r\n",
+                                 "RSP id=0 mod=MODULES op=STATUS flash=%u flash_stage=%s baro=%u baro_stage=%s imu=%u gps=%u mag=%u\r\n",
                                  (unsigned int)app_control_flash_ok(&flash_status),
                                  app_control_flash_stage(&flash_status),
                                  (unsigned int)app_control_baro_ok(&baro_status),
                                  app_control_baro_stage(&baro_status),
-                                 (unsigned int)imu_status.initialized);
+                                 (unsigned int)imu_status.initialized,
+                                 (unsigned int)gps_status.initialized,
+                                 (unsigned int)mag_status.initialized);
     app_control_queue_proto_text(APP_PROTO_MSG_MODULES_SUMMARY,
-                                 "RSP id=0 mod=MODULES op=STATUS imu_stage=%s cfg_valid=%u cfg_loaded=%u servo_slots=%u wifi_en=%u\r\n",
+                                 "RSP id=0 mod=MODULES op=STATUS imu_stage=%s mag_type=%s cfg_valid=%u cfg_loaded=%u servo_slots=%u wifi_en=%u\r\n",
                                  app_control_imu_stage_name(imu_status.init_stage),
+                                 APP_MAG_GetTypeName(mag_status.type),
                                  (unsigned int)control_config.flash_valid,
                                  (unsigned int)control_config.loaded_from_flash,
                                  (unsigned int)APP_CONTROL_SERVO_COUNT,
@@ -979,6 +1094,117 @@ static void app_control_req_icm42688(uint32_t id, const char *op)
     app_control_protocol_err(id, "ICM42688", op, "BAD_OP");
 }
 
+static void app_control_req_m9n(uint32_t id, const char *op)
+{
+    APP_GPS_Status gps_status;
+    uint32_t now_ms = HAL_GetTick();
+    uint32_t age_ms = 0U;
+    char age_text[16];
+
+    if (op == NULL) {
+        app_control_protocol_err(id, "M9N", "?", "NO_OP");
+        return;
+    }
+
+    APP_GPS_GetStatus(&gps_status);
+    if (gps_status.last_rx_ms != 0U) {
+        age_ms = now_ms - gps_status.last_rx_ms;
+    } else {
+        age_ms = 0xFFFFFFFFUL;
+    }
+
+    if ((strcmp(op, "STATUS") == 0) || (strcmp(op, "DIAG") == 0)) {
+        app_control_queue_text("RSP id=%lu mod=M9N op=%s ok=%u init=%ld fix=%u valid=%u sv=%u age_ms=%s packets=%lu nav=%lu nmea=%lu gga=%lu\r\n",
+                               (unsigned long)id,
+                               op,
+                               (unsigned int)gps_status.initialized,
+                               (long)gps_status.init_status,
+                               (unsigned int)gps_status.fix_type,
+                               (unsigned int)gps_status.valid_fix,
+                               (unsigned int)gps_status.num_sv,
+                               app_control_age_text(age_ms, age_text, (uint16_t)sizeof(age_text)),
+                               (unsigned long)gps_status.packets,
+                               (unsigned long)gps_status.nav_pvt_packets,
+                               (unsigned long)gps_status.nmea_sentences,
+                               (unsigned long)gps_status.nmea_gga_sentences);
+        app_control_queue_text("RSP id=%lu mod=M9N op=%s bytes=%lu cksum=%lu nmea_ck=%lu ovf=%lu nmea_ovf=%lu rst=%lu uerr=%lu cfg=%lu\r\n",
+                               (unsigned long)id,
+                               op,
+                               (unsigned long)gps_status.bytes,
+                               (unsigned long)gps_status.checksum_errors,
+                               (unsigned long)gps_status.nmea_checksum_errors,
+                               (unsigned long)gps_status.payload_overflows,
+                               (unsigned long)gps_status.nmea_overflows,
+                               (unsigned long)gps_status.rx_restarts,
+                               (unsigned long)gps_status.uart_errors,
+                               (unsigned long)gps_status.config_writes);
+        app_control_queue_text("RSP id=%lu mod=M9N op=%s lon=%ld lat=%ld hmsl_mm=%ld hacc_mm=%lu vacc_mm=%lu vn=%ld ve=%ld vd=%ld head_e5=%ld utc=%04u-%02u-%02uT%02u:%02u:%02u\r\n",
+                               (unsigned long)id,
+                               op,
+                               (long)gps_status.lon_deg_e7,
+                               (long)gps_status.lat_deg_e7,
+                               (long)gps_status.hmsl_mm,
+                               (unsigned long)gps_status.hacc_mm,
+                               (unsigned long)gps_status.vacc_mm,
+                               (long)gps_status.vel_n_mm_s,
+                               (long)gps_status.vel_e_mm_s,
+                               (long)gps_status.vel_d_mm_s,
+                               (long)gps_status.heading_motion_deg_e5,
+                               (unsigned int)gps_status.year,
+                               (unsigned int)gps_status.month,
+                               (unsigned int)gps_status.day,
+                               (unsigned int)gps_status.hour,
+                               (unsigned int)gps_status.minute,
+                               (unsigned int)gps_status.second);
+        return;
+    }
+
+    app_control_protocol_err(id, "M9N", op, "BAD_OP");
+}
+
+static void app_control_req_mag(uint32_t id, const char *op)
+{
+    APP_MAG_Status mag_status;
+
+    if (op == NULL) {
+        app_control_protocol_err(id, "MAG", "?", "NO_OP");
+        return;
+    }
+
+    APP_MAG_GetStatus(&mag_status);
+
+    if ((strcmp(op, "STATUS") == 0) || (strcmp(op, "DIAG") == 0)) {
+        app_control_queue_text("RSP id=%lu mod=MAG op=%s ok=%u init=%ld st=%ld type=%s addr=0x%02X who=0x%02X n=%lu raw=%d,%d,%d mgauss=%ld,%ld,%ld\r\n",
+                               (unsigned long)id,
+                               op,
+                               (unsigned int)mag_status.initialized,
+                               (long)mag_status.init_status,
+                               (long)mag_status.last_status,
+                               APP_MAG_GetTypeName(mag_status.type),
+                               (unsigned int)mag_status.address,
+                               (unsigned int)mag_status.who_am_i,
+                               (unsigned long)mag_status.sample_count,
+                               (int)mag_status.raw_x,
+                               (int)mag_status.raw_y,
+                               (int)mag_status.raw_z,
+                               (long)mag_status.x_mgauss,
+                               (long)mag_status.y_mgauss,
+                               (long)mag_status.z_mgauss);
+        app_control_queue_text("RSP id=%lu mod=MAG op=%s probe ist=%u hmc=%u qmc=%u hmc_id=%02X%02X%02X\r\n",
+                               (unsigned long)id,
+                               op,
+                               (unsigned int)mag_status.detected_ist8310,
+                               (unsigned int)mag_status.detected_hmc5883,
+                               (unsigned int)mag_status.detected_qmc5883,
+                               (unsigned int)mag_status.hmc_id_a,
+                               (unsigned int)mag_status.hmc_id_b,
+                               (unsigned int)mag_status.hmc_id_c);
+        return;
+    }
+
+    app_control_protocol_err(id, "MAG", op, "BAD_OP");
+}
+
 static void app_control_handle_req(char **tokens, uint32_t count)
 {
     const char *id_text = app_control_token_value(tokens, count, "id");
@@ -1003,6 +1229,16 @@ static void app_control_handle_req(char **tokens, uint32_t count)
 
     if (strcmp(mod, "ICM42688") == 0) {
         app_control_req_icm42688(id, op);
+        return;
+    }
+
+    if (strcmp(mod, "M9N") == 0) {
+        app_control_req_m9n(id, op);
+        return;
+    }
+
+    if (strcmp(mod, "MAG") == 0) {
+        app_control_req_mag(id, op);
         return;
     }
 
@@ -1040,6 +1276,8 @@ static void app_control_report_status(void)
     APP_Flash_Status flash_status;
     APP_Baro_Status baro_status;
     APP_IMU_Status imu_status;
+    APP_GPS_Status gps_status;
+    APP_MAG_Status mag_status;
     uint32_t uart_rx_bytes = 0U;
     uint32_t uart_rx_lines = 0U;
     uint32_t uart_rx_overflows = 0U;
@@ -1051,6 +1289,8 @@ static void app_control_report_status(void)
     APP_Flash_GetStatus(&flash_status);
     APP_Baro_GetStatus(&baro_status);
     APP_IMU_GetStatus(&imu_status);
+    APP_GPS_GetStatus(&gps_status);
+    APP_MAG_GetStatus(&mag_status);
     APP_UART_GetStats(&uart_rx_bytes,
                       &uart_rx_lines,
                       &uart_rx_overflows,
@@ -1112,6 +1352,32 @@ static void app_control_report_status(void)
                                  (unsigned int)imu_status.diag_burst_m3_tok_2,
                                  (unsigned int)imu_status.diag_burst_m3_tok_3,
                                  (unsigned int)imu_status.diag_burst_m3_tok_4);
+    app_control_queue_proto_text(APP_PROTO_MSG_GPS_RECORD,
+                                 "HW M9N ok=%u init=%ld fix=%u valid=%u sv=%u packets=%lu nav=%lu nmea=%lu gga=%lu lon=%ld lat=%ld hmsl_mm=%ld\r\n",
+                                 (unsigned int)gps_status.initialized,
+                                 (long)gps_status.init_status,
+                                 (unsigned int)gps_status.fix_type,
+                                 (unsigned int)gps_status.valid_fix,
+                                 (unsigned int)gps_status.num_sv,
+                                 (unsigned long)gps_status.packets,
+                                 (unsigned long)gps_status.nav_pvt_packets,
+                                 (unsigned long)gps_status.nmea_sentences,
+                                 (unsigned long)gps_status.nmea_gga_sentences,
+                                 (long)gps_status.lon_deg_e7,
+                                 (long)gps_status.lat_deg_e7,
+                                 (long)gps_status.hmsl_mm);
+    app_control_queue_proto_text(APP_PROTO_MSG_MAG_RECORD,
+                                 "HW MAG ok=%u init=%ld st=%ld type=%s addr=0x%02X who=0x%02X n=%lu x=%ld y=%ld z=%ld\r\n",
+                                 (unsigned int)mag_status.initialized,
+                                 (long)mag_status.init_status,
+                                 (long)mag_status.last_status,
+                                 APP_MAG_GetTypeName(mag_status.type),
+                                 (unsigned int)mag_status.address,
+                                 (unsigned int)mag_status.who_am_i,
+                                 (unsigned long)mag_status.sample_count,
+                                 (long)mag_status.x_mgauss,
+                                 (long)mag_status.y_mgauss,
+                                 (long)mag_status.z_mgauss);
 
     app_control_queue_proto_text(APP_PROTO_MSG_STATUS_FLASH,
                                  "STATUS flash probe=%ld sr_st=%ld read=%ld id=%02X%02X%02X sr1=%02X\r\n",
@@ -1148,6 +1414,33 @@ static void app_control_report_status(void)
                                  (long)imu_status.gyro_y_mdps,
                                  (long)imu_status.gyro_z_mdps,
                                  (int)imu_status.temperature_cdeg);
+    app_control_queue_proto_text(APP_PROTO_MSG_GPS_RECORD,
+                                 "STATUS gps init=%u st=%ld fix=%u valid=%u sv=%u nav=%lu lon=%ld lat=%ld hmsl=%ld hacc=%lu vacc=%lu\r\n",
+                                 (unsigned int)gps_status.initialized,
+                                 (long)gps_status.init_status,
+                                 (unsigned int)gps_status.fix_type,
+                                 (unsigned int)gps_status.valid_fix,
+                                 (unsigned int)gps_status.num_sv,
+                                 (unsigned long)gps_status.nav_pvt_packets,
+                                 (long)gps_status.lon_deg_e7,
+                                 (long)gps_status.lat_deg_e7,
+                                 (long)gps_status.hmsl_mm,
+                                 (unsigned long)gps_status.hacc_mm,
+                                 (unsigned long)gps_status.vacc_mm);
+    app_control_queue_proto_text(APP_PROTO_MSG_MAG_RECORD,
+                                 "STATUS mag init=%u st=%ld type=%s addr=0x%02X who=0x%02X n=%lu raw=%d,%d,%d mgauss=%ld,%ld,%ld\r\n",
+                                 (unsigned int)mag_status.initialized,
+                                 (long)mag_status.last_status,
+                                 APP_MAG_GetTypeName(mag_status.type),
+                                 (unsigned int)mag_status.address,
+                                 (unsigned int)mag_status.who_am_i,
+                                 (unsigned long)mag_status.sample_count,
+                                 (int)mag_status.raw_x,
+                                 (int)mag_status.raw_y,
+                                 (int)mag_status.raw_z,
+                                 (long)mag_status.x_mgauss,
+                                 (long)mag_status.y_mgauss,
+                                 (long)mag_status.z_mgauss);
     app_control_queue_proto_text(APP_PROTO_MSG_UART_STATS,
                                  "UART1 rx_bytes=%lu rx_lines=%lu rx_overflows=%lu rx_errors=%lu rx_evt=%lu rx_rst=%lu rx_evt_size=%lu\r\n",
                                  (unsigned long)uart_rx_bytes,
@@ -1910,6 +2203,10 @@ static void app_control_dispatch_tokens(char **tokens, uint32_t count, uint8_t e
         app_control_handle_baro(tokens, count);
     } else if (strcmp(tokens[0], "IMU?") == 0) {
         app_control_report_imu();
+    } else if (strcmp(tokens[0], "GPS?") == 0) {
+        app_control_report_gps();
+    } else if (strcmp(tokens[0], "MAG?") == 0) {
+        app_control_report_mag();
     } else if (strcmp(tokens[0], "PARAM?") == 0) {
         app_control_report_params();
     } else if (strcmp(tokens[0], "PID?") == 0) {
@@ -2026,6 +2323,14 @@ static void app_control_process_proto_request(uint16_t function,
 
     case APP_PROTO_REQ_IMU:
         app_control_dispatch_tokens((char *[]){"IMU?"}, 1U, 0U);
+        break;
+
+    case APP_PROTO_REQ_GPS:
+        app_control_dispatch_tokens((char *[]){"GPS?"}, 1U, 0U);
+        break;
+
+    case APP_PROTO_REQ_MAG:
+        app_control_dispatch_tokens((char *[]){"MAG?"}, 1U, 0U);
         break;
 
     case APP_PROTO_REQ_MODULES:

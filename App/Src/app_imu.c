@@ -103,6 +103,8 @@ static void APP_IMU_PublishSample(void)
 
 void APP_IMU_Task_Init(void)
 {
+    APP_Task_GPS_Init();
+    APP_Task_MAG_Init();
     BSP_IMU_Invalidate();
     imu_state.sample_count = 0U;
     imu_state.last_status = BSP_ICM42688_ERROR;
@@ -164,6 +166,9 @@ static void APP_IMU_UpdateAttitude(void)
 void APP_IMU_Task_Step(void)
 {
     bool ready = false;
+
+    APP_Task_GPS_Step();
+    APP_Task_MAG_Step();
 
     if (imu_state.initialized == 0U) {
         imu_state.last_status = BSP_IMU_Init();

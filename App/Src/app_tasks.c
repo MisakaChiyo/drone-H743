@@ -2,6 +2,8 @@
 #include "app_message.h"
 #include "app_led.h"
 #include "app_imu.h"
+#include "app_gps.h"
+#include "app_mag.h"
 #include "app_uart.h"
 #include "app_maint_uart.h"
 
@@ -23,6 +25,26 @@ void APP_Task_IMU_Init(void)
 void APP_Task_IMU_Step(void)
 {
     APP_IMU_Task_Step();
+}
+
+void APP_Task_GPS_Init(void)
+{
+    APP_GPS_Init();
+}
+
+void APP_Task_GPS_Step(void)
+{
+    APP_GPS_Step();
+}
+
+void APP_Task_MAG_Init(void)
+{
+    APP_MAG_Init();
+}
+
+void APP_Task_MAG_Step(void)
+{
+    APP_MAG_Step();
 }
 
 void APP_Task_Message_Init(void)

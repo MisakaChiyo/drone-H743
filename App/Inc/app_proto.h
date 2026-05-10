@@ -33,6 +33,8 @@
 #define APP_PROTO_REQ_SERVO_ACTION   0x1016U
 #define APP_PROTO_REQ_SERVO_RAW      0x1017U
 #define APP_PROTO_REQ_WIFI           0x1018U
+#define APP_PROTO_REQ_GPS            0x1019U
+#define APP_PROTO_REQ_MAG            0x101AU
 
 #define APP_PROTO_MSG_CMD_LINE  0x2000U
 #define APP_PROTO_MSG_TEXT_LINE 0x2001U
@@ -67,6 +69,8 @@
 #define APP_PROTO_MSG_DEFAULTS_RESULT   0x2218U
 #define APP_PROTO_MSG_SERVO_RESULT      0x2219U
 #define APP_PROTO_MSG_WIFI_RECORD       0x221AU
+#define APP_PROTO_MSG_GPS_RECORD        0x221BU
+#define APP_PROTO_MSG_MAG_RECORD        0x221CU
 
 typedef struct {
     uint8_t direction;
