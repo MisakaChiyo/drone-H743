@@ -1,5 +1,6 @@
 #include "app_mag.h"
 
+#include "app_control.h"
 #include "bsp_mag.h"
 
 #include <string.h>
@@ -75,4 +76,33 @@ void APP_MAG_GetStatus(APP_MAG_Status *status)
 const char *APP_MAG_GetTypeName(uint8_t type)
 {
     return BSP_MAG_TypeName((BSP_MAG_Type)type);
+}
+
+void APP_MAG_Report(void)
+{
+    APP_MAG_Status mag_status;
+
+    APP_MAG_GetStatus(&mag_status);
+
+    APP_Control_QueueText("MAG ok=%u init=%ld st=%ld type=%s addr=0x%02X who=0x%02X n=%lu raw=%d,%d,%d mgauss=%ld,%ld,%ld\r\n",
+                           (unsigned int)mag_status.initialized,
+                           (long)mag_status.init_status,
+                           (long)mag_status.last_status,
+                           APP_MAG_GetTypeName(mag_status.type),
+                           (unsigned int)mag_status.address,
+                           (unsigned int)mag_status.who_am_i,
+                           (unsigned long)mag_status.sample_count,
+                           (int)mag_status.raw_x,
+                           (int)mag_status.raw_y,
+                           (int)mag_status.raw_z,
+                           (long)mag_status.x_mgauss,
+                           (long)mag_status.y_mgauss,
+                           (long)mag_status.z_mgauss);
+    APP_Control_QueueText("MAG probe ist=%u hmc=%u qmc=%u hmc_id=%02X%02X%02X\r\n",
+                           (unsigned int)mag_status.detected_ist8310,
+                           (unsigned int)mag_status.detected_hmc5883,
+                           (unsigned int)mag_status.detected_qmc5883,
+                           (unsigned int)mag_status.hmc_id_a,
+                           (unsigned int)mag_status.hmc_id_b,
+                           (unsigned int)mag_status.hmc_id_c);
 }

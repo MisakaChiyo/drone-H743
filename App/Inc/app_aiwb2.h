@@ -16,6 +16,11 @@ typedef enum {
     APP_AIWB2_STATE_RETRY_DELAY
 } APP_AiWB2_State;
 
+typedef enum {
+    APP_AIWB2_LINK_UDP_SERVER = 1,
+    APP_AIWB2_LINK_TCP_CLIENT = 4
+} APP_AiWB2_LinkMode;
+
 void APP_AiWB2_Init(void);
 void APP_AiWB2_Tick(void);
 void APP_AiWB2_ProcessLine(const char *line);
@@ -25,7 +30,12 @@ uint8_t APP_AiWB2_ShouldConsumeTransparentLine(const char *line);
 void APP_AiWB2_AssumeTransparent(void);
 uint8_t APP_AiWB2_StartProvision(const char *ssid,
                                  const char *password,
-                                 const char *local_port);
+                                 APP_AiWB2_LinkMode mode,
+                                 const char *host,
+                                 const char *port);
+uint8_t APP_AiWB2_StartSocketConfig(APP_AiWB2_LinkMode mode,
+                                    const char *host,
+                                    const char *port);
 uint8_t APP_AiWB2_SendRawCommand(const char *command);
 void APP_AiWB2_SendDiagCommands(void);
 APP_AiWB2_State APP_AiWB2_GetState(void);

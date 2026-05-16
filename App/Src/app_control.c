@@ -59,12 +59,8 @@ static APP_ControlConfig control_config;
 static uint32_t control_last_heartbeat_ms;
 static uint8_t control_reported_hw_once;
 #endif
-static uint8_t control_baro_stream_enabled;
-static uint32_t control_baro_stream_period_ms;
-static uint32_t control_last_baro_stream_ms;
 static uint8_t control_wifi_reset_pending;
 static uint32_t control_wifi_reset_deadline_ms;
-static uint16_t control_response_override_function;
 static uint8_t control_initialized;
 static uint8_t control_maint_output_active;
 static uint8_t control_dwt_ready;
@@ -76,13 +72,9 @@ static uint8_t control_flash_buf_b[APP_CONTROL_FLASH_BENCH_MAX_LEN];
 static void app_control_handle_param(char **tokens, uint32_t count);
 static void app_control_report_pid_legacy(void);
 static void app_control_report_wifi(void);
-static void app_control_queue_text(const char *format, ...);
+void APP_Control_QueueText(const char *format, ...);
 static void app_control_queue_proto_text(uint16_t function, const char *format, ...);
-static void app_control_process_proto_request(uint16_t function,
-                                              const uint8_t *payload,
-                                              uint16_t payload_length);
 static void app_control_dispatch_tokens(char **tokens, uint32_t count, uint8_t emit_ack);
-static uint16_t app_control_response_function_for_request(uint16_t function);
 static uint32_t app_control_tokenize(char *buffer, char **tokens, uint32_t max_tokens);
 static uint8_t app_control_payload_to_line(const uint8_t *payload,
                                            uint16_t payload_length,
@@ -91,35 +83,11 @@ static uint8_t app_control_payload_to_line(const uint8_t *payload,
 static void app_control_handle_wifi(char **tokens, uint32_t count);
 static void app_control_service_wifi_reset(void);
 static void app_control_tick_common(uint8_t emit_heartbeat);
-static void app_control_report_gps(void);
-static void app_control_report_mag(void);
 static void app_control_report_rtos(void);
 static void app_control_handle_flash(char **tokens, uint32_t count);
 static void app_control_req_m9n(uint32_t id, const char *op);
 static void app_control_req_mag(uint32_t id, const char *op);
 static const char *app_control_age_text(uint32_t age_ms, char *buffer, uint16_t size);
-
-static uint16_t app_control_detect_function(const char *format)
-{
-    if (format == NULL) {
-        return APP_PROTO_MSG_TEXT_LINE;
-    }
-
-    if (strncmp(format, "RX ", 3U) == 0) {
-        return APP_PROTO_MSG_CMD_RX;
-    }
-    if (strncmp(format, "ACK ", 4U) == 0) {
-        return APP_PROTO_MSG_CMD_ACK;
-    }
-    if (strncmp(format, "ERR ", 4U) == 0) {
-        return APP_PROTO_MSG_CMD_ERR;
-    }
-    if (strncmp(format, "OK ", 3U) == 0) {
-        return APP_PROTO_MSG_CMD_OK;
-    }
-
-    return APP_PROTO_MSG_TEXT_LINE;
-}
 
 static const char *app_control_imu_stage_name(uint8_t stage)
 {
@@ -232,7 +200,7 @@ static uint32_t app_control_checksum(const uint8_t *data, uint32_t length)
     return sum;
 }
 
-static void app_control_queue_text(const char *format, ...)
+void APP_Control_QueueText(const char *format, ...)
 {
     APP_UART_TxMessage tx_message;
     APP_UART_TxMessage dropped;
@@ -243,9 +211,7 @@ static void app_control_queue_text(const char *format, ...)
         return;
     }
 
-    tx_message.function = (control_response_override_function != 0U) ?
-                          control_response_override_function :
-                          app_control_detect_function(format);
+    tx_message.function = 0U;
     va_start(args, format);
     written = vsnprintf(tx_message.text, sizeof(tx_message.text), format, args);
     va_end(args);
@@ -394,62 +360,6 @@ static uint16_t app_control_copy_payload_text(char *buffer,
 
     buffer[used] = '\0';
     return used;
-}
-
-static uint16_t app_control_response_function_for_request(uint16_t function)
-{
-    switch (function) {
-    case APP_PROTO_REQ_PING:
-        return APP_PROTO_MSG_PONG;
-    case APP_PROTO_REQ_STATUS:
-        return APP_PROTO_MSG_STATUS_FLASH;
-    case APP_PROTO_REQ_CONFIG:
-        return APP_PROTO_MSG_CONFIG_SUMMARY;
-    case APP_PROTO_REQ_PARAMS:
-        return APP_PROTO_MSG_PARAM_RECORD;
-    case APP_PROTO_REQ_PID:
-        return APP_PROTO_MSG_PID_RECORD;
-    case APP_PROTO_REQ_BARO:
-    case APP_PROTO_REQ_BARO_STREAM:
-        return APP_PROTO_MSG_BARO_STATE;
-    case APP_PROTO_REQ_FLASH:
-        return APP_PROTO_MSG_FLASH_RECORD;
-    case APP_PROTO_REQ_IMU:
-        return APP_PROTO_MSG_IMU_STATE;
-    case APP_PROTO_REQ_MODULES:
-        return APP_PROTO_MSG_MODULES_SUMMARY;
-    case APP_PROTO_REQ_CAPS:
-        return APP_PROTO_MSG_CAPS_RECORD;
-    case APP_PROTO_REQ_SAVE:
-        return APP_PROTO_MSG_SAVE_RESULT;
-    case APP_PROTO_REQ_LOAD:
-        return APP_PROTO_MSG_LOAD_RESULT;
-    case APP_PROTO_REQ_DEFAULTS:
-        return APP_PROTO_MSG_DEFAULTS_RESULT;
-    case APP_PROTO_REQ_PARAM_SET:
-        return APP_PROTO_MSG_PARAM_RECORD;
-    case APP_PROTO_REQ_PID_SET:
-        return APP_PROTO_MSG_PID_RECORD;
-    case APP_PROTO_REQ_SERVO_MOVE:
-    case APP_PROTO_REQ_SERVO_MOVE_ALL:
-    case APP_PROTO_REQ_SERVO_ID:
-    case APP_PROTO_REQ_SERVO_SETID:
-    case APP_PROTO_REQ_SERVO_MODE:
-    case APP_PROTO_REQ_SERVO_ENABLE:
-    case APP_PROTO_REQ_SERVO_ACTION:
-    case APP_PROTO_REQ_SERVO_RAW:
-        return APP_PROTO_MSG_SERVO_RESULT;
-    case APP_PROTO_REQ_WIFI:
-        return APP_PROTO_MSG_WIFI_RECORD;
-    case APP_PROTO_REQ_GPS:
-        return APP_PROTO_MSG_GPS_RECORD;
-    case APP_PROTO_REQ_MAG:
-        return APP_PROTO_MSG_MAG_RECORD;
-    case APP_PROTO_REQ_RTOS:
-        return APP_PROTO_MSG_RTOS_RECORD;
-    default:
-        return 0U;
-    }
 }
 
 static const char *app_control_aiwb2_state_name(APP_AiWB2_State state)
@@ -639,7 +549,7 @@ static void app_control_protocol_err(uint32_t id,
                                      const char *op,
                                      const char *code)
 {
-    app_control_queue_text("ERR id=%lu mod=%s op=%s code=%s\r\n",
+    APP_Control_QueueText("ERR id=%lu mod=%s op=%s code=%s\r\n",
                            (unsigned long)id,
                            (mod != NULL) ? mod : "?",
                            (op != NULL) ? op : "?",
@@ -840,14 +750,14 @@ static void app_control_flash_verify(char **tokens, uint32_t count)
 
     if (!app_control_token_u32(tokens, count, 2U, APP_CONTROL_FLASH_BENCH_DEFAULT_ADDR, &address) ||
         !app_control_token_u32(tokens, count, 3U, APP_CONTROL_FLASH_BENCH_DEFAULT_LEN, &length)) {
-        app_control_queue_text("ERR usage FLASH VERIFY [addr] [len]\r\n");
+        APP_Control_QueueText("ERR usage FLASH VERIFY [addr] [len]\r\n");
         return;
     }
 
     if ((length == 0U) || (length > APP_CONTROL_FLASH_BENCH_MAX_LEN) ||
         (address >= APP_FLASH_SERVICE_SIZE_BYTES) ||
         (length > (APP_FLASH_SERVICE_SIZE_BYTES - address))) {
-        app_control_queue_text("ERR flash verify range addr=0x%06lX len=%lu max=%lu\r\n",
+        APP_Control_QueueText("ERR flash verify range addr=0x%06lX len=%lu max=%lu\r\n",
                                (unsigned long)address,
                                (unsigned long)length,
                                (unsigned long)APP_CONTROL_FLASH_BENCH_MAX_LEN);
@@ -893,7 +803,7 @@ static void app_control_flash_bench_read(char **tokens, uint32_t count)
         !app_control_token_u32(tokens, count, 4U, APP_CONTROL_FLASH_BENCH_DEFAULT_LEN, &length) ||
         !app_control_token_u32(tokens, count, 5U, APP_CONTROL_FLASH_BENCH_DEFAULT_LOOPS, &loops) ||
         !app_control_token_u32(tokens, count, 6U, 1U, &mode)) {
-        app_control_queue_text("ERR usage FLASH BENCH READ [addr] [len] [loops] [mode 0=blocking 1=dma]\r\n");
+        APP_Control_QueueText("ERR usage FLASH BENCH READ [addr] [len] [loops] [mode 0=blocking 1=dma]\r\n");
         return;
     }
 
@@ -901,7 +811,7 @@ static void app_control_flash_bench_read(char **tokens, uint32_t count)
         (loops == 0U) ||
         (address >= APP_FLASH_SERVICE_SIZE_BYTES) ||
         (length > (APP_FLASH_SERVICE_SIZE_BYTES - address))) {
-        app_control_queue_text("ERR flash bench range addr=0x%06lX len=%lu loops=%lu max=%lu\r\n",
+        APP_Control_QueueText("ERR flash bench range addr=0x%06lX len=%lu loops=%lu max=%lu\r\n",
                                (unsigned long)address,
                                (unsigned long)length,
                                (unsigned long)loops,
@@ -962,7 +872,7 @@ static void app_control_handle_flash(char **tokens, uint32_t count)
                                      (unsigned long)APP_CONTROL_FLASH_SCRATCH_ADDR,
                                      (unsigned long)4096UL);
     } else {
-        app_control_queue_text("ERR usage FLASH VERIFY|BENCH READ|SCRATCH?\r\n");
+        APP_Control_QueueText("ERR usage FLASH VERIFY|BENCH READ|SCRATCH?\r\n");
     }
 }
 
@@ -1025,30 +935,6 @@ static void app_control_report_baro(void)
                                  (unsigned int)snapshot.raw_regs[13]);
 }
 
-static void app_control_emit_baro_event(void)
-{
-    APP_Baro_Snapshot snapshot;
-
-    APP_Baro_ReadSnapshot(&snapshot);
-    app_control_queue_proto_text(APP_PROTO_MSG_BARO_STREAM,
-                                 "BARO ok=%u stage=%s raw_st=%ld coef_st=%ld scaled=%u pressure_pa=%ld pressure=%ld temp_cdeg=%ld raw_pressure=%ld raw_temperature=%ld prs_cfg=0x%02X tmp_cfg=0x%02X meas_cfg=0x%02X int=0x%02X count=%lu\r\n",
-                                 (unsigned int)app_control_baro_ok(&snapshot.status),
-                                 app_control_baro_stage(&snapshot.status),
-                                 (long)snapshot.raw_status,
-                                 (long)snapshot.coef_status,
-                                 (unsigned int)snapshot.scaled_valid,
-                                 (long)snapshot.pressure_pa,
-                                 (long)snapshot.pressure_pa,
-                                 (long)snapshot.temperature_cdeg,
-                                 (long)snapshot.pressure_raw,
-                                 (long)snapshot.temperature_raw,
-                                 (unsigned int)snapshot.prs_cfg,
-                                 (unsigned int)snapshot.tmp_cfg,
-                                 (unsigned int)snapshot.meas_cfg,
-                                 (unsigned int)snapshot.int_sts,
-                                 (unsigned long)(snapshot.status.report_done != 0U));
-}
-
 static void app_control_report_imu(void)
 {
     APP_IMU_Status imu_status;
@@ -1099,88 +985,6 @@ static void app_control_report_imu(void)
                                  (unsigned int)imu_status.diag_burst_m3_tok_4);
 }
 
-static void app_control_report_gps(void)
-{
-    APP_GPS_Status gps_status;
-    uint32_t now_ms = HAL_GetTick();
-    uint32_t age_ms = 0U;
-    char age_text[16];
-
-    APP_GPS_GetStatus(&gps_status);
-    if (gps_status.last_rx_ms != 0U) {
-        age_ms = now_ms - gps_status.last_rx_ms;
-    } else {
-        age_ms = 0xFFFFFFFFUL;
-    }
-
-    app_control_queue_text("GPS ok=%u init=%ld fix=%u valid=%u sv=%u pkts=%lu nav=%lu nmea=%lu gga=%lu age_ms=%s\r\n",
-                           (unsigned int)gps_status.initialized,
-                           (long)gps_status.init_status,
-                           (unsigned int)gps_status.fix_type,
-                           (unsigned int)gps_status.valid_fix,
-                           (unsigned int)gps_status.num_sv,
-                           (unsigned long)gps_status.packets,
-                           (unsigned long)gps_status.nav_pvt_packets,
-                           (unsigned long)gps_status.nmea_sentences,
-                           (unsigned long)gps_status.nmea_gga_sentences,
-                           app_control_age_text(age_ms, age_text, (uint16_t)sizeof(age_text)));
-    app_control_queue_text("GPS diag baud=%lu bytes=%lu cksum=%lu nmea_ck=%lu ovf=%lu nmea_ovf=%lu rst=%lu uerr=%lu last_err=0x%lX cfg=%lu\r\n",
-                           (unsigned long)gps_status.baud_rate,
-                           (unsigned long)gps_status.bytes,
-                           (unsigned long)gps_status.checksum_errors,
-                           (unsigned long)gps_status.nmea_checksum_errors,
-                           (unsigned long)gps_status.payload_overflows,
-                           (unsigned long)gps_status.nmea_overflows,
-                           (unsigned long)gps_status.rx_restarts,
-                           (unsigned long)gps_status.uart_errors,
-                           (unsigned long)gps_status.last_uart_error,
-                           (unsigned long)gps_status.config_writes);
-    app_control_queue_text("GPS pos lon=%ld lat=%ld hmsl_mm=%ld hacc_mm=%lu vacc_mm=%lu vn=%ld ve=%ld vd=%ld head_e5=%ld utc=%04u-%02u-%02uT%02u:%02u:%02u\r\n",
-                           (long)gps_status.lon_deg_e7,
-                           (long)gps_status.lat_deg_e7,
-                           (long)gps_status.hmsl_mm,
-                           (unsigned long)gps_status.hacc_mm,
-                           (unsigned long)gps_status.vacc_mm,
-                           (long)gps_status.vel_n_mm_s,
-                           (long)gps_status.vel_e_mm_s,
-                           (long)gps_status.vel_d_mm_s,
-                           (long)gps_status.heading_motion_deg_e5,
-                           (unsigned int)gps_status.year,
-                           (unsigned int)gps_status.month,
-                           (unsigned int)gps_status.day,
-                           (unsigned int)gps_status.hour,
-                           (unsigned int)gps_status.minute,
-                           (unsigned int)gps_status.second);
-}
-
-static void app_control_report_mag(void)
-{
-    APP_MAG_Status mag_status;
-
-    APP_MAG_GetStatus(&mag_status);
-
-    app_control_queue_text("MAG ok=%u init=%ld st=%ld type=%s addr=0x%02X who=0x%02X n=%lu raw=%d,%d,%d mgauss=%ld,%ld,%ld\r\n",
-                           (unsigned int)mag_status.initialized,
-                           (long)mag_status.init_status,
-                           (long)mag_status.last_status,
-                           APP_MAG_GetTypeName(mag_status.type),
-                           (unsigned int)mag_status.address,
-                           (unsigned int)mag_status.who_am_i,
-                           (unsigned long)mag_status.sample_count,
-                           (int)mag_status.raw_x,
-                           (int)mag_status.raw_y,
-                           (int)mag_status.raw_z,
-                           (long)mag_status.x_mgauss,
-                           (long)mag_status.y_mgauss,
-                           (long)mag_status.z_mgauss);
-    app_control_queue_text("MAG probe ist=%u hmc=%u qmc=%u hmc_id=%02X%02X%02X\r\n",
-                           (unsigned int)mag_status.detected_ist8310,
-                           (unsigned int)mag_status.detected_hmc5883,
-                           (unsigned int)mag_status.detected_qmc5883,
-                           (unsigned int)mag_status.hmc_id_a,
-                           (unsigned int)mag_status.hmc_id_b,
-                           (unsigned int)mag_status.hmc_id_c);
-}
 
 static void app_control_report_modules(void)
 {
@@ -1227,14 +1031,14 @@ static void app_control_req_spl06(uint32_t id, const char *op)
     APP_Baro_ReadSnapshot(&snapshot);
 
     if (strcmp(op, "STATUS") == 0) {
-        app_control_queue_text("RSP id=%lu mod=SPL06 op=STATUS ok=%u stage=%s init=%ld raw=%ld who=0x%02X exp=0x10\r\n",
+        APP_Control_QueueText("RSP id=%lu mod=SPL06 op=STATUS ok=%u stage=%s init=%ld raw=%ld who=0x%02X exp=0x10\r\n",
                                (unsigned long)id,
                                (unsigned int)app_control_baro_ok(&snapshot.status),
                                app_control_baro_stage(&snapshot.status),
                                (long)snapshot.status.init_status,
                                (long)snapshot.raw_status,
                                (unsigned int)snapshot.id);
-        app_control_queue_text("RSP id=%lu mod=SPL06 op=STATUS split=%ld txrx=%ld sid=0x%02X tid=0x%02X cs=%u miso=%u\r\n",
+        APP_Control_QueueText("RSP id=%lu mod=SPL06 op=STATUS split=%ld txrx=%ld sid=0x%02X tid=0x%02X cs=%u miso=%u\r\n",
                                (unsigned long)id,
                                (long)snapshot.status.split_status,
                                (long)snapshot.status.txrx_status,
@@ -1246,7 +1050,7 @@ static void app_control_req_spl06(uint32_t id, const char *op)
     }
 
     if ((strcmp(op, "SAMPLE") == 0) || (strcmp(op, "READ") == 0)) {
-        app_control_queue_text("RSP id=%lu mod=SPL06 op=%s ok=%u raw_st=%ld coef_st=%ld scaled=%u press_raw=%ld temp_raw=%ld pressure_pa=%ld temp_cdeg=%ld\r\n",
+        APP_Control_QueueText("RSP id=%lu mod=SPL06 op=%s ok=%u raw_st=%ld coef_st=%ld scaled=%u press_raw=%ld temp_raw=%ld pressure_pa=%ld temp_cdeg=%ld\r\n",
                                (unsigned long)id,
                                op,
                                (snapshot.raw_status == (int32_t)BSP_SPL06_OK) ? 1U : 0U,
@@ -1257,7 +1061,7 @@ static void app_control_req_spl06(uint32_t id, const char *op)
                                (long)snapshot.temperature_raw,
                                (long)snapshot.pressure_pa,
                                (long)snapshot.temperature_cdeg);
-        app_control_queue_text("RSP id=%lu mod=SPL06 op=%s cfg prs=0x%02X tmp=0x%02X meas=0x%02X cfg=0x%02X int=0x%02X fifo=0x%02X\r\n",
+        APP_Control_QueueText("RSP id=%lu mod=SPL06 op=%s cfg prs=0x%02X tmp=0x%02X meas=0x%02X cfg=0x%02X int=0x%02X fifo=0x%02X\r\n",
                                (unsigned long)id,
                                op,
                                (unsigned int)snapshot.prs_cfg,
@@ -1266,7 +1070,7 @@ static void app_control_req_spl06(uint32_t id, const char *op)
                                (unsigned int)snapshot.cfg_reg,
                                (unsigned int)snapshot.int_sts,
                                (unsigned int)snapshot.fifo_sts);
-        app_control_queue_text("RSP id=%lu mod=SPL06 op=%s regs=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\r\n",
+        APP_Control_QueueText("RSP id=%lu mod=SPL06 op=%s regs=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\r\n",
                                (unsigned long)id,
                                op,
                                (unsigned int)snapshot.raw_regs[0],
@@ -1301,7 +1105,7 @@ static void app_control_req_icm42688(uint32_t id, const char *op)
     APP_IMU_GetStatus(&imu_status);
 
     if ((strcmp(op, "STATUS") == 0) || (strcmp(op, "DIAG") == 0)) {
-        app_control_queue_text("RSP id=%lu mod=ICM42688 op=%s ok=%u stage=%s stage_id=%u who=0x%02X exp=0x%02X code=%ld\r\n",
+        APP_Control_QueueText("RSP id=%lu mod=ICM42688 op=%s ok=%u stage=%s stage_id=%u who=0x%02X exp=0x%02X code=%ld\r\n",
                                (unsigned long)id,
                                op,
                                (unsigned int)imu_status.initialized,
@@ -1310,7 +1114,7 @@ static void app_control_req_icm42688(uint32_t id, const char *op)
                                (unsigned int)imu_status.who_am_i,
                                (unsigned int)BSP_ICM42688_WHO_AM_I_VALUE,
                                (long)imu_status.last_error);
-        app_control_queue_text("RSP id=%lu mod=ICM42688 op=%s st=%ld n=%lu ax=%d ay=%d az=%d gx=%ld gy=%ld gz=%ld t=%d\r\n",
+        APP_Control_QueueText("RSP id=%lu mod=ICM42688 op=%s st=%ld n=%lu ax=%d ay=%d az=%d gx=%ld gy=%ld gz=%ld t=%d\r\n",
                                (unsigned long)id,
                                op,
                                (long)imu_status.last_status,
@@ -1322,7 +1126,7 @@ static void app_control_req_icm42688(uint32_t id, const char *op)
                                (long)imu_status.gyro_y_mdps,
                                (long)imu_status.gyro_z_mdps,
                                (int)imu_status.temperature_cdeg);
-        app_control_queue_text("RSP id=%lu mod=ICM42688 op=%s diag valid=%u m0_tok=0x%02X m0_msb=0x%02X m0_b0=0x%02X m3_tok=0x%02X m3_msb=0x%02X m3_b0=0x%02X best_mode=%u best_hdr=%u\r\n",
+        APP_Control_QueueText("RSP id=%lu mod=ICM42688 op=%s diag valid=%u m0_tok=0x%02X m0_msb=0x%02X m0_b0=0x%02X m3_tok=0x%02X m3_msb=0x%02X m3_b0=0x%02X best_mode=%u best_hdr=%u\r\n",
                                (unsigned long)id,
                                op,
                                (unsigned int)imu_status.diag_valid,
@@ -1334,7 +1138,7 @@ static void app_control_req_icm42688(uint32_t id, const char *op)
                                (unsigned int)imu_status.diag_mode3_bit0,
                                (unsigned int)imu_status.diag_best_mode,
                                (unsigned int)imu_status.diag_best_header);
-        app_control_queue_text("RSP id=%lu mod=ICM42688 op=%s burst m0_b0=%02X%02X%02X%02X m3_tok=%02X%02X%02X%02X\r\n",
+        APP_Control_QueueText("RSP id=%lu mod=ICM42688 op=%s burst m0_b0=%02X%02X%02X%02X m3_tok=%02X%02X%02X%02X\r\n",
                                (unsigned long)id,
                                op,
                                (unsigned int)imu_status.diag_burst_m0_b0_1,
@@ -1371,7 +1175,7 @@ static void app_control_req_m9n(uint32_t id, const char *op)
     }
 
     if ((strcmp(op, "STATUS") == 0) || (strcmp(op, "DIAG") == 0)) {
-        app_control_queue_text("RSP id=%lu mod=M9N op=%s ok=%u init=%ld fix=%u valid=%u sv=%u age_ms=%s packets=%lu nav=%lu nmea=%lu gga=%lu\r\n",
+        APP_Control_QueueText("RSP id=%lu mod=M9N op=%s ok=%u init=%ld fix=%u valid=%u sv=%u age_ms=%s packets=%lu nav=%lu nmea=%lu gga=%lu\r\n",
                                (unsigned long)id,
                                op,
                                (unsigned int)gps_status.initialized,
@@ -1384,7 +1188,7 @@ static void app_control_req_m9n(uint32_t id, const char *op)
                                (unsigned long)gps_status.nav_pvt_packets,
                                (unsigned long)gps_status.nmea_sentences,
                                (unsigned long)gps_status.nmea_gga_sentences);
-        app_control_queue_text("RSP id=%lu mod=M9N op=%s baud=%lu bytes=%lu cksum=%lu nmea_ck=%lu ovf=%lu nmea_ovf=%lu rst=%lu uerr=%lu last_err=0x%lX cfg=%lu\r\n",
+        APP_Control_QueueText("RSP id=%lu mod=M9N op=%s baud=%lu bytes=%lu cksum=%lu nmea_ck=%lu ovf=%lu nmea_ovf=%lu rst=%lu uerr=%lu last_err=0x%lX cfg=%lu\r\n",
                                (unsigned long)id,
                                op,
                                (unsigned long)gps_status.baud_rate,
@@ -1397,7 +1201,7 @@ static void app_control_req_m9n(uint32_t id, const char *op)
                                (unsigned long)gps_status.uart_errors,
                                (unsigned long)gps_status.last_uart_error,
                                (unsigned long)gps_status.config_writes);
-        app_control_queue_text("RSP id=%lu mod=M9N op=%s lon=%ld lat=%ld hmsl_mm=%ld hacc_mm=%lu vacc_mm=%lu vn=%ld ve=%ld vd=%ld head_e5=%ld utc=%04u-%02u-%02uT%02u:%02u:%02u\r\n",
+        APP_Control_QueueText("RSP id=%lu mod=M9N op=%s lon=%ld lat=%ld hmsl_mm=%ld hacc_mm=%lu vacc_mm=%lu vn=%ld ve=%ld vd=%ld head_e5=%ld utc=%04u-%02u-%02uT%02u:%02u:%02u\r\n",
                                (unsigned long)id,
                                op,
                                (long)gps_status.lon_deg_e7,
@@ -1433,7 +1237,7 @@ static void app_control_req_mag(uint32_t id, const char *op)
     APP_MAG_GetStatus(&mag_status);
 
     if ((strcmp(op, "STATUS") == 0) || (strcmp(op, "DIAG") == 0)) {
-        app_control_queue_text("RSP id=%lu mod=MAG op=%s ok=%u init=%ld st=%ld type=%s addr=0x%02X who=0x%02X n=%lu raw=%d,%d,%d mgauss=%ld,%ld,%ld\r\n",
+        APP_Control_QueueText("RSP id=%lu mod=MAG op=%s ok=%u init=%ld st=%ld type=%s addr=0x%02X who=0x%02X n=%lu raw=%d,%d,%d mgauss=%ld,%ld,%ld\r\n",
                                (unsigned long)id,
                                op,
                                (unsigned int)mag_status.initialized,
@@ -1449,7 +1253,7 @@ static void app_control_req_mag(uint32_t id, const char *op)
                                (long)mag_status.x_mgauss,
                                (long)mag_status.y_mgauss,
                                (long)mag_status.z_mgauss);
-        app_control_queue_text("RSP id=%lu mod=MAG op=%s probe ist=%u hmc=%u qmc=%u hmc_id=%02X%02X%02X\r\n",
+        APP_Control_QueueText("RSP id=%lu mod=MAG op=%s probe ist=%u hmc=%u qmc=%u hmc_id=%02X%02X%02X\r\n",
                                (unsigned long)id,
                                op,
                                (unsigned int)mag_status.detected_ist8310,
@@ -1507,7 +1311,7 @@ static void app_control_handle_req(char **tokens, uint32_t count)
             return;
         }
         if (strcmp(op, "STATUS") == 0) {
-            app_control_queue_text("RSP id=%lu mod=WIFI op=STATUS en=%u pin=PC6 last=%u writes=%lu state=%s transparent=%u retry=%lu socket=%ld cycling=%u wait_ms=%lu prov=%u cmd=%lu/%lu\r\n",
+            APP_Control_QueueText("RSP id=%lu mod=WIFI op=STATUS en=%u pin=PC6 last=%u writes=%lu state=%s transparent=%u retry=%lu socket=%ld cycling=%u wait_ms=%lu prov=%u cmd=%lu/%lu\r\n",
                                    (unsigned long)id,
                                    (unsigned int)BSP_AiWB2_IsEnabled(),
                                    (unsigned int)BSP_AiWB2_GetLastWrittenState(),
@@ -1827,12 +1631,12 @@ static void app_control_servo_move_configured(void)
     }
 
     if (count == 0U) {
-        app_control_queue_text("ERR servo no enabled channels\r\n");
+        APP_Control_QueueText("ERR servo no enabled channels\r\n");
         return;
     }
 
     status = BSP_BusServo_MoveMany(moves, count, time_ms);
-    app_control_queue_text("OK servo move_all st=%u count=%u time=%u\r\n",
+    APP_Control_QueueText("OK servo move_all st=%u count=%u time=%u\r\n",
                            (unsigned int)status,
                            (unsigned int)count,
                            (unsigned int)time_ms);
@@ -1845,7 +1649,7 @@ static void app_control_handle_servo(char **tokens, uint32_t count)
     BSP_BusServoStatus status;
 
     if (count < 2U) {
-        app_control_queue_text("ERR servo missing subcmd\r\n");
+        APP_Control_QueueText("ERR servo missing subcmd\r\n");
         return;
     }
 
@@ -1857,7 +1661,7 @@ static void app_control_handle_servo(char **tokens, uint32_t count)
             (app_control_parse_u32(tokens[3], &pulse) == 0U) ||
             (app_control_parse_u32(tokens[4], &time_ms) == 0U) ||
             (app_control_valid_servo_index(index) == 0U)) {
-            app_control_queue_text("ERR usage SERVO MOVE index pulse time\r\n");
+            APP_Control_QueueText("ERR usage SERVO MOVE index pulse time\r\n");
             return;
         }
 
@@ -1866,7 +1670,7 @@ static void app_control_handle_servo(char **tokens, uint32_t count)
         status = BSP_BusServo_Move(control_config.servo[index].id,
                                    control_config.servo[index].pulse_us,
                                    control_config.servo[index].time_ms);
-        app_control_queue_text("OK servo%lu move st=%u id=%u pulse=%u time=%u\r\n",
+        APP_Control_QueueText("OK servo%lu move st=%u id=%u pulse=%u time=%u\r\n",
                                (unsigned long)index,
                                (unsigned int)status,
                                (unsigned int)control_config.servo[index].id,
@@ -1886,12 +1690,12 @@ static void app_control_handle_servo(char **tokens, uint32_t count)
             (app_control_parse_u32(tokens[3], &value) == 0U) ||
             (app_control_valid_servo_index(index) == 0U) ||
             (value > 255U)) {
-            app_control_queue_text("ERR usage SERVO ID index id\r\n");
+            APP_Control_QueueText("ERR usage SERVO ID index id\r\n");
             return;
         }
 
         control_config.servo[index].id = (uint8_t)value;
-        app_control_queue_text("OK servo%lu id=%u\r\n",
+        APP_Control_QueueText("OK servo%lu id=%u\r\n",
                                (unsigned long)index,
                                (unsigned int)control_config.servo[index].id);
         return;
@@ -1904,13 +1708,13 @@ static void app_control_handle_servo(char **tokens, uint32_t count)
             (app_control_parse_u32(tokens[3], &new_id) == 0U) ||
             (app_control_valid_servo_index(index) == 0U) ||
             (new_id > 255U)) {
-            app_control_queue_text("ERR usage SERVO SETID index new_id\r\n");
+            APP_Control_QueueText("ERR usage SERVO SETID index new_id\r\n");
             return;
         }
 
         status = BSP_BusServo_SetId(control_config.servo[index].id, (uint8_t)new_id);
         control_config.servo[index].id = (uint8_t)new_id;
-        app_control_queue_text("OK servo%lu setid st=%u id=%u\r\n",
+        APP_Control_QueueText("OK servo%lu setid st=%u id=%u\r\n",
                                (unsigned long)index,
                                (unsigned int)status,
                                (unsigned int)new_id);
@@ -1922,7 +1726,7 @@ static void app_control_handle_servo(char **tokens, uint32_t count)
             (app_control_parse_u32(tokens[2], &index) == 0U) ||
             (app_control_parse_u32(tokens[3], &value) == 0U) ||
             (app_control_valid_servo_index(index) == 0U)) {
-            app_control_queue_text("ERR usage SERVO MODE index mode\r\n");
+            APP_Control_QueueText("ERR usage SERVO MODE index mode\r\n");
             return;
         }
 
@@ -1930,7 +1734,7 @@ static void app_control_handle_servo(char **tokens, uint32_t count)
         if (status == BSP_BUS_SERVO_OK) {
             control_config.servo[index].mode = (uint8_t)value;
         }
-        app_control_queue_text("OK servo%lu mode st=%u mode=%u\r\n",
+        APP_Control_QueueText("OK servo%lu mode st=%u mode=%u\r\n",
                                (unsigned long)index,
                                (unsigned int)status,
                                (unsigned int)control_config.servo[index].mode);
@@ -1942,12 +1746,12 @@ static void app_control_handle_servo(char **tokens, uint32_t count)
             (app_control_parse_u32(tokens[2], &index) == 0U) ||
             (app_control_parse_u32(tokens[3], &value) == 0U) ||
             (app_control_valid_servo_index(index) == 0U)) {
-            app_control_queue_text("ERR usage SERVO ENABLE index 0|1\r\n");
+            APP_Control_QueueText("ERR usage SERVO ENABLE index 0|1\r\n");
             return;
         }
 
         control_config.servo[index].enabled = (value != 0U) ? 1U : 0U;
-        app_control_queue_text("OK servo%lu enabled=%u\r\n",
+        APP_Control_QueueText("OK servo%lu enabled=%u\r\n",
                                (unsigned long)index,
                                (unsigned int)control_config.servo[index].enabled);
         return;
@@ -1957,7 +1761,7 @@ static void app_control_handle_servo(char **tokens, uint32_t count)
         if ((count < 4U) ||
             (app_control_parse_u32(tokens[2], &index) == 0U) ||
             (app_control_valid_servo_index(index) == 0U)) {
-            app_control_queue_text("ERR usage SERVO CMD index action\r\n");
+            APP_Control_QueueText("ERR usage SERVO CMD index action\r\n");
             return;
         }
 
@@ -1982,7 +1786,7 @@ static void app_control_handle_servo(char **tokens, uint32_t count)
         } else if (strcmp(tokens[3], "BD") == 0) {
             uint32_t baud_code;
             if ((count < 5U) || (app_control_parse_u32(tokens[4], &baud_code) == 0U)) {
-                app_control_queue_text("ERR usage SERVO CMD index BD code\r\n");
+                APP_Control_QueueText("ERR usage SERVO CMD index BD code\r\n");
                 return;
             }
             status = BSP_BusServo_SetBaud(control_config.servo[index].id, (uint8_t)baud_code);
@@ -2003,11 +1807,11 @@ static void app_control_handle_servo(char **tokens, uint32_t count)
         } else if (strcmp(tokens[3], "CLE") == 0) {
             status = BSP_BusServo_FactoryResetFull(control_config.servo[index].id);
         } else {
-            app_control_queue_text("ERR unknown servo action %s\r\n", tokens[3]);
+            APP_Control_QueueText("ERR unknown servo action %s\r\n", tokens[3]);
             return;
         }
 
-        app_control_queue_text("OK servo%lu cmd=%s st=%u\r\n",
+        APP_Control_QueueText("OK servo%lu cmd=%s st=%u\r\n",
                                (unsigned long)index,
                                tokens[3],
                                (unsigned int)status);
@@ -2015,17 +1819,30 @@ static void app_control_handle_servo(char **tokens, uint32_t count)
     }
 
     if (strcmp(tokens[1], "RAW") == 0) {
+        char response[DRV_SERVO_MAX_RESPONSE_LEN + 1];
+        uint16_t rx_len;
+
         if (count < 3U) {
-            app_control_queue_text("ERR usage SERVO RAW command\r\n");
+            APP_Control_QueueText("ERR usage SERVO RAW command\r\n");
             return;
         }
 
         status = BSP_BusServo_SendRaw(tokens[2]);
-        app_control_queue_text("OK servo raw st=%u\r\n", (unsigned int)status);
+        if (status == BSP_BUS_SERVO_OK) {
+            rx_len = BSP_BusServo_ReadResponse(response, DRV_SERVO_MAX_RESPONSE_LEN);
+            if (rx_len > 0U) {
+                response[rx_len] = '\0';
+                APP_Control_QueueText("OK servo raw st=%u rsp=%s\r\n", (unsigned int)status, response);
+            } else {
+                APP_Control_QueueText("OK servo raw st=%u rsp=(none)\r\n", (unsigned int)status);
+            }
+        } else {
+            APP_Control_QueueText("ERR servo raw tx st=%u\r\n", (unsigned int)status);
+        }
         return;
     }
 
-    app_control_queue_text("ERR unknown servo subcmd %s\r\n", tokens[1]);
+    APP_Control_QueueText("ERR unknown servo subcmd %s\r\n", tokens[1]);
 }
 
 static void app_control_handle_wifi(char **tokens, uint32_t count)
@@ -2045,7 +1862,7 @@ static void app_control_handle_wifi(char **tokens, uint32_t count)
         uint32_t offset = 0U;
 
         if (count < 3U) {
-            app_control_queue_text("ERR usage WIFI AT command\r\n");
+            APP_Control_QueueText("ERR usage WIFI AT command\r\n");
             return;
         }
 
@@ -2057,43 +1874,43 @@ static void app_control_handle_wifi(char **tokens, uint32_t count)
                                    (i > 2U) ? " " : "",
                                    tokens[i]);
             if ((written < 0) || ((uint32_t)written >= (sizeof(raw_command) - offset))) {
-                app_control_queue_text("ERR wifi at too long\r\n");
+                APP_Control_QueueText("ERR wifi at too long\r\n");
                 return;
             }
             offset += (uint32_t)written;
         }
 
         if (APP_AiWB2_SendRawCommand(raw_command) == 0U) {
-            app_control_queue_text("ERR wifi at bad command\r\n");
+            APP_Control_QueueText("ERR wifi at bad command\r\n");
             return;
         }
 
-        app_control_queue_text("OK wifi at %s\r\n", raw_command);
+        APP_Control_QueueText("OK wifi at %s\r\n", raw_command);
         return;
     }
 
     if (strcmp(tokens[1], "DIAG") == 0) {
         APP_AiWB2_SendDiagCommands();
-        app_control_queue_text("OK wifi diag queued\r\n");
+        APP_Control_QueueText("OK wifi diag queued\r\n");
         return;
     }
 
     if ((strcmp(tokens[1], "EN") == 0) || (strcmp(tokens[1], "ENABLE") == 0)) {
         if ((count < 3U) || (app_control_parse_u32(tokens[2], &value) == 0U)) {
-            app_control_queue_text("ERR usage WIFI EN 0|1\r\n");
+            APP_Control_QueueText("ERR usage WIFI EN 0|1\r\n");
             return;
         }
 
         control_wifi_reset_pending = 0U;
         BSP_AiWB2_SetEnabled((value != 0U) ? 1U : 0U);
-        app_control_queue_text("OK wifi en=%u pin=PC6\r\n",
+        APP_Control_QueueText("OK wifi en=%u pin=PC6\r\n",
                                (unsigned int)BSP_AiWB2_IsEnabled());
         return;
     }
 
     if (strcmp(tokens[1], "RESET") == 0) {
         if ((count >= 3U) && (app_control_parse_u32(tokens[2], &pulse_ms) == 0U)) {
-            app_control_queue_text("ERR usage WIFI RESET [ms]\r\n");
+            APP_Control_QueueText("ERR usage WIFI RESET [ms]\r\n");
             return;
         }
         if (pulse_ms > 5000U) {
@@ -2103,7 +1920,7 @@ static void app_control_handle_wifi(char **tokens, uint32_t count)
         BSP_AiWB2_SetEnabled(0U);
         control_wifi_reset_pending = 1U;
         control_wifi_reset_deadline_ms = HAL_GetTick() + pulse_ms;
-        app_control_queue_text("OK wifi reset queued ms=%lu pin=PC6\r\n",
+        APP_Control_QueueText("OK wifi reset queued ms=%lu pin=PC6\r\n",
                                (unsigned long)pulse_ms);
         return;
     }
@@ -2112,23 +1929,23 @@ static void app_control_handle_wifi(char **tokens, uint32_t count)
         const char *local_port;
 
         if (count < 5U) {
-            app_control_queue_text("ERR usage WIFI STA ssid password local_port\r\n");
+            APP_Control_QueueText("ERR usage WIFI STA ssid password local_port\r\n");
             return;
         }
 
         local_port = (count >= 6U) ? tokens[5] : tokens[4];
-        if (APP_AiWB2_StartProvision(tokens[2], tokens[3], local_port) == 0U) {
-            app_control_queue_text("ERR wifi sta bad args\r\n");
+        if (APP_AiWB2_StartProvision(tokens[2], tokens[3], APP_AIWB2_LINK_UDP_SERVER, "0.0.0.0", local_port) == 0U) {
+            APP_Control_QueueText("ERR wifi sta bad args\r\n");
             return;
         }
 
-        app_control_queue_text("OK wifi sta queued ssid=%s udp_server_port=%s\r\n",
+        APP_Control_QueueText("OK wifi sta queued ssid=%s udp_server_port=%s\r\n",
                                tokens[2],
                                local_port);
         return;
     }
 
-    app_control_queue_text("ERR unknown wifi subcmd %s\r\n", tokens[1]);
+    APP_Control_QueueText("ERR unknown wifi subcmd %s\r\n", tokens[1]);
 }
 
 static void app_control_service_wifi_reset(void)
@@ -2144,7 +1961,7 @@ static void app_control_service_wifi_reset(void)
     control_wifi_reset_pending = 0U;
     BSP_AiWB2_SetEnabled(1U);
     APP_AiWB2_Init();
-    app_control_queue_text("OK wifi reset done en=%u\r\n",
+    APP_Control_QueueText("OK wifi reset done en=%u\r\n",
                            (unsigned int)BSP_AiWB2_IsEnabled());
 }
 
@@ -2171,36 +1988,12 @@ static APP_ControlPidConfig *app_control_find_pid(const char *group, uint32_t in
 
 static void app_control_handle_baro(char **tokens, uint32_t count)
 {
-    uint32_t value;
-
     if ((count == 1U) || ((count >= 2U) && (strcmp(tokens[1], "?") == 0))) {
         app_control_report_baro();
         return;
     }
 
-    if (strcmp(tokens[1], "STREAM") != 0) {
-        app_control_queue_text("ERR usage BARO STREAM 0|1 [period_ms]\r\n");
-        return;
-    }
-
-    if ((count < 3U) || (app_control_parse_u32(tokens[2], &value) == 0U)) {
-        app_control_queue_text("ERR usage BARO STREAM 0|1 [period_ms]\r\n");
-        return;
-    }
-
-    control_baro_stream_enabled = (value != 0U) ? 1U : 0U;
-    control_baro_stream_period_ms = APP_CONTROL_BARO_STREAM_DEFAULT_PERIOD_MS;
-    if ((count >= 4U) && (app_control_parse_u32(tokens[3], &value) != 0U) && (value > 0U)) {
-        control_baro_stream_period_ms = value;
-    }
-    if ((control_baro_stream_enabled != 0U) &&
-        (control_baro_stream_period_ms < APP_CONTROL_BARO_STREAM_MIN_PERIOD_MS)) {
-        control_baro_stream_period_ms = APP_CONTROL_BARO_STREAM_MIN_PERIOD_MS;
-    }
-    control_last_baro_stream_ms = 0U;
-    app_control_queue_text("OK baro stream=%u period_ms=%lu\r\n",
-                           (unsigned int)control_baro_stream_enabled,
-                           (unsigned long)control_baro_stream_period_ms);
+    APP_Control_QueueText("OK baro stream=0 (streaming removed)\r\n");
 }
 
 static void app_control_handle_pid(char **tokens, uint32_t count)
@@ -2214,7 +2007,7 @@ static void app_control_handle_pid(char **tokens, uint32_t count)
     }
 
     if ((count < 3U) || (strcmp(tokens[1], "SET") != 0)) {
-        app_control_queue_text("ERR usage PID SET roll|pitch|yaw kp= ki= kd=\r\n");
+        APP_Control_QueueText("ERR usage PID SET roll|pitch|yaw kp= ki= kd=\r\n");
         return;
     }
 
@@ -2230,7 +2023,7 @@ static void app_control_handle_pid(char **tokens, uint32_t count)
         mapped_tokens[2] = "RATE";
         mapped_tokens[3] = "2";
     } else {
-        app_control_queue_text("ERR pid axis %s\r\n", tokens[2]);
+        APP_Control_QueueText("ERR pid axis %s\r\n", tokens[2]);
         return;
     }
 
@@ -2241,29 +2034,13 @@ static void app_control_handle_pid(char **tokens, uint32_t count)
     mapped_tokens[8] = "500";
 
     if ((mapped_tokens[4] == NULL) || (mapped_tokens[5] == NULL) || (mapped_tokens[6] == NULL)) {
-        app_control_queue_text("ERR usage PID SET roll|pitch|yaw kp= ki= kd=\r\n");
+        APP_Control_QueueText("ERR usage PID SET roll|pitch|yaw kp= ki= kd=\r\n");
         return;
     }
 
     app_control_handle_param(mapped_tokens, 9U);
 }
 
-static void app_control_service_streams(void)
-{
-    uint32_t now_ms = HAL_GetTick();
-
-    if ((control_baro_stream_enabled == 0U) || (control_baro_stream_period_ms == 0U)) {
-        return;
-    }
-
-    if ((control_last_baro_stream_ms != 0U) &&
-        ((now_ms - control_last_baro_stream_ms) < control_baro_stream_period_ms)) {
-        return;
-    }
-
-    control_last_baro_stream_ms = now_ms;
-    app_control_emit_baro_event();
-}
 
 static void app_control_report_pid_legacy(void)
 {
@@ -2302,7 +2079,7 @@ static void app_control_handle_param(char **tokens, uint32_t count)
     }
 
     if (strcmp(tokens[1], "SET") != 0) {
-        app_control_queue_text("ERR usage PARAM SET RATE|ANGLE|ALT index kp ki kd ilim out\r\n");
+        APP_Control_QueueText("ERR usage PARAM SET RATE|ANGLE|ALT index kp ki kd ilim out\r\n");
         return;
     }
 
@@ -2313,13 +2090,13 @@ static void app_control_handle_param(char **tokens, uint32_t count)
         (app_control_parse_i32(tokens[6], &kd) == 0U) ||
         (app_control_parse_i32(tokens[7], &integral_limit) == 0U) ||
         (app_control_parse_i32(tokens[8], &output_limit) == 0U)) {
-        app_control_queue_text("ERR usage PARAM SET RATE|ANGLE|ALT index kp ki kd ilim out\r\n");
+        APP_Control_QueueText("ERR usage PARAM SET RATE|ANGLE|ALT index kp ki kd ilim out\r\n");
         return;
     }
 
     pid = app_control_find_pid(tokens[2], index);
     if (pid == NULL) {
-        app_control_queue_text("ERR param target %s%lu\r\n",
+        APP_Control_QueueText("ERR param target %s%lu\r\n",
                                tokens[2],
                                (unsigned long)index);
         return;
@@ -2330,7 +2107,7 @@ static void app_control_handle_param(char **tokens, uint32_t count)
     pid->kd = app_control_clamp_i16(kd);
     pid->integral_limit = app_control_clamp_i16(integral_limit);
     pid->output_limit = app_control_clamp_i16(output_limit);
-    app_control_queue_text("OK param %s%lu kp=%d ki=%d kd=%d ilim=%d out=%d\r\n",
+    APP_Control_QueueText("OK param %s%lu kp=%d ki=%d kd=%d ilim=%d out=%d\r\n",
                            tokens[2],
                            (unsigned long)index,
                            (int)pid->kp,
@@ -2359,7 +2136,7 @@ void APP_Control_Init(void)
     }
 
 #if (APP_CONTROL_BOOT_READY_ENABLED != 0U)
-    app_control_queue_text("READY drone-H743 tcp-control servo_slots=2 cfg_loaded=%u cfg_valid=%u\r\n",
+    APP_Control_QueueText("READY drone-H743 tcp-control servo_slots=2 cfg_loaded=%u cfg_valid=%u\r\n",
                            (unsigned int)control_config.loaded_from_flash,
                            (unsigned int)control_config.flash_valid);
 #endif
@@ -2382,24 +2159,22 @@ void APP_Control_MaintTick(void)
 
 static void app_control_tick_common(uint8_t emit_heartbeat)
 {
-#if (APP_CONTROL_HEARTBEAT_ENABLED != 0U)
-    uint32_t uart_rx_bytes = 0U;
-    uint32_t uart_rx_lines = 0U;
-    uint32_t uart_rx_overflows = 0U;
-    uint32_t uart_rx_errors = 0U;
-    uint32_t uart_rx_events = 0U;
-    uint32_t uart_rx_restarts = 0U;
-    uint32_t uart_last_rx_event_size = 0U;
-#endif
-
     app_control_service_wifi_reset();
-    app_control_service_streams();
+
     if (emit_heartbeat == 0U) {
         return;
     }
+
 #if (APP_CONTROL_HEARTBEAT_ENABLED != 0U)
     {
         uint32_t now_ms = HAL_GetTick();
+        uint32_t uart_rx_bytes = 0U;
+        uint32_t uart_rx_lines = 0U;
+        uint32_t uart_rx_overflows = 0U;
+        uint32_t uart_rx_errors = 0U;
+        uint32_t uart_rx_events = 0U;
+        uint32_t uart_rx_restarts = 0U;
+        uint32_t uart_last_rx_event_size = 0U;
 
         if ((now_ms - control_last_heartbeat_ms) < 2000U) {
             return;
@@ -2413,7 +2188,7 @@ static void app_control_tick_common(uint8_t emit_heartbeat)
                                  &uart_rx_restarts,
                                  &uart_last_rx_event_size);
         control_last_heartbeat_ms = now_ms;
-        app_control_queue_text("READY ms=%lu servo0_id=%u servo1_id=%u cfg_valid=%u wifi=%u wifi_last=%u wifi_writes=%lu trans=%u rx_bytes=%lu rx_lines=%lu rx_ovf=%lu rx_err=%lu rx_evt=%lu rx_rst=%lu rx_evt_size=%lu\r\n",
+        APP_Control_QueueText("READY ms=%lu servo0_id=%u servo1_id=%u cfg_valid=%u wifi=%u wifi_last=%u wifi_writes=%lu trans=%u rx_bytes=%lu rx_lines=%lu rx_ovf=%lu rx_err=%lu rx_evt=%lu rx_rst=%lu rx_evt_size=%lu\r\n",
                                (unsigned long)now_ms,
                                (unsigned int)control_config.servo[0].id,
                                (unsigned int)control_config.servo[1].id,
@@ -2445,7 +2220,7 @@ static void app_control_dispatch_tokens(char **tokens, uint32_t count, uint8_t e
     }
 
     if ((emit_ack != 0U) && (APP_CONTROL_ASCII_ACK_ENABLED != 0U)) {
-        app_control_queue_text("ACK %s\r\n", tokens[0]);
+        APP_Control_QueueText("ACK %s\r\n", tokens[0]);
     }
 
     if (strcmp(tokens[0], "PING") == 0) {
@@ -2471,9 +2246,9 @@ static void app_control_dispatch_tokens(char **tokens, uint32_t count, uint8_t e
     } else if (strcmp(tokens[0], "IMU?") == 0) {
         app_control_report_imu();
     } else if (strcmp(tokens[0], "GPS?") == 0) {
-        app_control_report_gps();
+        APP_GPS_Report();
     } else if (strcmp(tokens[0], "MAG?") == 0) {
-        app_control_report_mag();
+        APP_MAG_Report();
     } else if (strcmp(tokens[0], "PARAM?") == 0) {
         app_control_report_params();
     } else if (strcmp(tokens[0], "PID?") == 0) {
@@ -2488,7 +2263,7 @@ static void app_control_dispatch_tokens(char **tokens, uint32_t count, uint8_t e
     } else if (strcmp(tokens[0], "WIFI_EN") == 0) {
         char *wifi_tokens[3] = {"WIFI", "EN", NULL};
         if (count < 2U) {
-            app_control_queue_text("ERR usage WIFI_EN 0|1\r\n");
+            APP_Control_QueueText("ERR usage WIFI_EN 0|1\r\n");
             return;
         }
         wifi_tokens[2] = tokens[1];
@@ -2500,14 +2275,14 @@ static void app_control_dispatch_tokens(char **tokens, uint32_t count, uint8_t e
             control_config.loaded_from_flash = 1U;
             control_config.flash_valid = 1U;
         }
-        app_control_queue_text("OK save st=%u\r\n", (unsigned int)save_status);
+        APP_Control_QueueText("OK save st=%u\r\n", (unsigned int)save_status);
     } else if (strcmp(tokens[0], "LOAD") == 0) {
         APP_FlashService_Status load_status = app_control_load_config();
         control_config.last_flash_status = (uint8_t)load_status;
-        app_control_queue_text("OK load st=%u\r\n", (unsigned int)load_status);
+        APP_Control_QueueText("OK load st=%u\r\n", (unsigned int)load_status);
     } else if (strcmp(tokens[0], "DEFAULTS") == 0) {
         app_control_defaults(&control_config);
-        app_control_queue_text("OK defaults\r\n");
+        APP_Control_QueueText("OK defaults\r\n");
     } else if (strcmp(tokens[0], "PARAM") == 0) {
         app_control_handle_param(tokens, count);
     } else if (strcmp(tokens[0], "PID") == 0) {
@@ -2516,12 +2291,12 @@ static void app_control_dispatch_tokens(char **tokens, uint32_t count, uint8_t e
         app_control_handle_servo(tokens, count);
     } else if (strcmp(tokens[0], "Sensor_Data:1") == 0) {
         vofaStreamActive = 1U;
-        app_control_queue_text("OK IMU stream started\r\n");
+        APP_Control_QueueText("OK IMU stream started\r\n");
     } else if (strcmp(tokens[0], "Sensor_Data:0") == 0) {
         vofaStreamActive = 0U;
-        app_control_queue_text("OK IMU stream stopped\r\n");
+        APP_Control_QueueText("OK IMU stream stopped\r\n");
     } else {
-        app_control_queue_text("ERR unknown cmd %s\r\n", tokens[0]);
+        APP_Control_QueueText("ERR unknown cmd %s\r\n", tokens[0]);
     }
 }
 
@@ -2536,7 +2311,7 @@ void APP_Control_ProcessLine(const char *line)
     }
 
     if (APP_CONTROL_ASCII_RX_ECHO_ENABLED != 0U) {
-        app_control_queue_text("RX %s\r\n", line);
+        APP_Control_QueueText("RX %s\r\n", line);
     }
 
     (void)snprintf(buffer, sizeof(buffer), "%s", line);
@@ -2556,155 +2331,6 @@ void APP_Control_ProcessMaintLine(const char *line)
     control_maint_output_active = 1U;
     APP_Control_ProcessLine(line);
     control_maint_output_active = saved_output;
-}
-
-static void app_control_process_proto_request(uint16_t function,
-                                              const uint8_t *payload,
-                                              uint16_t payload_length)
-{
-    char text[APP_CONTROL_MAX_LINE];
-    uint16_t saved_override = control_response_override_function;
-
-    control_response_override_function = app_control_response_function_for_request(function);
-
-    switch (function) {
-    case APP_PROTO_REQ_PING:
-        app_control_dispatch_tokens((char *[]){"PING"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_STATUS:
-        app_control_dispatch_tokens((char *[]){"STATUS?"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_CONFIG:
-        app_control_dispatch_tokens((char *[]){"CONFIG?"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_PARAMS:
-        app_control_dispatch_tokens((char *[]){"PARAM?"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_PID:
-        app_control_dispatch_tokens((char *[]){"PID?"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_BARO:
-        app_control_dispatch_tokens((char *[]){"BARO?"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_FLASH:
-        app_control_dispatch_tokens((char *[]){"FLASH?"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_IMU:
-        app_control_dispatch_tokens((char *[]){"IMU?"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_GPS:
-        app_control_dispatch_tokens((char *[]){"GPS?"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_MAG:
-        app_control_dispatch_tokens((char *[]){"MAG?"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_RTOS:
-        app_control_dispatch_tokens((char *[]){"RTOS?"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_MODULES:
-        app_control_dispatch_tokens((char *[]){"MODULES?"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_CAPS:
-        app_control_dispatch_tokens((char *[]){"CAPS?"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_WIFI:
-        if (app_control_copy_payload_text(text, sizeof(text), payload, payload_length) == 0U) {
-            app_control_dispatch_tokens((char *[]){"WIFI?"}, 1U, 0U);
-        } else if (app_control_payload_to_line(payload, payload_length, text, sizeof(text)) != 0U) {
-            char *tokens[10];
-            uint32_t count = app_control_tokenize(text,
-                                                  tokens,
-                                                  (uint32_t)(sizeof(tokens) / sizeof(tokens[0])));
-            if (count != 0U) {
-                app_control_dispatch_tokens(tokens, count, 0U);
-            } else {
-                app_control_queue_text("ERR empty payload fn=0x%04X\r\n", (unsigned int)function);
-            }
-        } else {
-            app_control_queue_text("ERR invalid payload fn=0x%04X\r\n", (unsigned int)function);
-        }
-        break;
-
-    case APP_PROTO_REQ_SAVE:
-        app_control_dispatch_tokens((char *[]){"SAVE"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_LOAD:
-        app_control_dispatch_tokens((char *[]){"LOAD"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_DEFAULTS:
-        app_control_dispatch_tokens((char *[]){"DEFAULTS"}, 1U, 0U);
-        break;
-
-    case APP_PROTO_REQ_BARO_STREAM:
-        if (app_control_copy_payload_text(text, sizeof(text), payload, payload_length) == 0U) {
-            app_control_dispatch_tokens((char *[]){"BARO", "STREAM", "1"}, 3U, 0U);
-        } else if (app_control_payload_to_line(payload, payload_length, text, sizeof(text)) != 0U) {
-            char *tokens[10];
-            uint32_t count = app_control_tokenize(text,
-                                                  tokens,
-                                                  (uint32_t)(sizeof(tokens) / sizeof(tokens[0])));
-            if (count != 0U) {
-                app_control_dispatch_tokens(tokens, count, 0U);
-            } else {
-                app_control_queue_text("ERR empty payload fn=0x%04X\r\n", (unsigned int)function);
-            }
-        } else {
-            app_control_queue_text("ERR invalid payload fn=0x%04X\r\n", (unsigned int)function);
-        }
-        break;
-
-    case APP_PROTO_REQ_PARAM_SET:
-    case APP_PROTO_REQ_PID_SET:
-    case APP_PROTO_REQ_SERVO_MOVE:
-    case APP_PROTO_REQ_SERVO_MOVE_ALL:
-    case APP_PROTO_REQ_SERVO_ID:
-    case APP_PROTO_REQ_SERVO_SETID:
-    case APP_PROTO_REQ_SERVO_MODE:
-    case APP_PROTO_REQ_SERVO_ENABLE:
-    case APP_PROTO_REQ_SERVO_ACTION:
-    case APP_PROTO_REQ_SERVO_RAW:
-    case APP_PROTO_MSG_CMD_LINE:
-        if (app_control_payload_to_line(payload, payload_length, text, sizeof(text)) == 0U) {
-            app_control_queue_text("ERR empty payload fn=0x%04X\r\n", (unsigned int)function);
-        } else {
-            char *tokens[10];
-            uint32_t count = app_control_tokenize(text,
-                                                  tokens,
-                                                  (uint32_t)(sizeof(tokens) / sizeof(tokens[0])));
-            if (count != 0U) {
-                app_control_dispatch_tokens(tokens, count, 0U);
-            }
-        }
-        break;
-
-    default:
-        app_control_queue_text("ERR unknown fn 0x%04X\r\n", (unsigned int)function);
-        break;
-    }
-
-    control_response_override_function = saved_override;
-}
-
-void APP_Control_ProcessProtoRequest(uint16_t function,
-                                     const uint8_t *payload,
-                                     uint16_t payload_length)
-{
-    app_control_process_proto_request(function, payload, payload_length);
 }
 
 void APP_Control_GetConfig(APP_ControlConfig *config)

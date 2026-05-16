@@ -550,7 +550,7 @@ void VOFA_task(void *argument)
 
   for(;;)
   {
-    osDelay(200);  /* 10Hz 发送（WiFi 透传不积包） */
+    osDelay(20);  /* 10Hz 发送（WiFi 透传不积包） */
 
     if (!vofaStreamActive) {
       continue;

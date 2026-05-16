@@ -4,9 +4,6 @@
 #include <string.h>
 
 #define DRV_SERVO_MAX_ID          255U
-#define DRV_SERVO_MIN_PULSE_US    500U
-#define DRV_SERVO_MAX_PULSE_US    2500U
-#define DRV_SERVO_MAX_TIME_MS     9999U
 #define DRV_SERVO_MAX_ITEMS       8U
 #define DRV_SERVO_TX_TIMEOUT_MS   100U
 #define DRV_SERVO_MIN_MODE        1U
@@ -61,11 +58,67 @@ DRV_SERVO_Status DRV_SERVO_SendRaw(DRV_SERVO_Device *dev, const char *command)
                                             (uint16_t)length, timeout));
 }
 
+uint16_t DRV_SERVO_ReadResponse(DRV_SERVO_Device *dev, char *buf, uint16_t max_len)
+{
+    uint16_t count = 0U;
+    uint32_t byte_timeout = 10U;
+
+    if ((buf == NULL) || (max_len == 0U)) { return 0U; }
+
+    HAL_HalfDuplex_EnableReceiver(dev->bus.huart);
+
+    while (count < max_len) {
+        HAL_StatusTypeDef status;
+        status = HAL_UART_Receive(dev->bus.huart, (uint8_t *)&buf[count], 1U,
+                                  byte_timeout);
+        if (status != HAL_OK) { break; }
+        count++;
+    }
+
+    HAL_HalfDuplex_EnableTransmitter(dev->bus.huart);
+    return count;
+}
+
+uint16_t DRV_SERVO_PositionToPulse(uint16_t position)
+{
+    uint32_t span = DRV_SERVO_MAX_PULSE_US - DRV_SERVO_MIN_PULSE_US;
+
+    if (position > DRV_SERVO_POSITION_MAX) {
+        position = DRV_SERVO_POSITION_MAX;
+    }
+
+    return (uint16_t)(DRV_SERVO_MIN_PULSE_US +
+                      (((uint32_t)position * span) / DRV_SERVO_POSITION_MAX));
+}
+
 DRV_SERVO_Status DRV_SERVO_Move(DRV_SERVO_Device *dev, uint8_t id,
                                 uint16_t pulse_us, uint16_t time_ms)
 {
-    DRV_SERVO_MoveCmd move = { .id = id, .pulse_us = pulse_us };
-    return DRV_SERVO_MoveMany(dev, &move, 1U, time_ms);
+    char command[32];
+    int written;
+
+    if ((pulse_us < DRV_SERVO_MIN_PULSE_US) || (pulse_us > DRV_SERVO_MAX_PULSE_US) ||
+        (time_ms > DRV_SERVO_MAX_TIME_MS)) {
+        return DRV_SERVO_INVALID_PARAM;
+    }
+
+    written = snprintf(command, sizeof(command), "#%03uP%04uT%04u!",
+                       (unsigned int)id, (unsigned int)pulse_us, (unsigned int)time_ms);
+    if ((written < 0) || ((uint32_t)written >= sizeof(command))) {
+        return DRV_SERVO_INVALID_PARAM;
+    }
+
+    return DRV_SERVO_SendRaw(dev, command);
+}
+
+DRV_SERVO_Status DRV_SERVO_MovePosition(DRV_SERVO_Device *dev, uint8_t id,
+                                        uint16_t position, uint16_t time_ms)
+{
+    if (position > DRV_SERVO_POSITION_MAX) {
+        return DRV_SERVO_INVALID_PARAM;
+    }
+
+    return DRV_SERVO_Move(dev, id, DRV_SERVO_PositionToPulse(position), time_ms);
 }
 
 DRV_SERVO_Status DRV_SERVO_MoveMany(DRV_SERVO_Device *dev,

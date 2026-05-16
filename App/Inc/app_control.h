@@ -34,12 +34,10 @@ typedef struct {
 
 void APP_Control_Init(void);
 void APP_Control_Tick(void);
+void APP_Control_QueueText(const char *format, ...);
 void APP_Control_ProcessLine(const char *line);
 void APP_Control_MaintTick(void);
 void APP_Control_ProcessMaintLine(const char *line);
-void APP_Control_ProcessProtoRequest(uint16_t function,
-                                     const uint8_t *payload,
-                                     uint16_t payload_length);
 void APP_Control_GetConfig(APP_ControlConfig *config);
 void APP_Control_ReportUartStats(uint32_t rx_bytes,
                                   uint32_t rx_lines,

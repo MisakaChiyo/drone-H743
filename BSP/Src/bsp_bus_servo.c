@@ -17,8 +17,19 @@ static void servo_bind_bus(void)
 DRV_SERVO_Status BSP_BusServo_SendRaw(const char *command)
 { servo_bind_bus(); return DRV_SERVO_SendRaw(&servo_dev, command); }
 
+uint16_t BSP_BusServo_ReadResponse(char *buf, uint16_t max_len)
+{ servo_bind_bus(); return DRV_SERVO_ReadResponse(&servo_dev, buf, max_len); }
+
+uint16_t BSP_BusServo_PositionToPulse(uint16_t position)
+{ return DRV_SERVO_PositionToPulse(position); }
+
 DRV_SERVO_Status BSP_BusServo_Move(uint8_t id, uint16_t pulse_us, uint16_t time_ms)
 { servo_bind_bus(); return DRV_SERVO_Move(&servo_dev, id, pulse_us, time_ms); }
+
+DRV_SERVO_Status BSP_BusServo_MovePosition(uint8_t id,
+                                           uint16_t position,
+                                           uint16_t time_ms)
+{ servo_bind_bus(); return DRV_SERVO_MovePosition(&servo_dev, id, position, time_ms); }
 
 DRV_SERVO_Status BSP_BusServo_MoveMany(const DRV_SERVO_MoveCmd *moves,
                                        uint8_t count, uint16_t time_ms)

@@ -28,6 +28,7 @@ typedef struct {
 void APP_MAG_Init(void);
 void APP_MAG_Step(void);
 void APP_MAG_GetStatus(APP_MAG_Status *status);
+void APP_MAG_Report(void);
 const char *APP_MAG_GetTypeName(uint8_t type);
 
 #endif

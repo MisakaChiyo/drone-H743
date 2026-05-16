@@ -677,6 +677,18 @@ void APP_UART_Task_Step(void)
     now_ms = HAL_GetTick();
     app_uart_flush_idle_line(now_ms);
     APP_AiWB2_Tick();
+
+    /* PC13 LED: 初始慢闪 → 透传快闪 */
+    {
+        static uint32_t led_toggle_ms;
+        uint32_t period_ms = APP_AiWB2_IsTransparent() ? 120U : 500U;
+
+        if ((now_ms - led_toggle_ms) >= period_ms) {
+            led_toggle_ms = now_ms;
+            BSP_LED_Toggle(LED_RED);
+        }
+    }
+
     app_uart_ensure_control_ready();
     if ((app_uart_control_initialized != 0U)
 #if (APP_UART_DIRECT_CONTROL_ENABLED == 0U)

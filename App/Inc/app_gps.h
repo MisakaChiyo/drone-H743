@@ -44,5 +44,6 @@ typedef struct {
 void APP_GPS_Init(void);
 void APP_GPS_Step(void);
 void APP_GPS_GetStatus(APP_GPS_Status *status);
+void APP_GPS_Report(void);
 
 #endif

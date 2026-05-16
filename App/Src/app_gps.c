@@ -1,7 +1,9 @@
 #include "app_gps.h"
 
+#include "app_control.h"
 #include "bsp_gps.h"
 
+#include <stdio.h>
 #include <string.h>
 
 typedef struct {
@@ -80,4 +82,57 @@ void APP_GPS_GetStatus(APP_GPS_Status *status)
     status->vel_e_mm_s = bsp->nav.vel_e_mm_s;
     status->vel_d_mm_s = bsp->nav.vel_d_mm_s;
     status->heading_motion_deg_e5 = bsp->nav.heading_motion_deg_e5;
+}
+
+void APP_GPS_Report(void)
+{
+    APP_GPS_Status gps_status;
+    uint32_t now_ms = HAL_GetTick();
+    uint32_t age_ms = 0U;
+
+    APP_GPS_GetStatus(&gps_status);
+    if (gps_status.last_rx_ms != 0U) {
+        age_ms = now_ms - gps_status.last_rx_ms;
+    } else {
+        age_ms = 0xFFFFFFFFUL;
+    }
+
+    APP_Control_QueueText("GPS ok=%u init=%ld fix=%u valid=%u sv=%u pkts=%lu nav=%lu nmea=%lu gga=%lu age_ms=%lu\r\n",
+                           (unsigned int)gps_status.initialized,
+                           (long)gps_status.init_status,
+                           (unsigned int)gps_status.fix_type,
+                           (unsigned int)gps_status.valid_fix,
+                           (unsigned int)gps_status.num_sv,
+                           (unsigned long)gps_status.packets,
+                           (unsigned long)gps_status.nav_pvt_packets,
+                           (unsigned long)gps_status.nmea_sentences,
+                           (unsigned long)gps_status.nmea_gga_sentences,
+                           (unsigned long)age_ms);
+    APP_Control_QueueText("GPS diag baud=%lu bytes=%lu cksum=%lu nmea_ck=%lu ovf=%lu nmea_ovf=%lu rst=%lu uerr=%lu last_err=0x%lX cfg=%lu\r\n",
+                           (unsigned long)gps_status.baud_rate,
+                           (unsigned long)gps_status.bytes,
+                           (unsigned long)gps_status.checksum_errors,
+                           (unsigned long)gps_status.nmea_checksum_errors,
+                           (unsigned long)gps_status.payload_overflows,
+                           (unsigned long)gps_status.nmea_overflows,
+                           (unsigned long)gps_status.rx_restarts,
+                           (unsigned long)gps_status.uart_errors,
+                           (unsigned long)gps_status.last_uart_error,
+                           (unsigned long)gps_status.config_writes);
+    APP_Control_QueueText("GPS pos lon=%ld lat=%ld hmsl_mm=%ld hacc_mm=%lu vacc_mm=%lu vn=%ld ve=%ld vd=%ld head_e5=%ld utc=%04u-%02u-%02uT%02u:%02u:%02u\r\n",
+                           (long)gps_status.lon_deg_e7,
+                           (long)gps_status.lat_deg_e7,
+                           (long)gps_status.hmsl_mm,
+                           (unsigned long)gps_status.hacc_mm,
+                           (unsigned long)gps_status.vacc_mm,
+                           (long)gps_status.vel_n_mm_s,
+                           (long)gps_status.vel_e_mm_s,
+                           (long)gps_status.vel_d_mm_s,
+                           (long)gps_status.heading_motion_deg_e5,
+                           (unsigned int)gps_status.year,
+                           (unsigned int)gps_status.month,
+                           (unsigned int)gps_status.day,
+                           (unsigned int)gps_status.hour,
+                           (unsigned int)gps_status.minute,
+                           (unsigned int)gps_status.second);
 }

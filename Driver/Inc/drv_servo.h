@@ -30,9 +30,20 @@ typedef struct {
     DRV_SERVO_Bus bus;
 } DRV_SERVO_Device;
 
+#define DRV_SERVO_MIN_PULSE_US    500U
+#define DRV_SERVO_MAX_PULSE_US    2500U
+#define DRV_SERVO_MAX_TIME_MS     9999U
+#define DRV_SERVO_POSITION_MIN    0U
+#define DRV_SERVO_POSITION_MAX    1000U
+#define DRV_SERVO_MAX_RESPONSE_LEN 64U
+
 DRV_SERVO_Status DRV_SERVO_SendRaw(DRV_SERVO_Device *dev, const char *command);
+uint16_t DRV_SERVO_ReadResponse(DRV_SERVO_Device *dev, char *buf, uint16_t max_len);
+uint16_t DRV_SERVO_PositionToPulse(uint16_t position);
 DRV_SERVO_Status DRV_SERVO_Move(DRV_SERVO_Device *dev, uint8_t id,
                                 uint16_t pulse_us, uint16_t time_ms);
+DRV_SERVO_Status DRV_SERVO_MovePosition(DRV_SERVO_Device *dev, uint8_t id,
+                                        uint16_t position, uint16_t time_ms);
 DRV_SERVO_Status DRV_SERVO_MoveMany(DRV_SERVO_Device *dev,
                                     const DRV_SERVO_MoveCmd *moves,
                                     uint8_t count, uint16_t time_ms);
