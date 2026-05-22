@@ -83,6 +83,11 @@ static uint8_t aiwb2_contains(const char *line, const char *needle)
     return (strstr(line, needle) != 0) ? 1U : 0U;
 }
 
+static uint8_t aiwb2_is_transparent_prompt(const char *line)
+{
+    return ((line != 0) && (line[0] == '>')) ? 1U : 0U;
+}
+
 static uint8_t aiwb2_should_mirror_to_maint(const char *line)
 {
     if ((line == 0) || (*line == '\0')) {
@@ -101,7 +106,7 @@ static uint8_t aiwb2_should_mirror_to_maint(const char *line)
         (aiwb2_contains(line, "connect success") != 0U) ||
         (strcmp(line, "OK") == 0) ||
         (strcmp(line, "ERROR") == 0) ||
-        (strcmp(line, ">") == 0)) {
+        (aiwb2_is_transparent_prompt(line) != 0U)) {
         return 1U;
     }
 
@@ -223,6 +228,7 @@ static void aiwb2_enter_transparent(void)
 {
     aiwb2_state = APP_AIWB2_STATE_TRANSPARENT;
     aiwb2_retry_count = 0U;
+    aiwb2_provision_active = 0U;
 }
 
 static void aiwb2_wait_transparent_ok(void)
@@ -426,7 +432,10 @@ void APP_AiWB2_ProcessLine(const char *line)
         return;
     }
 
-    if (strcmp(line, ">") == 0) {
+    if (((aiwb2_state == APP_AIWB2_STATE_WAIT_TRANSPARENT_OK) ||
+         (aiwb2_state == APP_AIWB2_STATE_WAIT_BOOT_CONNECT) ||
+         (aiwb2_state == APP_AIWB2_STATE_WAIT_COMMAND)) &&
+        (aiwb2_is_transparent_prompt(line) != 0U)) {
         aiwb2_enter_transparent();
         return;
     }
@@ -495,8 +504,8 @@ void APP_AiWB2_ProcessLine(const char *line)
 
     if (aiwb2_state == APP_AIWB2_STATE_WAIT_BOOT_CONNECT) {
         if ((aiwb2_contains(line, "connect success") != 0U) ||
-            (strcmp(line, ">") == 0)) {
-            if (strcmp(line, ">") == 0) {
+            (aiwb2_is_transparent_prompt(line) != 0U)) {
+            if (aiwb2_is_transparent_prompt(line) != 0U) {
                 aiwb2_enter_transparent();
             } else {
                 aiwb2_wait_transparent_ok();
@@ -747,18 +756,31 @@ uint8_t APP_AiWB2_SendRawCommand(const char *command)
 
 void APP_AiWB2_SendDiagCommands(void)
 {
-    static const char *const commands[] = {
-        "AT",
-        "AT+WMODE?",
-        "AT+WJAP?",
-        "AT+WAUTOCONN?",
-        "AT+SOCKETAUTOTT?",
-        "AT+SOCKET?",
-    };
+    uint32_t now_ms = HAL_GetTick();
 
-    for (uint32_t i = 0U; i < (uint32_t)(sizeof(commands) / sizeof(commands[0])); ++i) {
-        (void)APP_AiWB2_SendRawCommand(commands[i]);
-        HAL_Delay(150U);
+    aiwb2_provision_commands[0] = (APP_AiWB2Command){ "ATE0", 1500U, 1U, 0U };
+    aiwb2_provision_commands[1] = (APP_AiWB2Command){ "AT+WMODE?", 1500U, 1U, 0U };
+    aiwb2_provision_commands[2] = (APP_AiWB2Command){ "AT+WJAP?", 2500U, 1U, 0U };
+    aiwb2_provision_commands[3] = (APP_AiWB2Command){ "AT+WAUTOCONN?", 1500U, 1U, 0U };
+    aiwb2_provision_commands[4] = (APP_AiWB2Command){ "AT+SOCKETAUTOTT?", 1500U, 1U, 0U };
+    aiwb2_provision_commands[5] = (APP_AiWB2Command){ "AT+SOCKET?", 1500U, 1U, 0U };
+    aiwb2_provision_commands[6] = (APP_AiWB2Command){ "AT+SOCKETTT", 3000U, 1U, 0U };
+    aiwb2_provision_command_count = 7U;
+
+    if (BSP_AiWB2_IsEnabled() == 0U) {
+        BSP_AiWB2_SetEnabled(1U);
+    }
+
+    aiwb2_provision_active = 1U;
+    aiwb2_power_recycle_active = 0U;
+    aiwb2_command_index = 0U;
+    aiwb2_probe_escape_used = 1U;
+
+    if (aiwb2_state == APP_AIWB2_STATE_TRANSPARENT) {
+        aiwb2_state = APP_AIWB2_STATE_ESCAPE_BEFORE;
+        aiwb2_deadline_ms = now_ms + APP_AIWB2_ESCAPE_GUARD_MS;
+    } else {
+        aiwb2_begin_probe();
     }
 }
 

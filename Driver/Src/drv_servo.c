@@ -1,5 +1,7 @@
 #include "drv_servo.h"
 
+#include "bsp_cache.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -11,6 +13,61 @@
 #define DRV_SERVO_MIN_MODE        1U
 #define DRV_SERVO_MAX_MODE        8U
 #define DRV_SERVO_MAX_BAUD_CODE   7U
+#define DRV_SERVO_COMMAND_BUFFER_SIZE 128U
+#define DRV_SERVO_DMA_MIN_TIMEOUT_MS 10U
+#define DRV_SERVO_UART_BITS_PER_BYTE 10U
+
+__attribute__((section(".dma_buffer"), aligned(32)))
+static uint8_t servo_dma_tx_buffer[DRV_SERVO_COMMAND_BUFFER_SIZE];
+static volatile DRV_SERVO_Diag servo_diag;
+static volatile uint32_t servo_dma_start_tick_ms;
+static volatile uint32_t servo_dma_timeout_ms;
+static UART_HandleTypeDef * volatile servo_dma_huart;
+
+static uint32_t servo_estimate_dma_timeout_ms(UART_HandleTypeDef *huart,
+                                              uint16_t length)
+{
+    uint32_t baud = ((huart != NULL) && (huart->Init.BaudRate != 0U)) ?
+                    huart->Init.BaudRate : 115200U;
+    uint32_t bits = (uint32_t)length * DRV_SERVO_UART_BITS_PER_BYTE;
+    uint32_t wire_ms = ((bits * 1000U) + baud - 1U) / baud;
+    uint32_t timeout_ms = wire_ms + 5U;
+
+    return (timeout_ms < DRV_SERVO_DMA_MIN_TIMEOUT_MS) ?
+           DRV_SERVO_DMA_MIN_TIMEOUT_MS : timeout_ms;
+}
+
+static void servo_diag_capture_uart(UART_HandleTypeDef *huart)
+{
+    servo_diag.last_uart_state = (huart != NULL) ? (uint32_t)huart->gState : 0U;
+    servo_diag.last_uart_error = (huart != NULL) ? huart->ErrorCode : 0U;
+    servo_diag.last_dma_state = ((huart != NULL) && (huart->hdmatx != NULL)) ?
+                                (uint32_t)huart->hdmatx->State : 0U;
+    servo_diag.last_dma_error = ((huart != NULL) && (huart->hdmatx != NULL)) ?
+                                huart->hdmatx->ErrorCode : 0U;
+}
+
+static void servo_try_recover_stuck_dma(UART_HandleTypeDef *huart)
+{
+    uint32_t elapsed_ms;
+
+    if ((huart == NULL) || (servo_dma_start_tick_ms == 0U) ||
+        (huart->gState == HAL_UART_STATE_READY)) {
+        return;
+    }
+
+    elapsed_ms = HAL_GetTick() - servo_dma_start_tick_ms;
+    if (elapsed_ms < servo_dma_timeout_ms) {
+        return;
+    }
+
+    (void)HAL_UART_AbortTransmit(huart);
+    servo_dma_start_tick_ms = 0U;
+    servo_dma_timeout_ms = 0U;
+    servo_dma_huart = NULL;
+    servo_diag.tx_recover_count++;
+    servo_diag_capture_uart(huart);
+}
 
 static DRV_SERVO_Status servo_from_hal(HAL_StatusTypeDef status)
 {
@@ -27,6 +84,55 @@ static uint8_t servo_is_valid_move(const DRV_SERVO_MoveCmd *move)
     if ((move->pulse_us < DRV_SERVO_MIN_PULSE_US) ||
         (move->pulse_us > DRV_SERVO_MAX_PULSE_US)) { return 0U; }
     return 1U;
+}
+
+static DRV_SERVO_Status servo_build_move_many_command(const DRV_SERVO_MoveCmd *moves,
+                                                      uint8_t count,
+                                                      uint16_t time_ms,
+                                                      char *command,
+                                                      uint16_t command_size,
+                                                      uint16_t *length)
+{
+    int written;
+    uint32_t used = 0U;
+
+    if ((moves == NULL) || (command == NULL) || (length == NULL) ||
+        (count == 0U) || (count > DRV_SERVO_MAX_ITEMS) ||
+        (time_ms > DRV_SERVO_MAX_TIME_MS) ||
+        (command_size < 3U)) {
+        return DRV_SERVO_INVALID_PARAM;
+    }
+
+    command[used++] = '{';
+    command[used++] = 'G';
+    command[used++] = '0';
+    command[used++] = '0';
+    command[used++] = '0';
+    command[used++] = '0';
+
+    for (uint8_t index = 0U; index < count; ++index) {
+        if (servo_is_valid_move(&moves[index]) == 0U) {
+            return DRV_SERVO_INVALID_PARAM;
+        }
+
+        written = snprintf(&command[used], (size_t)command_size - used,
+                           "#%03uP%04uT%04u!",
+                           (unsigned int)moves[index].id,
+                           (unsigned int)moves[index].pulse_us,
+                           (unsigned int)time_ms);
+        if ((written < 0) || ((uint32_t)written >= ((uint32_t)command_size - used))) {
+            return DRV_SERVO_INVALID_PARAM;
+        }
+        used += (uint32_t)written;
+    }
+
+    if ((used + 2U) > command_size) { return DRV_SERVO_INVALID_PARAM; }
+
+    command[used++] = '}';
+    command[used] = '\0';
+    *length = (uint16_t)used;
+
+    return DRV_SERVO_OK;
 }
 
 static DRV_SERVO_Status servo_send_id_command(DRV_SERVO_Device *dev,
@@ -144,39 +250,112 @@ DRV_SERVO_Status DRV_SERVO_MoveMany(DRV_SERVO_Device *dev,
                                     const DRV_SERVO_MoveCmd *moves,
                                     uint8_t count, uint16_t time_ms)
 {
-    char command[128];
-    int written;
-    uint32_t used = 0U;
+    char command[DRV_SERVO_COMMAND_BUFFER_SIZE];
+    uint16_t length = 0U;
+    DRV_SERVO_Status status;
 
-    if ((moves == NULL) || (count == 0U) || (count > DRV_SERVO_MAX_ITEMS) ||
-        (time_ms > DRV_SERVO_MAX_TIME_MS)) {
+    status = servo_build_move_many_command(moves, count, time_ms,
+                                           command, (uint16_t)sizeof(command),
+                                           &length);
+    if (status != DRV_SERVO_OK) {
+        return status;
+    }
+    return DRV_SERVO_SendRaw(dev, command);
+}
+
+DRV_SERVO_Status DRV_SERVO_MoveManyAsync(DRV_SERVO_Device *dev,
+                                         const DRV_SERVO_MoveCmd *moves,
+                                         uint8_t count, uint16_t time_ms)
+{
+    uint16_t length = 0U;
+    DRV_SERVO_Status status;
+    HAL_StatusTypeDef hal_status;
+
+    if ((dev == NULL) || (dev->bus.huart == NULL)) {
         return DRV_SERVO_INVALID_PARAM;
     }
 
-    command[used++] = '{';
-
-    for (uint8_t index = 0U; index < count; ++index) {
-        if (servo_is_valid_move(&moves[index]) == 0U) {
-            return DRV_SERVO_INVALID_PARAM;
-        }
-
-        written = snprintf(&command[used], sizeof(command) - used,
-                           "#%03uP%04uT%04u!",
-                           (unsigned int)moves[index].id,
-                           (unsigned int)moves[index].pulse_us,
-                           (unsigned int)time_ms);
-        if ((written < 0) || ((uint32_t)written >= (sizeof(command) - used))) {
-            return DRV_SERVO_INVALID_PARAM;
-        }
-        used += (uint32_t)written;
+    if (dev->bus.huart->hdmatx == NULL) {
+        servo_diag.last_status = DRV_SERVO_ERROR;
+        servo_diag_capture_uart(dev->bus.huart);
+        return DRV_SERVO_ERROR;
     }
 
-    if ((used + 2U) > sizeof(command)) { return DRV_SERVO_INVALID_PARAM; }
+    servo_try_recover_stuck_dma(dev->bus.huart);
+    if (dev->bus.huart->gState != HAL_UART_STATE_READY) {
+        servo_diag.tx_busy_count++;
+        servo_diag.last_status = DRV_SERVO_BUSY;
+        servo_diag_capture_uart(dev->bus.huart);
+        return DRV_SERVO_BUSY;
+    }
 
-    command[used++] = '}';
-    command[used] = '\0';
+    status = servo_build_move_many_command(moves, count, time_ms,
+                                           (char *)servo_dma_tx_buffer,
+                                           (uint16_t)sizeof(servo_dma_tx_buffer),
+                                           &length);
+    if (status != DRV_SERVO_OK) {
+        servo_diag.last_status = status;
+        return status;
+    }
 
-    return DRV_SERVO_SendRaw(dev, command);
+    BSP_Cache_CleanDCache(servo_dma_tx_buffer, length);
+    hal_status = HAL_UART_Transmit_DMA(dev->bus.huart, servo_dma_tx_buffer, length);
+
+    if (hal_status == HAL_BUSY) {
+        servo_diag.tx_busy_count++;
+        servo_diag.last_status = DRV_SERVO_BUSY;
+        servo_diag_capture_uart(dev->bus.huart);
+        return DRV_SERVO_BUSY;
+    }
+
+    status = servo_from_hal(hal_status);
+    servo_diag.last_status = status;
+    servo_diag_capture_uart(dev->bus.huart);
+
+    if (status == DRV_SERVO_OK) {
+        servo_diag.tx_start_count++;
+        servo_diag.last_length = length;
+        servo_dma_timeout_ms = servo_estimate_dma_timeout_ms(dev->bus.huart, length);
+        servo_dma_start_tick_ms = HAL_GetTick();
+        servo_dma_huart = dev->bus.huart;
+    } else {
+        servo_diag.tx_error_count++;
+    }
+
+    return status;
+}
+
+void DRV_SERVO_GetDiag(DRV_SERVO_Diag *diag)
+{
+    if (diag == NULL) { return; }
+    *diag = servo_diag;
+}
+
+void DRV_SERVO_OnUartTxComplete(UART_HandleTypeDef *huart)
+{
+    if ((huart == NULL) || (huart != servo_dma_huart)) {
+        return;
+    }
+
+    servo_dma_start_tick_ms = 0U;
+    servo_dma_timeout_ms = 0U;
+    servo_dma_huart = NULL;
+    servo_diag.tx_complete_count++;
+    servo_diag_capture_uart(huart);
+}
+
+void DRV_SERVO_OnUartError(UART_HandleTypeDef *huart)
+{
+    if ((huart == NULL) || (huart != servo_dma_huart)) {
+        return;
+    }
+
+    servo_dma_start_tick_ms = 0U;
+    servo_dma_timeout_ms = 0U;
+    servo_dma_huart = NULL;
+    servo_diag.tx_error_count++;
+    servo_diag.last_status = DRV_SERVO_ERROR;
+    servo_diag_capture_uart(huart);
 }
 
 DRV_SERVO_Status DRV_SERVO_ReadVersion(DRV_SERVO_Device *dev, uint8_t id)

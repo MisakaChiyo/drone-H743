@@ -60,31 +60,28 @@ void APP_IMU_RawToScaled(const DRV_IMU_RawData *raw,
 /*  (1-alpha)      → 更信任加速度计重力向量。                                */
 /* ════════════════════════════════════════════════════════════════════════ */
 
-#define APP_IMU_ATTITUDE_ALPHA     0.96f
-#define APP_IMU_DEFAULT_DT_SEC     0.01f
-#define APP_IMU_MAX_DT_SEC        0.05f
+#define APP_IMU_ACCEL_CORRECTION_TAU_SEC  0.25f
+#define APP_IMU_DEFAULT_DT_SEC            0.001f
+#define APP_IMU_MAX_DT_SEC                0.05f
 #define APP_IMU_RAD_TO_DEG        57.2957795f
 
 void APP_IMU_UpdateAttitude(const DRV_IMU_ScaledData *imu,
                             float *roll_deg,
                             float *pitch_deg,
                             float *yaw_deg,
-                            uint32_t *last_tick_ms,
+                            float dt_sec,
                             uint32_t sample_count)
 {
-    uint32_t now_ms = osKernelGetTickCount();
-    float dt_sec = APP_IMU_DEFAULT_DT_SEC;
+    float alpha;
 
-    if (*last_tick_ms != 0U) {
-        uint32_t dt_ms = now_ms - *last_tick_ms;
-        dt_sec = (float)dt_ms * 0.001f;
-        if (dt_sec <= 0.0f) {
-            dt_sec = APP_IMU_DEFAULT_DT_SEC;
-        } else if (dt_sec > APP_IMU_MAX_DT_SEC) {
-            dt_sec = APP_IMU_MAX_DT_SEC;
-        }
+    if (dt_sec <= 0.0f) {
+        dt_sec = APP_IMU_DEFAULT_DT_SEC;
+    } else if (dt_sec > APP_IMU_MAX_DT_SEC) {
+        dt_sec = APP_IMU_MAX_DT_SEC;
     }
-    *last_tick_ms = now_ms;
+
+    alpha = APP_IMU_ACCEL_CORRECTION_TAU_SEC /
+            (APP_IMU_ACCEL_CORRECTION_TAU_SEC + dt_sec);
 
     float roll_acc  = atan2f(imu->accel_y_g, imu->accel_z_g) * APP_IMU_RAD_TO_DEG;
     float pitch_acc = atan2f(-imu->accel_x_g,
@@ -95,10 +92,10 @@ void APP_IMU_UpdateAttitude(const DRV_IMU_ScaledData *imu,
         *roll_deg  = roll_acc;
         *pitch_deg = pitch_acc;
     } else {
-        *roll_deg  = APP_IMU_ATTITUDE_ALPHA * (*roll_deg  + imu->gyro_x_dps * dt_sec)
-                   + (1.0f - APP_IMU_ATTITUDE_ALPHA) * roll_acc;
-        *pitch_deg = APP_IMU_ATTITUDE_ALPHA * (*pitch_deg + imu->gyro_y_dps * dt_sec)
-                   + (1.0f - APP_IMU_ATTITUDE_ALPHA) * pitch_acc;
+        *roll_deg  = alpha * (*roll_deg  + imu->gyro_x_dps * dt_sec)
+                   + (1.0f - alpha) * roll_acc;
+        *pitch_deg = alpha * (*pitch_deg + imu->gyro_y_dps * dt_sec)
+                   + (1.0f - alpha) * pitch_acc;
         *yaw_deg  += imu->gyro_z_dps * dt_sec;
     }
 
@@ -263,6 +260,43 @@ uint8_t APP_Sensor_CalibrateGyroBias(float gx, float gy, float gz,
         return 1U;  /* 刚完成校准 */
     }
     return 0U;
+}
+
+void APP_SensorRateMeter_Reset(APP_Sensor_RateMeter *meter)
+{
+    if (meter == NULL) return;
+
+    meter->window_start_us = 0ULL;
+    meter->window_start_count = 0U;
+    meter->hz = 0.0f;
+}
+
+float APP_SensorRateMeter_Update(APP_Sensor_RateMeter *meter,
+                                  uint64_t timestamp_us,
+                                  uint32_t sample_count)
+{
+    uint64_t elapsed_us;
+    uint32_t elapsed_samples;
+
+    if (meter == NULL) return 0.0f;
+
+    if (meter->window_start_us == 0ULL) {
+        meter->window_start_us = timestamp_us;
+        meter->window_start_count = sample_count;
+        return meter->hz;
+    }
+
+    elapsed_us = timestamp_us - meter->window_start_us;
+    if (elapsed_us < 250000ULL) {
+        return meter->hz;
+    }
+
+    elapsed_samples = sample_count - meter->window_start_count;
+    meter->hz = ((float)elapsed_samples * 1000000.0f) / (float)elapsed_us;
+    meter->window_start_us = timestamp_us;
+    meter->window_start_count = sample_count;
+
+    return meter->hz;
 }
 
 /* ════════════════════════════════════════════════════════════════════════ */

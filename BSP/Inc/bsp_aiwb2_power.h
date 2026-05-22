@@ -5,6 +5,7 @@
 
 void BSP_AiWB2_PowerInit(void);
 void BSP_AiWB2_SetEnabled(uint8_t enabled);
+void BSP_AiWB2_UpdateButton(void);
 uint8_t BSP_AiWB2_IsEnabled(void);
 uint8_t BSP_AiWB2_GetLastWrittenState(void);
 uint32_t BSP_AiWB2_GetWriteCount(void);

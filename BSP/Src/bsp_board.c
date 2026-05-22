@@ -15,6 +15,8 @@ static DRV_MAG_Bus mag_bus;
 static DRV_GPS_Bus gps_bus;
 static DRV_SERVO_Bus servo_bus;
 
+#define BSP_IMU_SPI_TIMEOUT_MS 5U
+
 void BSP_DelayMs(uint32_t ms)
 {
     if (osKernelGetState() == osKernelRunning) {
@@ -29,7 +31,7 @@ void BSP_Board_Init(void)
     imu_bus.hspi       = &hspi2;
     imu_bus.cs_port    = IMU_CS_GPIO_Port;
     imu_bus.cs_pin     = IMU_CS_Pin;
-    imu_bus.timeout_ms = 100U;
+    imu_bus.timeout_ms = BSP_IMU_SPI_TIMEOUT_MS;
     imu_bus.delay_ms   = BSP_DelayMs;
 
     baro_bus.hspi       = &hspi4;

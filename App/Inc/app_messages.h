@@ -51,8 +51,12 @@ typedef struct {
     float  baro_temperature_c;      /* deg C  */
     uint8_t baro_updated;           /* 1 when new baro data present */
 
+    /* IMU sampling diagnostics */
+    float imu_sample_rate_hz;
+
     /* IMU data-ready counter (debug) */
     uint32_t imu_data_ready_count;
+    uint32_t imu_poll_ready_count;
 } APP_Sensor_SampleMessage;
 
 typedef struct {

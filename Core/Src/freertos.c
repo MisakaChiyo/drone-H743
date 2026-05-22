@@ -17,6 +17,77 @@
   */
 /* USER CODE END Header */
 
+/*
+ * ============================================================================
+ * freertos.c —— 同轴双旋翼无人机 RTOS 任务架构
+ * ============================================================================
+ *
+ * 概述：
+ *   本文件是飞控固件的 RTOS 层入口，由 STM32CubeMX 生成框架代码，
+ *   在 USER CODE 区域填充应用逻辑。文件包含 6 个 FreeRTOS 任务、
+ *   5 个消息队列、1 个互斥锁、1 个信号量的声明和初始化。
+ *
+ * ┌─────────────────────────────────────────────────────────────────┐
+ * │                     系统数据流架构（按数据传递顺序）               │
+ * │                                                                 │
+ * │  ┌──────────┐    IMU 1kHz       ┌──────────────┐                │
+ * │  │ 硬件 IRQ  │ ────────────────→ │  Sensor_Task │                │
+ * │  │ PC0 EXTI │   Thread Flag     │  (Normal)    │                │
+ * │  └──────────┘                   │              │                │
+ * │                                 │ 1.读取 SPI1  │                │
+ * │                                 │ 2.零偏校准   │                │
+ * │                                 │ 3.坐标对齐   │                │
+ * │                                 │ 4.低通滤波   │                │
+ * │                                 │ 5.气压计降采样│               │
+ * │                                 └──────┬───────┘                │
+ * │                                        │                        │
+ * │                            SensorSampleQueue (深度8)             │
+ * │                                        │                        │
+ * │                                 ┌──────▼───────┐                │
+ * │                                 │ Stabilizer   │                │
+ * │                                 │   Task       │                │
+ * │                                 │  (Normal)    │                │
+ * │                                 │              │                │
+ * │                                 │ 1.互补滤波   │                │
+ * │                                 │ 2.姿态解算   │                │
+ * │                                 │ 3.舵机控制   │                │
+ * │                                 │   (25Hz)     │                │
+ * │                                 └──┬───────┬───┘                │
+ * │                                    │       │                    │
+ * │                      vofaLogQueue  │       │  舵机总线           │
+ * │                       (深度1覆盖)  │       │  (UART7)           │
+ * │                                    │       │                    │
+ * │                           ┌────────▼─┐  ┌──▼──────────┐        │
+ * │                           │ VOFA_Task │  │ BSP_BusServo │       │
+ * │                           │  (Low)    │  │   (ISR)      │       │
+ * │                           │           │  └──────────────┘       │
+ * │                           │ 50Hz 发送 │                         │
+ * │                           │ WiFi→上位机│                        │
+ * │                           └───────────┘                         │
+ * │                                                                 │
+ * │  ┌───────────┐     ┌───────────┐     ┌───────────────┐         │
+ * │  │ UARTTask  │     │messageTask│     │backgroundTask │         │
+ * │  │ (Normal)  │     │(BelowN)   │     │  (BelowN)     │         │
+ * │  │           │     │           │     │               │         │
+ * │  │ UART4:舵机│     │ JSON解析  │     │ FLASH参数读写  │         │
+ * │  │ UART7:ELRS│     │ 协议编解码│     │ 磨损均衡      │         │
+ * │  │ UART8:WiFi│     │ 参数API   │     │ 异步保存      │         │
+ * │  └───────────┘     └───────────┘     └───────────────┘         │
+ * └─────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────┐
+ * │                     CubeMX 代码生成注意事项                       │
+ * │                                                                 │
+ * │  CubeMX 重新生成 .ioc 后，USER CODE BEGIN/END 之外的内容会被     │
+ * │  覆盖。本文件中的 USER CODE 区域：                                │
+ * │    - Includes / PD / PM / Variables  — 常量定义和辅助函数        │
+ * │    - Init / RTOS_MUTEX / RTOS_SEMAPHORES / RTOS_QUEUES /        │
+ * │      RTOS_THREADS / RTOS_EVENTS     — 内核对象创建               │
+ * │    - Header_* / 各任务函数体         — 任务实现代码               │
+ * │    - 4 / 5 / Application            — 钩子函数和应用代码         │
+ * └─────────────────────────────────────────────────────────────────┘
+ */
+
 /* Includes ------------------------------------------------------------------*/
 #include "FreeRTOS.h"
 #include "task.h"
@@ -26,6 +97,28 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+/*
+ * ============================================================================
+ * 模块依赖说明
+ * ============================================================================
+ * App 层（应用逻辑）：
+ *   app_diag.h       — 诊断记录（栈溢出 / malloc 失败时记录到 FLASH）
+ *   app_sensor.h     — 传感器数据处理（零偏校准、坐标系对齐、低通滤波）
+ *   app_messages.h   — 消息协议编解码（JSON / 二进制帧封装）
+ *   app_tasks.h      — 各任务 Init/Step 函数声明
+ *   app_vofa.h       — VOFA 上位机通信（浮点数组帧发送）
+ *   app_elrs.h       — ELRS 遥控器链路（通道值读取）
+ *
+ * BSP 层（板级支持包——硬件抽象）：
+ *   bsp_baro.h       — 气压计 SPL06-007 驱动
+ *   bsp_imu.h        — IMU (ICM-42688-P) 驱动
+ *   bsp_bus_servo.h  — 舵机总线（UART7 半双工串行舵机协议）
+ *   bsp_pwm.h        — 电调 PWM 输出（TIM1/TIM8 → DShot 或标准 PWM）
+ *   bsp_aiwb2_power.h — Ai-WB2 WiFi 模块电源控制
+ *
+ * Driver 层（外设驱动——算法 / 协议）：
+ *   drv_coax_ctrl.h  — 同轴倾转旋翼控制器（Simulink 代码生成）
+ */
 #include "app_diag.h"
 #include "app_sensor.h"
 #include "app_messages.h"
@@ -38,7 +131,8 @@
 #include "bsp_imu.h"
 #include "bsp_bus_servo.h"
 #include "bsp_pwm.h"
-#include "drv_motor_model.h"
+#include "bsp_aiwb2_power.h"
+#include "drv_coax_ctrl.h"
 
 /* USER CODE END Includes */
 
@@ -49,6 +143,81 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+/*
+ * ============================================================================
+ * 传感器相关常量
+ * ============================================================================
+ * IMU 数据就绪优先由 PC0 外部中断触发，中断中设置 Thread Flag。
+ * 若短时间未等到中断，只读取一次 IMU ready 状态作为兜底；坏帧/短暂丢帧会被跳过。
+ */
+#define SENSOR_IMU_DATA_READY_FLAG     0x0001U  /* 位 0：IMU 数据就绪事件标志          */
+#define SENSOR_IMU_DEFAULT_DT_SEC      0.001f   /* 默认 IMU 采样间隔 1ms → dt = 0.001s */
+#define SENSOR_IMU_DRDY_TIMEOUT_MS     20U      /* 单次等待 DRDY 的超时时间            */
+#define SENSOR_IMU_DRDY_MISS_FAULT_LIMIT 50U    /* 连续 1s 无 DRDY/ready 才锁存故障    */
+#define SENSOR_IMU_READ_FAIL_LIMIT     25U      /* 连续读失败次数，超过后锁存故障      */
+#define SENSOR_MAG_PERIOD_US           50000ULL /* 磁力计步进间隔 50ms = 20Hz          */
+#define STABILIZER_USE_FIXED_IMU_DT    1U       /* 1=固定 1ms dt, 0=时间戳 dt          */
+
+/*
+ * ============================================================================
+ * 姿态稳定器常量
+ * ============================================================================
+ * 控制周期 20ms（50Hz）—— 舵机是慢速设备，不需要和 IMU 1kHz 同步。
+ *
+ * 舵机模式选择：
+ *   STABILIZER_USE_DIRECT_ANGLE_SERVO = 1 → 角度直驱（舵机调试）
+ *         姿态角直接映射为舵机脉宽，不经过同轴控制器。
+ *         alpha(α) = pitch → 舵机1,  beta(β) = roll → 舵机2
+ *   STABILIZER_USE_DIRECT_ANGLE_SERVO = 0 → 同轴控制器（Simulink 生成）
+ *         经过完整的同轴倾转旋翼控制律，RC 遥控器参与参考输入。
+ */
+#define STABILIZER_CONTROL_PERIOD_MS   20U      /* 控制输出周期 20ms = 50Hz            */
+#define STABILIZER_IMU_STALE_MS        50U      /* 超过此年龄后不再用旧姿态算新舵机   */
+#define STABILIZER_DEG_TO_RAD          0.0174532925f /* 度 → 弧度  (π/180)            */
+#define STABILIZER_USE_DIRECT_ANGLE_SERVO 0U     /* 1=角度直驱舵机, 0=同轴控制器       */
+#define STABILIZER_DIRECT_ALPHA_SIGN    (1.0f)   /* α 轴（俯仰→舵机1）方向符号         */
+#define STABILIZER_DIRECT_BETA_SIGN    (-1.0f)   /* β 轴（横滚→舵机2）方向符号         */
+#define STABILIZER_YAW_REF_LIMIT_RAD   0.34906585f /* 偏航参考限幅 ±20°               */
+#define STABILIZER_XY_REF_RANGE_M      1.20f     /* CH1/CH2 速度意图对应的虚拟 XY 参考 */
+#define STABILIZER_Z_REF_RANGE_M       0.25f     /* CH3 回中油门/升降参考范围 ±0.25m   */
+#define STABILIZER_RC_DEADBAND_US      20        /* RC 摇杆死区 [μs]，中位 1500±20      */
+
+/*
+ * ============================================================================
+ * ELRS / CRSF 遥控器通道约定
+ * ============================================================================
+ * 这个表就是本机遥控器映射的唯一维护入口，后续不要再靠口头记忆：
+ *
+ *   CH1 → 左右 / roll stick      → 自稳定速度意图 / 控制器 y_ref，右为正，回中 0
+ *   CH2 → 前后 / pitch stick     → 自稳定速度意图 / 控制器 x_ref，前为正，回中 0
+ *   CH3 → 左摇杆上下，回中油门   → 控制器 z_ref，向上为正，回中 0
+ *   CH4 → 偏航 / yaw stick       → 控制器 yaw_ref，右偏航为正，回中 0
+ *   CH5 → 二值开关 / arm switch  → +100=开锁，-100=关锁
+ *
+ * CRSF 驱动输出的是 16 路 us 值，数组下标从 0 开始，所以 CH1 对应 ch[0]。
+ * CH5 用阈值判断：>1500us 视为开锁，<=1500us 视为上锁。
+ * 由于 CH3 是回中油门，不使用“油门最低才能开锁”的传统单向油门规则。
+ */
+#define STABILIZER_RC_CH_ROLL          0U
+#define STABILIZER_RC_CH_PITCH         1U
+#define STABILIZER_RC_CH_THROTTLE_Z    2U
+#define STABILIZER_RC_CH_YAW           3U
+#define STABILIZER_RC_CH_ARM           4U
+#define STABILIZER_RC_ARM_THRESHOLD_US 1500U
+#define STABILIZER_USE_RC_DIRECT_TILT_SERVO 0U   /* 0=自稳定控制器, 1=CH1/CH2 直控舵机调试 */
+#define STABILIZER_RC_DIRECT_TILT_LIMIT_RAD 0.261799395f /* 遥控直控调试最大 ±15° */
+
+/*
+ * ============================================================================
+ * 舵机通信常量
+ * ============================================================================
+ * 舵机通过 UART7 半双工总线控制，每次移动命令指定目标脉宽和到位时间。
+ * 为避免总线拥塞，只有脉宽变化超过阈值或超过强制刷新间隔才发送。
+ */
+#define STABILIZER_SERVO_MOVE_TIME_MS  0U        /* 舵机到位时间 [ms]，0 表示尽快到位     */
+#define STABILIZER_SERVO_REFRESH_MS    500U      /* 强制刷新间隔 [ms]（即使脉宽未变）    */
+#define STABILIZER_SERVO_DELTA_US      3U        /* 脉宽变化死区 [μs]（小于此值不发送）  */
+#define VOFA_SEND_PERIOD_MS            200U      /* VOFA 诊断输出周期，降低 WiFi/UART 负载 */
 
 /* USER CODE END PD */
 
@@ -59,9 +228,220 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
+/*
+ * ============================================================================
+ * 全局同步对象
+ * ============================================================================
+ * imuDataReadySemaphore — IMU 数据就绪信号量
+ *   生产者：Sensor_Task（每次 IMU 采样完成后 release）
+ *   消费者：StabilizerTask（acquire 后开始消费 SensorSampleQueue）
+ *   初始值 0，最大值 1（二进制信号量，只做事件通知不做计数）
+ *
+ * vofaStreamActive — VOFA 数据流开关
+ *   由上位机通过消息系统远程控制，置 0 时暂停 VOFA 发送
+ */
 osSemaphoreId_t imuDataReadySemaphore;
 volatile uint8_t vofaStreamActive = 1U;
+
+typedef enum
+{
+  STABILIZER_IMU_FAULT_NONE = 0U,
+  STABILIZER_IMU_FAULT_DRDY_TIMEOUT = 1U,
+  STABILIZER_IMU_FAULT_READ_FAIL = 2U,
+} StabilizerImuFaultReason;
+
+static volatile uint8_t stabilizer_imu_fault_latched = 0U;
+static volatile StabilizerImuFaultReason stabilizer_imu_fault_reason =
+  STABILIZER_IMU_FAULT_NONE;
+static volatile uint32_t stabilizer_imu_fault_count = 0U;
+static volatile uint32_t stabilizer_imu_last_sample_ms = 0U;
+
+static void stabilizer_latch_imu_fault(StabilizerImuFaultReason reason)
+{
+  if (stabilizer_imu_fault_latched == 0U) {
+    stabilizer_imu_fault_reason = reason;
+  }
+  stabilizer_imu_fault_latched = 1U;
+  stabilizer_imu_fault_count++;
+}
+
+static void stabilizer_clear_imu_fault(void)
+{
+  stabilizer_imu_fault_latched = 0U;
+  stabilizer_imu_fault_reason = STABILIZER_IMU_FAULT_NONE;
+}
+
+/*
+ * ============================================================================
+ * 稳定器辅助函数
+ * ============================================================================
+ * 以下 3 个 static 函数仅供 StabilizerTask 内部使用，不暴露到头文件。
+ */
+
+/*
+ * stabilizer_rc_normalized() — RC 通道值归一化到 [-1, +1]
+ *   输入：RC 脉宽 [μs]，典型范围 1000~2000，中位 1500
+ *   处理：减去中位 1500 → 死区过滤 → 限幅 ±500 → 除以 500
+ *   仅在 USE_DIRECT_ANGLE_SERVO=0（同轴控制器模式）时编译
+ */
+#if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
+static float stabilizer_rc_normalized(uint16_t ch_us)
+{
+  int32_t centered = (int32_t)ch_us - 1500;
+
+  if ((centered > -STABILIZER_RC_DEADBAND_US) &&
+      (centered < STABILIZER_RC_DEADBAND_US)) {
+    return 0.0f;
+  }
+  if (centered > 500) { centered = 500; }
+  if (centered < -500) { centered = -500; }
+
+  return (float)centered / 500.0f;
+}
+
+static uint8_t stabilizer_rc_is_armed(const uint16_t ch[CRSF_CHANNEL_COUNT])
+{
+  return (ch[STABILIZER_RC_CH_ARM] > STABILIZER_RC_ARM_THRESHOLD_US) ? 1U : 0U;
+}
+
+#if (STABILIZER_USE_RC_DIRECT_TILT_SERVO != 0U)
+static void stabilizer_map_rc_direct_to_servo(const uint16_t ch[CRSF_CHANNEL_COUNT],
+                                              DRV_SERVO_MoveCmd moves[2])
+{
+  float alpha_rad = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_PITCH]) *
+                    STABILIZER_RC_DIRECT_TILT_LIMIT_RAD *
+                    STABILIZER_DIRECT_ALPHA_SIGN;
+  float beta_rad = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_ROLL]) *
+                   STABILIZER_RC_DIRECT_TILT_LIMIT_RAD *
+                   STABILIZER_DIRECT_BETA_SIGN;
+
+  moves[0].pulse_us = DRV_COAX_CTRL_TiltRadToServoPulse(alpha_rad);
+  moves[1].pulse_us = DRV_COAX_CTRL_TiltRadToServoPulse(beta_rad);
+}
+#endif
+#endif
+
+/*
+ * stabilizer_map_angle_direct_to_servo() — 角度直驱模式：姿态角 → 舵机脉宽
+ *   pitch → alpha(α) → 舵机1 (id=1)
+ *   roll  → beta(β)  → 舵机2 (id=2)
+ *   方向符号由 STABILIZER_DIRECT_ALPHA_SIGN / BETA_SIGN 控制（安装方向补偿）
+ */
+#if (STABILIZER_USE_DIRECT_ANGLE_SERVO != 0U)
+static void stabilizer_map_angle_direct_to_servo(float roll_deg,
+                                                 float pitch_deg,
+                                                 DRV_SERVO_MoveCmd moves[2])
+{
+  float direct_alpha_rad = pitch_deg * STABILIZER_DEG_TO_RAD *
+                           STABILIZER_DIRECT_ALPHA_SIGN;
+  float direct_beta_rad = roll_deg * STABILIZER_DEG_TO_RAD *
+                          STABILIZER_DIRECT_BETA_SIGN;
+
+  moves[0].pulse_us = DRV_COAX_CTRL_TiltRadToServoPulse(direct_alpha_rad);
+  moves[1].pulse_us = DRV_COAX_CTRL_TiltRadToServoPulse(direct_beta_rad);
+}
+#endif
+
+/*
+ * stabilizer_servo_should_send() — 判断是否需要向舵机发送新指令
+ *   返回非零的条件（满足任一即发送）：
+ *     1. 任一舵机目标脉宽与上次发送值相差 ≥ SERVO_DELTA_US (3μs)
+ *     2. 距离上次发送超过 SERVO_REFRESH_MS (500ms) 强制刷新
+ *   目的：避免在脉宽几乎不变时反复占用舵机总线
+ */
+static volatile uint16_t stabilizer_latest_servo_target_us[2] = {
+  DRV_COAX_CTRL_SERVO_CENTER_US,
+  DRV_COAX_CTRL_SERVO_CENTER_US,
+};
+static volatile uint16_t stabilizer_last_sent_servo_pulse_us[2] = {
+  DRV_COAX_CTRL_SERVO_CENTER_US,
+  DRV_COAX_CTRL_SERVO_CENTER_US,
+};
+static uint32_t stabilizer_last_servo_send_ms;
+
+static uint8_t stabilizer_servo_should_send(const DRV_SERVO_MoveCmd moves[2],
+                                            uint32_t now_ms)
+{
+  uint8_t should_send = 0U;
+
+  for (uint32_t i = 0U; i < 2U; ++i) {
+    uint16_t previous = stabilizer_last_sent_servo_pulse_us[i];
+    uint16_t current = moves[i].pulse_us;
+    uint16_t delta = (current >= previous) ? (uint16_t)(current - previous)
+                                           : (uint16_t)(previous - current);
+
+    if (delta >= STABILIZER_SERVO_DELTA_US) {
+      should_send = 1U;
+    }
+  }
+
+  if ((now_ms - stabilizer_last_servo_send_ms) >= STABILIZER_SERVO_REFRESH_MS) {
+    should_send = 1U;
+  }
+
+  return should_send;
+}
+
+static void stabilizer_servo_commit_sent(const DRV_SERVO_MoveCmd moves[2],
+                                         uint32_t now_ms)
+{
+  stabilizer_last_sent_servo_pulse_us[0] = moves[0].pulse_us;
+  stabilizer_last_sent_servo_pulse_us[1] = moves[1].pulse_us;
+  stabilizer_last_servo_send_ms = now_ms;
+}
+
+static void stabilizer_servo_record_target(const DRV_SERVO_MoveCmd moves[2])
+{
+  stabilizer_latest_servo_target_us[0] = moves[0].pulse_us;
+  stabilizer_latest_servo_target_us[1] = moves[1].pulse_us;
+}
 /* USER CODE END Variables */
+/*
+ * ============================================================================
+ * RTOS 内核对象一览
+ * ============================================================================
+ *
+ * ┌──────────────────────────────────────────────────────────────────┐
+ * │                         任务拓扑 (6 线程)                         │
+ * ├──────────────┬──────────┬──────────┬──────────────┬──────────────┤
+ * │ 任务名        │ 优先级    │ 栈深度    │ 周期/触发     │ 职责          │
+ * ├──────────────┼──────────┼──────────┼──────────────┼──────────────┤
+ * │ SensorTask   │ Normal   │ 512×4   │ 1kHz 中断驱动 │ IMU 采集+前处理│
+ * │ Stabilizer   │ Normal   │ 512×4   │ 信号量触发     │ 姿态融合+控制 │
+ * │ UARTTask     │ Normal   │ 1024×4  │ 事件驱动       │ UART 收发调度  │
+ * │ messageTask  │ BelowNormal│1024×4│ 事件驱动       │ 消息协议处理   │
+ * │ backgroundTask│BelowNormal│1024×4│ 事件驱动       │ FLASH 参数读写  │
+ * │ VOFA_Task    │ Low      │ 512×4   │ 50Hz 定时      │ 上位机数据发送 │
+ * └──────────────┴──────────┴──────────┴──────────────┴──────────────┘
+ *
+ * ┌──────────────────────────────────────────────────────────────────┐
+ * │                       消息队列 (5 队列)                           │
+ * ├────────────────────┬──────────┬──────────────────────────────────┤
+ * │ 队列名              │ 深度      │ 用途                              │
+ * ├────────────────────┼──────────┼──────────────────────────────────┤
+ * │ SensorSampleQueue  │ 8        │ SensorTask → Stabilizer          │
+ * │ vofaLogQueue       │ 1 (覆盖) │ Stabilizer → VOFA_Task           │
+ * │ uartTxQueue        │ 32       │ 各任务 → UARTTask (发送缓冲)      │
+ * │ backgroundReqQueue │ 8        │ 任意任务 → BackgroundTask (请求)  │
+ * │ backgroundRespQueue│ 8        │ BackgroundTask → 请求者 (响应)    │
+ * └────────────────────┴──────────┴──────────────────────────────────┘
+ *
+ * ┌──────────────────────────────────────────────────────────────────┐
+ * │                     互斥锁 (1 个)                                  │
+ * ├────────────────────┬──────────────────────────────────────────────┤
+ * │ flashBusMutex      │ 保护 FLASH 读写操作（递归锁，允许同一任务重入）│
+ * └────────────────────┴──────────────────────────────────────────────┘
+ *
+ * 关键数据流（按数据传递顺序）：
+ *   硬件 IRQ ──→ Sensor_Task ──→ SensorSampleQueue ──→ StabilizerTask
+ *                                                          │
+ *                                                    vofaLogQueue (50Hz)
+ *                                                          │
+ *                                                       VOFA_task
+ *                                                          │
+ *                                                    WiFi → 上位机
+ */
+
 /* Definitions for Stabilizer */
 osThreadId_t StabilizerHandle;
 const osThreadAttr_t Stabilizer_attributes = {
@@ -156,11 +536,22 @@ void vApplicationStackOverflowHook(xTaskHandle xTask, char *pcTaskName);
 void vApplicationMallocFailedHook(void);
 
 /* USER CODE BEGIN 4 */
+/*
+ * vApplicationStackOverflowHook — 任务栈溢出钩子
+ *
+ * 触发条件：configCHECK_FOR_STACK_OVERFLOW 设置为 1 或 2 时，
+ * FreeRTOS 在每个任务切换时检查栈指针是否越界。
+ *
+ * 处理策略：
+ *   1. 记录栈溢出事件到诊断系统（APP_Diag_RecordStackOverflow）
+ *   2. 关全局中断（taskDISABLE_INTERRUPTS）
+ *   3. 死循环——栈溢出是不可恢复的错误，继续运行会导致内存损坏
+ *
+ * 排查方法：如果某个任务反复触发此钩子，增大该任务的 .stack_size，
+ * 或检查函数内的局部变量是否过大（大数组应改为 static）。
+ */
 void vApplicationStackOverflowHook(xTaskHandle xTask, char *pcTaskName)
 {
-   /* Run time stack overflow checking is performed if
-   configCHECK_FOR_STACK_OVERFLOW is defined to 1 or 2. This hook function is
-   called if a stack overflow is detected. */
    (void)xTask;
    APP_Diag_RecordStackOverflow(pcTaskName);
    taskDISABLE_INTERRUPTS();
@@ -171,18 +562,23 @@ void vApplicationStackOverflowHook(xTaskHandle xTask, char *pcTaskName)
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN 5 */
+/*
+ * vApplicationMallocFailedHook — 动态内存分配失败钩子
+ *
+ * 触发条件：configUSE_MALLOC_FAILED_HOOK = 1 时，
+ * pvPortMalloc() 返回 NULL（堆内存耗尽）时调用。
+ *
+ * FreeRTOS 内部在创建任务/队列/信号量/定时器时都会调用 pvPortMalloc()。
+ * 堆大小由 FreeRTOSConfig.h 中的 configTOTAL_HEAP_SIZE 定义。
+ *
+ * 处理策略：与栈溢出相同——记录诊断信息后死循环。
+ *
+ * 排查方法：检查 configTOTAL_HEAP_SIZE 是否足够；
+ * 检查是否有内存泄漏（创建对象后未删除）；
+ * 使用 xPortGetFreeHeapSize() 监控剩余堆空间。
+ */
 void vApplicationMallocFailedHook(void)
 {
-   /* vApplicationMallocFailedHook() will only be called if
-   configUSE_MALLOC_FAILED_HOOK is set to 1 in FreeRTOSConfig.h. It is a hook
-   function that will get called if a call to pvPortMalloc() fails.
-   pvPortMalloc() is called internally by the kernel whenever a task, queue,
-   timer or semaphore is created. It is also called by various parts of the
-   demo application. If heap_1.c or heap_2.c are used, then the size of the
-   heap available to pvPortMalloc() is defined by configTOTAL_HEAP_SIZE in
-   FreeRTOSConfig.h, and the xPortGetFreeHeapSize() API function can be used
-   to query the size of free heap space that remains (although it does not
-   provide information on how the remaining heap might be fragmented). */
    APP_Diag_RecordMallocFailed();
    taskDISABLE_INTERRUPTS();
    for(;;)
@@ -192,9 +588,19 @@ void vApplicationMallocFailedHook(void)
 /* USER CODE END 5 */
 
 /**
-  * @brief  FreeRTOS initialization
+  * @brief  FreeRTOS 初始化 —— 创建所有内核对象并启动调度器
   * @param  None
   * @retval None
+  *
+  * 初始化顺序（按依赖关系排列，不可随意调换）：
+  *   1. 互斥锁    — flashBusMutex（FLASH 读写保护，递归锁）
+  *   2. 信号量    — imuDataReadySemaphore（IMU 数据就绪通知）
+  *   3. 消息队列  — 5 个队列（详见上方拓扑图）
+  *   4. 线程      — 6 个任务（按优先级：Normal → BelowNormal → Low）
+  *
+  * 注意：
+  *   - CubeMX 重新生成代码时会覆盖此函数中 USER CODE BEGIN/END 之外的部分
+  *   - 队列/线程的属性定义在文件上方，方便 CubeMX 识别和修改
   */
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
@@ -210,6 +616,7 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* 创建 IMU 数据就绪信号量：初始 0，最大 1，二进制事件通知 */
   imuDataReadySemaphore = osSemaphoreNew(1U, 0U, NULL);
   /* USER CODE END RTOS_SEMAPHORES */
 
@@ -268,9 +675,28 @@ void MX_FREERTOS_Init(void) {
 
 /* USER CODE BEGIN Header_StabilizerTask */
 /**
-  * @brief  Function implementing the Stabilizer thread.
+  * @brief  StabilizerTask —— 姿态融合 + 控制输出（核心控制线程）
   * @param  argument: Not used
   * @retval None
+  *
+  * 这是整个飞控的核心任务，负责：
+  *   1. 等待 IMU 数据就绪（通过 imuDataReadySemaphore 信号量）
+  *   2. 从 SensorSampleQueue 消费传感器数据
+  *   3. 互补滤波姿态解算 → roll / pitch / yaw（调用 APP_IMU_UpdateAttitude）
+  *   4. 将融合后的姿态写入 vofaLogQueue（VOFA_task 在上位机显示）
+  *   5. 按 25Hz 控制周期输出舵机指令
+  *
+  * 数据流：
+  *   Sensor_Task → SensorSampleQueue → 这里
+  *     ① 互补滤波算出 roll/pitch/yaw
+  *     ② 写入 vofaLogQueue（VOFA_task 50Hz 发送到上位机）
+  *     ③ 舵机控制输出（25Hz）
+  *
+  * 舵机控制有两种模式（编译期切换）：
+  *   模式 A (USE_DIRECT_ANGLE_SERVO=1)：姿态角直接映射为舵机脉宽
+  *   模式 B (USE_DIRECT_ANGLE_SERVO=0)：经过 Simulink 生成的同轴控制器
+  *
+  * 注意：电调当前固定输出最小油门（BSP_PWM_ESC_MIN_US），处于安全锁定状态。
   */
 /* USER CODE END Header_StabilizerTask */
 void StabilizerTask(void *argument)
@@ -279,114 +705,182 @@ void StabilizerTask(void *argument)
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN StabilizerTask */
 
-  /*
-   * Stabilizer 任务：姿态融合 + 控制输出。
-   *
-   * 数据流：
-   *   Sensor_Task → SensorSampleQueue → 这里
-   *     ① 互补滤波算出 roll/pitch/yaw
-   *     ② 写入 vofaLogQueue（VOFA_task 50Hz 发送到上位机）
-   *     ③ TODO: 控制输出
-   */
-
-  APP_Sensor_SampleMessage msg;
-  float  roll  = 0.0f;
-  float  pitch = 0.0f;
-  float  yaw   = 0.0f;
-  uint32_t last_tick_ms = 0U;
-  uint32_t stabilizer_seq = 0U;
+  APP_Sensor_SampleMessage msg;        /* 传感器消息（从队列中取出）            */
+  float  roll  = 0.0f;                /* 当前横滚角 [度]                       */
+  float  pitch = 0.0f;                /* 当前俯仰角 [度]                       */
+  float  yaw   = 0.0f;                /* 当前偏航角 [度]                       */
+#if (STABILIZER_USE_FIXED_IMU_DT == 0U)
+  uint64_t last_imu_timestamp_us = 0ULL; /* 上一帧 IMU 时间戳（用于计算 dt）   */
+#endif
+  uint32_t stabilizer_seq = 0U;       /* 姿态解算帧序号                         */
+  uint32_t last_out_ms = 0U;          /* 上次控制输出时刻 [ms]                  */
+  uint8_t has_imu_sample = 0U;        /* 是否已收到至少一帧 IMU 数据            */
 
   for(;;)
   {
-    if (osSemaphoreAcquire(imuDataReadySemaphore, osWaitForever) == osOK) {
-      if (osMessageQueueGet(SensorSampleQueueHandle, &msg, 0U, 0U) == osOK) {
-        stabilizer_seq++;
+    /*
+     * 步骤 0：阻塞等待 IMU 数据就绪信号量
+     * Sensor_Task 在每次 IMU 采样完成后 release 此信号量。
+     * 超时 1ms——正常情况下信号量在中断后立即到来。
+     */
+    (void)osSemaphoreAcquire(imuDataReadySemaphore, 1U);
 
-        /* 0.5 ELRS 遥控数据更新 */
-        APP_ELRS_Step();
+    /* 步骤 0.5：ELRS 遥控器链路状态机步进（非阻塞，每次 IMU 采样后执行） */
+    APP_ELRS_Step();
 
-        /* ① 互补滤波（加速度 + 陀螺仪融合） */
-        APP_IMU_UpdateAttitude(&msg.imu, &roll, &pitch, &yaw,
-                               &last_tick_ms, stabilizer_seq);
+    /*
+     * 步骤 1：消费 SensorSampleQueue 中的所有待处理数据
+     * 使用 while 循环 + 零超时（0U）一次性清空队列，只保留最新一帧。
+     * 如果消费者慢于生产者（1kHz IMU），队列深度 8 提供缓冲。
+     */
+    while (osMessageQueueGet(SensorSampleQueueHandle, &msg, 0U, 0U) == osOK) {
+      float dt_sec = SENSOR_IMU_DEFAULT_DT_SEC;
 
-        /* ② 写入 VOFA 日志队列（带姿态，覆盖模式） */
-        msg.roll_deg  = roll;
-        msg.pitch_deg = pitch;
-        msg.yaw_deg   = yaw;
+      stabilizer_seq++;
+#if (STABILIZER_USE_FIXED_IMU_DT == 0U)
+      if (last_imu_timestamp_us != 0ULL) {
+        uint64_t dt_us = msg.base.timestamp_us - last_imu_timestamp_us;
+        dt_sec = (float)dt_us * 0.000001f;   /* 微秒 → 秒                  */
+      }
+      last_imu_timestamp_us = msg.base.timestamp_us;
+#endif
 
-        if (osMessageQueuePut(vofaLogQueueHandle, &msg, 0U, 0U) != osOK) {
-          APP_Sensor_SampleMessage drop;
-          (void)osMessageQueueGet(vofaLogQueueHandle, &drop, 0U, 0U);
-          (void)osMessageQueuePut(vofaLogQueueHandle, &msg, 0U, 0U);
+      /*
+       * ① 互补滤波姿态解算
+       * 调用 APP_IMU_UpdateAttitude()，融合加速度计（低频）和陀螺仪（高频）数据。
+       * 输入：msg.imu（加速度 + 陀螺仪原始值）、dt_sec、帧序号
+       * 输出：roll / pitch / yaw（全局变量，被舵机输出阶段使用）
+       */
+      APP_IMU_UpdateAttitude(&msg.imu, &roll, &pitch, &yaw,
+                             dt_sec, stabilizer_seq);
+      has_imu_sample = 1U;
+
+      /*
+       * ② 写入 VOFA 日志队列（覆盖模式）
+       * vofaLogQueue 深度为 1，如果队列满则丢弃旧数据再写入新数据。
+       * VOFA_task 以 50Hz 频率从此队列读取并发送到上位机。
+       */
+      msg.roll_deg  = roll;
+      msg.pitch_deg = pitch;
+      msg.yaw_deg   = yaw;
+
+      if (osMessageQueuePut(vofaLogQueueHandle, &msg, 0U, 0U) != osOK) {
+        APP_Sensor_SampleMessage drop;
+        (void)osMessageQueueGet(vofaLogQueueHandle, &drop, 0U, 0U);
+        (void)osMessageQueuePut(vofaLogQueueHandle, &msg, 0U, 0U);
+      }
+    }
+
+    /*
+     * 步骤 2：按固定周期（50Hz）输出舵机控制
+     * 控制输出与姿态解算解耦——不管 IMU 来多快，舵机始终 50Hz 更新。
+     */
+    {
+      uint32_t now = HAL_GetTick();
+
+      if ((now - last_out_ms) >= STABILIZER_CONTROL_PERIOD_MS) {
+#if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
+        uint16_t ch[16];
+#if (STABILIZER_USE_RC_DIRECT_TILT_SERVO == 0U)
+        DRV_COAX_CTRL_AttitudeInput attitude;
+        DRV_COAX_CTRL_Reference reference;
+#endif
+        DRV_COAX_CTRL_Output ctrl_out;
+        uint8_t rc_armed = 0U;
+#endif
+        DRV_SERVO_MoveCmd moves[2];     /* [0]=舵机1(α/pitch), [1]=舵机2(β/roll) */
+        uint8_t imu_control_valid = 0U;
+
+        last_out_ms = now;
+
+#if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
+        APP_ELRS_GetChannels(ch);       /* 读取 ELRS 遥控器 16 通道             */
+        rc_armed = stabilizer_rc_is_armed(ch);
+#endif
+        BSP_AiWB2_UpdateButton();       /* 更新 WiFi 模块按键状态                */
+
+        /* 默认保持上一条有效舵机目标；短暂 IMU 异常不能直接回中。 */
+        moves[0].id = 1U;
+        moves[1].id = 2U;
+        moves[0].pulse_us = stabilizer_latest_servo_target_us[0];
+        moves[1].pulse_us = stabilizer_latest_servo_target_us[1];
+
+        if ((has_imu_sample != 0U) &&
+            ((now - stabilizer_imu_last_sample_ms) <= STABILIZER_IMU_STALE_MS)) {
+          imu_control_valid = 1U;
         }
 
-        /* ③ RC 控制输出：CH1→舵机1, CH2→舵机2, CH3→油门, CH4→偏航, CH5→解锁 */
+        if (imu_control_valid != 0U) {
+#if (STABILIZER_USE_DIRECT_ANGLE_SERVO != 0U)
+          /*
+           * 模式 A：角度直驱
+           *   pitch → alpha → 舵机1
+           *   roll  → beta  → 舵机2
+           */
+          stabilizer_map_angle_direct_to_servo(roll, pitch, moves);
+#else
+          /*
+           * 模式 B：同轴控制器（Simulink 代码生成）
+           *   输入：姿态角 + 角速度（全部转为弧度）+ RC 参考（归一化）
+           *   输出：两个舵机脉宽（servo_alpha_us / servo_beta_us）
+           */
+#if (STABILIZER_USE_RC_DIRECT_TILT_SERVO != 0U)
+          /*
+           * 当前台架遥控调试模式：
+           *   CH2 前后直接控制 alpha 舵机，CH1 左右直接控制 beta 舵机。
+           *   这样先验证遥控通道和机械方向，不受未接位置/速度估计的控制器影响。
+           */
+          stabilizer_map_rc_direct_to_servo(ch, moves);
+          ctrl_out.omega_upper = 0.0f;
+          ctrl_out.omega_lower = 0.0f;
+#else
+          attitude.roll_rad = roll * STABILIZER_DEG_TO_RAD;
+          attitude.pitch_rad = pitch * STABILIZER_DEG_TO_RAD;
+          attitude.yaw_rad = yaw * STABILIZER_DEG_TO_RAD;
+          attitude.gyro_x_rad_s = msg.imu.gyro_x_dps * STABILIZER_DEG_TO_RAD;
+          attitude.gyro_y_rad_s = msg.imu.gyro_y_dps * STABILIZER_DEG_TO_RAD;
+          attitude.gyro_z_rad_s = msg.imu.gyro_z_dps * STABILIZER_DEG_TO_RAD;
+
+          reference.x_m = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_PITCH]) *
+                          STABILIZER_XY_REF_RANGE_M;
+          reference.y_m = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_ROLL]) *
+                          STABILIZER_XY_REF_RANGE_M;
+          reference.z_m = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_THROTTLE_Z]) *
+                          STABILIZER_Z_REF_RANGE_M;
+          reference.yaw_rad = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_YAW]) *
+                              STABILIZER_YAW_REF_LIMIT_RAD;
+
+          DRV_COAX_CTRL_Run(&attitude, &reference, &ctrl_out);
+
+          moves[0].pulse_us = ctrl_out.servo_alpha_us;
+          moves[1].pulse_us = ctrl_out.servo_beta_us;
+#endif
+#endif
+        } else if (has_imu_sample == 0U) {
+          /* 上电尚无有效姿态时才使用中位；运行中 IMU 异常保持上一目标。 */
+          moves[0].pulse_us = DRV_COAX_CTRL_SERVO_CENTER_US;
+          moves[1].pulse_us = DRV_COAX_CTRL_SERVO_CENTER_US;
+        }
+
+        stabilizer_servo_record_target(moves);
+
+        /* 有变化才发（带 500ms 强制刷新），避免占用舵机总线 */
+        if (stabilizer_servo_should_send(moves, now) != 0U) {
+          if (BSP_BusServo_MoveManyAsync(moves, 2U,
+                                         STABILIZER_SERVO_MOVE_TIME_MS) == DRV_SERVO_OK) {
+            stabilizer_servo_commit_sent(moves, now);
+          }
+        }
+
+#if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
+        if ((rc_armed != 0U) && (imu_control_valid != 0U)) {
+          BSP_PWM_SetEscPulse(1, DRV_COAX_CTRL_OmegaToMotorPulse(ctrl_out.omega_upper));
+          BSP_PWM_SetEscPulse(2, DRV_COAX_CTRL_OmegaToMotorPulse(ctrl_out.omega_lower));
+        } else
+#endif
         {
-            static uint32_t last_out_ms = 0U;
-            static uint8_t  armed = 0U;
-            uint32_t now = HAL_GetTick();
-
-            if ((now - last_out_ms) >= 20U) {
-                last_out_ms = now;
-
-                uint16_t ch[16];
-                APP_ELRS_GetChannels(ch);
-
-                uint16_t s1_us = ch[0];  /* CH1 → 舵机1 */
-                uint16_t s2_us = ch[1];  /* CH2 → 舵机2 */
-                uint8_t  arm_sw = (ch[4] > 1500U) ? 1U : 0U;  /* CH5 解锁开关 */
-
-                /* 解锁状态机：必须油门归零后才能解锁 */
-                if (arm_sw && !armed && ch[2] < 1050U) {
-                    armed = 1U;  /* 油门已归零 → 正式解锁 */
-                } else if (!arm_sw) {
-                    armed = 0U;  /* 关锁 */
-                }
-                /* arm_sw && !armed && ch[2] >= 1050: 油门未归零，拒绝解锁 */
-
-                /* ---- 舵机 ---- */
-                if (s1_us < DRV_SERVO_MIN_PULSE_US) s1_us = DRV_SERVO_MIN_PULSE_US;
-                if (s1_us > DRV_SERVO_MAX_PULSE_US) s1_us = DRV_SERVO_MAX_PULSE_US;
-                if (s2_us < DRV_SERVO_MIN_PULSE_US) s2_us = DRV_SERVO_MIN_PULSE_US;
-                if (s2_us > DRV_SERVO_MAX_PULSE_US) s2_us = DRV_SERVO_MAX_PULSE_US;
-
-                DRV_SERVO_MoveCmd moves[2];
-                moves[0].id = 1U;  moves[0].pulse_us = s1_us;
-                moves[1].id = 2U;  moves[1].pulse_us = s2_us;
-                BSP_BusServo_MoveMany(moves, 2U, 0U);
-
-                /* ---- 共轴双桨电机 ---- */
-                if (armed) {
-                    float thr_pct = 0.0f;
-                    if (ch[2] > 1000U) {
-                        thr_pct = (float)(ch[2] - 1000U) * 0.1f;
-                        if (thr_pct > 100.0f) thr_pct = 100.0f;
-                    }
-
-                    /* CH4: 1500=中立, ±500 → ±30% 差速 */
-                    float yaw_diff = (float)((int32_t)ch[3] - 1500) * 0.06f;
-                    if (yaw_diff > 30.0f)  yaw_diff = 30.0f;
-                    if (yaw_diff < -30.0f) yaw_diff = -30.0f;
-
-                    float m1 = thr_pct + yaw_diff;
-                    float m2 = thr_pct - yaw_diff;
-                    if (m1 < 0.0f) m1 = 0.0f; else if (m1 > 100.0f) m1 = 100.0f;
-                    if (m2 < 0.0f) m2 = 0.0f; else if (m2 > 100.0f) m2 = 100.0f;
-
-                    uint16_t pwm1 = motor_hammerstein_interp_thrust_to_pwm(
-                        motor_hammerstein_interp_f32(motor_hammerstein_pct,
-                            motor_hammerstein_thrust_g, MOTOR_HAMMERSTEIN_POINTS, m1));
-                    uint16_t pwm2 = motor_hammerstein_interp_thrust_to_pwm(
-                        motor_hammerstein_interp_f32(motor_hammerstein_pct,
-                            motor_hammerstein_thrust_g, MOTOR_HAMMERSTEIN_POINTS, m2));
-
-                    BSP_PWM_SetEscPulse(1, pwm1);  /* PA0: 上桨 */
-                    BSP_PWM_SetEscPulse(2, pwm2);  /* PA1: 下桨 */
-                } else {
-                    BSP_PWM_SetEscPulse(1, BSP_PWM_ESC_MIN_US);
-                    BSP_PWM_SetEscPulse(2, BSP_PWM_ESC_MIN_US);
-                }
-            }
+          BSP_PWM_SetEscPulse(1, BSP_PWM_ESC_MIN_US);
+          BSP_PWM_SetEscPulse(2, BSP_PWM_ESC_MIN_US);
         }
       }
     }
@@ -396,18 +890,39 @@ void StabilizerTask(void *argument)
 
 /* USER CODE BEGIN Header_Sensor_Task */
 /**
-* @brief Function implementing the SensorTask thread.
-* @param argument: Not used
-* @retval None
-*/
+  * @brief  Sensor_Task —— IMU 传感器采集与数据预处理（1kHz，中断驱动）
+  * @param  argument: Not used
+  * @retval None
+  *
+  * 这是整个飞控的数据源头，负责：
+  *   1. 初始化 IMU（ICM-42688-P）、气压计（SPL06-007）、磁力计（QMC5883L）
+  *   2. 等待 PC0 外部中断通知（IMU 数据就绪），超时后轮询兜底
+  *   3. 读取 IMU 原始寄存器值 → 转换为物理单位（dps / g）
+  *   4. 陀螺仪零偏校准（前 1000 个样本自动均值，要求静止）
+  *   5. 坐标系对齐（ICM 芯片坐标系 → 机体 NED 坐标系）
+  *   6. 低通滤波（陀螺 80Hz、加速度 30Hz，IIR 一阶）
+  *   7. 气压计降采样读取（1kHz 中每 32 次读一次 ≈ 32Hz）
+  *   8. 组装 SensorSampleMessage → 推入 SensorSampleQueue
+  *   9. Release imuDataReadySemaphore 通知 StabilizerTask 消费
+  *
+  * 运行时序：
+  *   硬件 IRQ ──→ Thread Flag ──→ 本任务唤醒 ──→ SPI 读取 ──→ 处理流水线
+  *   ──→ 推送队列 ──→ Release 信号量 ──→ 再次阻塞等待 Thread Flag
+  *
+  * 涉及的硬件接口：
+  *   SPI1 → ICM-42688-P (IMU, 加速度 + 陀螺仪)
+  *   I2C1 → SPL06-007   (气压计)
+  *   I2C1 → QMC5883L    (磁力计)
+  *   PC0  → EXTI 中断   (IMU INT1 数据就绪引脚)
+  */
 /* USER CODE END Header_Sensor_Task */
 void Sensor_Task(void *argument)
 {
   /* USER CODE BEGIN Sensor_Task */
-  BSP_IMU_Invalidate();
+  BSP_IMU_Invalidate();                  /* 复位 IMU 驱动内部状态              */
 
   /* APP_Task_GPS_Init();  暂时停止 GPS */
-  APP_Task_MAG_Init();
+  APP_Task_MAG_Init();                   /* 初始化磁力计 QMC5883L              */
 
   /* ---- 初始化 IMU（重试直到成功） ---- */
   while (BSP_IMU_Init() != DRV_IMU_OK) {
@@ -415,18 +930,30 @@ void Sensor_Task(void *argument)
   }
   BSP_BARO_Init();   /* 气压计初始化，失败时在读数据时重试 */
 
-  DRV_IMU_RawData    raw;
-  DRV_IMU_ScaledData scaled;
-  uint32_t sample_count = 0U;
-  uint32_t baro_cnt     = 0U;
-  float    baro_pa      = 0.0f;   /* 保持旧值直到下次气压计更新 */
-  float    baro_temp    = 0.0f;
+  DRV_IMU_RawData    raw;               /* IMU 原始 ADC 值（寄存器原始读数）    */
+  DRV_IMU_ScaledData scaled;            /* IMU 物理单位值（dps / g）            */
+  uint32_t sample_count = 0U;           /* 总采样帧计数（溢出回绕是安全的）     */
+  uint32_t baro_cnt     = 0U;           /* 气压计降采样计数器（32 分频）        */
+  uint64_t last_mag_step_us = 0ULL;     /* 磁力计上次步进时间 [μs]              */
+  float    baro_pa      = 0.0f;         /* 当前气压值 [Pa]，保持旧值直到更新    */
+  float    baro_temp    = 0.0f;         /* 当前气压计温度 [°C]                  */
 
   /* 陀螺仪零偏校准状态 */
   APP_Sensor_GyroBias gyro_bias = {0};
+  APP_Sensor_RateMeter imu_rate_meter = {0}; /* IMU 实际采样率统计              */
 
-  /* 低通滤波器：陀螺 80Hz，加速度 30Hz (dt = 0.001s @ 1kHz) */
+  /*
+   * 低通滤波器：陀螺 80Hz，加速度 30Hz
+   * dt = 0.001s（@ 1kHz 采样率）
+   * 陀螺 80Hz 截止频率的选择依据：共轴飞行器机械振动主要在 50~100Hz，
+   * 需要在保留有效角速度信号的同时衰减高频振动噪声。
+   * 加速度 30Hz 更加激进——加速度计噪声大且姿态解算只关心重力方向。
+   */
   APP_Sensor_Lpf gyro_lpf[3], acc_lpf[3];
+  uint32_t imu_irq_ready_count = 0U;
+  uint32_t imu_poll_ready_count = 0U;
+  uint32_t imu_read_fail_count = 0U;
+  uint32_t imu_drdy_miss_count = 0U;
   for (uint32_t i = 0U; i < 3U; i++) {
     APP_Sensor_LpfInit(&gyro_lpf[i], 80.0f, 0.001f);
     APP_Sensor_LpfInit(&acc_lpf[i], 30.0f, 0.001f);
@@ -436,25 +963,54 @@ void Sensor_Task(void *argument)
 
   for(;;)
   {
-    /* ---- 等待 PC0 数据就绪中断，超时后轮询 ---- */
-    bool imu_ready = false;
-    if ((osThreadFlagsWait(0x0001U, osFlagsWaitAny, 10U) & 0x0001U) == 0U) {
-      (void)BSP_IMU_IsDataReady(&imu_ready);
-      if (!imu_ready) { continue; }
-    }
-    imu_ready = true;
+    /*
+     * 步骤 1：等待 IMU 数据就绪
+     * PC0 EXTI → HAL_GPIO_EXTI_Callback → osThreadFlagsSet → 本任务被唤醒。
+     * 未等到中断时只读一次 ready 状态；若仍未 ready，则跳过本轮继续等下一帧。
+     */
+   if ((osThreadFlagsWait(SENSOR_IMU_DATA_READY_FLAG, osFlagsWaitAny,
+                           SENSOR_IMU_DRDY_TIMEOUT_MS) &
+         SENSOR_IMU_DATA_READY_FLAG) != 0U) {
+      imu_irq_ready_count++;
+      imu_drdy_miss_count = 0U;
+    } else {
+      bool imu_ready = false;
 
-    /* ---- 读取 IMU 原始值，转换为物理单位 ---- */
+      if ((BSP_IMU_IsDataReady(&imu_ready) == DRV_IMU_OK) && imu_ready) {
+        imu_poll_ready_count++;
+        imu_drdy_miss_count = 0U;
+      } else {
+        imu_drdy_miss_count++;
+        if (imu_drdy_miss_count >= SENSOR_IMU_DRDY_MISS_FAULT_LIMIT) {
+          stabilizer_latch_imu_fault(STABILIZER_IMU_FAULT_DRDY_TIMEOUT);
+          (void)osSemaphoreRelease(imuDataReadySemaphore);
+        }
+        continue;
+      }
+    }
+
+    /* ---- 步骤 2：SPI 读取 IMU 原始值，转换为物理单位 ---- */
     if (BSP_IMU_ReadRaw(&raw) != DRV_IMU_OK) {
-      BSP_IMU_Invalidate();
-      osDelay(20);
+      imu_read_fail_count++;
+      if (imu_read_fail_count >= SENSOR_IMU_READ_FAIL_LIMIT) {
+        stabilizer_latch_imu_fault(STABILIZER_IMU_FAULT_READ_FAIL);
+        (void)osSemaphoreRelease(imuDataReadySemaphore);
+      }
       continue;
     }
+    imu_read_fail_count = 0U;
+    stabilizer_clear_imu_fault();
+    stabilizer_imu_last_sample_ms = HAL_GetTick();
 
     sample_count++;
-    APP_IMU_RawToScaled(&raw, &scaled);
+    APP_IMU_RawToScaled(&raw, &scaled);  /* ADC → 物理单位（dps / g）         */
 
-    /* ---- 陀螺仪零偏校准（前 1000 个样本取均值） ---- */
+    /*
+     * 步骤 3：陀螺仪零偏校准
+     * APP_Sensor_CalibrateGyroBias() 内部累积前 1000 个样本求均值。
+     * 校准完成后（gyro_bias.ready == true），后续所有采样都减去零偏。
+     * 重要：校准时飞行器必须完全静止，否则零偏不准确。
+     */
     {
       float g[3] = {scaled.gyro_x_dps, scaled.gyro_y_dps, scaled.gyro_z_dps};
       if (APP_Sensor_CalibrateGyroBias(g[0], g[1], g[2], &gyro_bias)) {
@@ -470,7 +1026,14 @@ void Sensor_Task(void *argument)
       scaled.gyro_z_dps = g[2];
     }
 
-    /* ---- 坐标系对齐 + 低通滤波 ---- */
+    /*
+     * 步骤 4：坐标系对齐 + 低通滤波
+     * ICM-42688-P 芯片坐标系与机体坐标系不一定一致（取决于 PCB 焊接方向）。
+     * APP_Sensor_AlignToAirframe() 通过轴重排和取反将传感器轴映射到机体轴。
+     * 机体坐标系定义（NED 约定）：
+     *   X → 机头前方,  Y → 机身右侧,  Z → 机身下方
+     * 对齐后分别对陀螺和加速度施加一阶 IIR 低通滤波。
+     */
     {
       float a[3] = {scaled.accel_x_g, scaled.accel_y_g, scaled.accel_z_g};
       float g[3] = {scaled.gyro_x_dps, scaled.gyro_y_dps, scaled.gyro_z_dps};
@@ -478,34 +1041,52 @@ void Sensor_Task(void *argument)
 
       APP_Sensor_AlignToAirframe(a, a_align);
       APP_Sensor_AlignToAirframe(g, g_align);
-      APP_Sensor_LpfApply3f(gyro_lpf, g_align, g_align);
-      APP_Sensor_LpfApply3f(acc_lpf,  a_align, a_align);
+      APP_Sensor_LpfApply3f(gyro_lpf, g_align, g_align); /* IIR 低通：陀螺    */
+      APP_Sensor_LpfApply3f(acc_lpf,  a_align, a_align); /* IIR 低通：加速度  */
 
       scaled.accel_x_g  = a_align[0];  scaled.accel_y_g = a_align[1];  scaled.accel_z_g = a_align[2];
       scaled.gyro_x_dps = g_align[0];  scaled.gyro_y_dps = g_align[1]; scaled.gyro_z_dps = g_align[2];
     }
 
-    /* ---- 气压计：1kHz IMU 触发中每 32 次读一次（≈32Hz） ---- */
+    /*
+     * 步骤 5：气压计降采样读取（≈32Hz）
+     * 气压计不需要 1kHz 更新——大气压力变化缓慢（< 10Hz）。
+     * 每 32 次 IMU 循环（= 32ms @ 1kHz）读取一次，实际频率 ≈ 31.25Hz。
+     * SPI06-007 偶有上电复位后无响应的问题——读取失败时重新初始化。
+     */
     uint8_t baro_fresh = 0U;
 
     if (++baro_cnt >= 32U) {
       baro_cnt = 0U;
-      uint8_t buf[6];
+      uint8_t buf[6];                    /* 3 字节压力原始值 + 3 字节温度原始值 */
 
       if (BSP_BARO_ReadRawRegisters(0x00U, buf, 6U) == DRV_BARO_OK) {
-        /* SPL06-007：24 位补码，MSB 在前 */
+        /* SPL06-007：24 位补码，MSB 在前，左移后算术右移完成符号扩展 */
         int32_t prs_raw = ((int32_t)(((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) | ((uint32_t)buf[2] << 8))) >> 8;
         int32_t tmp_raw = ((int32_t)(((uint32_t)buf[3] << 24) | ((uint32_t)buf[4] << 16) | ((uint32_t)buf[5] << 8))) >> 8;
 
         APP_IMU_ConvertBaro(prs_raw, tmp_raw, &baro_pa, &baro_temp);
         baro_fresh = 1U;
       } else {
+        /* 读取失败：复位驱动状态 + 重新初始化传感器 */
         BSP_BARO_Invalidate();
         BSP_BARO_Init();
       }
     }
 
-    /* ---- 推送传感器数据给 StabilizerTask ---- */
+    /*
+     * 步骤 6：组装传感器消息 → 推送队列 → 通知 StabilizerTask
+     * SensorSampleMessage 包含：
+     *   - 时间戳（SVC_Timestamp_Us：32 位微秒硬件计数器）
+     *   - IMU 数据（加速度 + 陀螺仪，已滤波 + 坐标对齐 + 零偏校正）
+     *   - 气压计数据（压力 + 温度，baro_updated 标志是否本帧新鲜）
+     *   - IMU 采样率统计
+     *
+     * 队列满处理：丢弃最旧的一帧再写入（覆盖模式），保证 Stabilizer 拿到最新数据。
+     *
+     * 顺序关键：必须先 Push 队列，再 Release 信号量！
+     * 否则 StabilizerTask 被唤醒后发现队列空，白跑一趟。
+     */
     APP_Sensor_SampleMessage msg;
 
     msg.base.timestamp_us    = SVC_Timestamp_Us();
@@ -518,7 +1099,11 @@ void Sensor_Task(void *argument)
     msg.baro_updated         = baro_fresh;
     msg.baro_pressure_pa     = baro_pa;
     msg.baro_temperature_c   = baro_temp;
-    msg.imu_data_ready_count = 0U;
+    msg.imu_sample_rate_hz   = APP_SensorRateMeter_Update(&imu_rate_meter,
+                                                          msg.base.timestamp_us,
+                                                          sample_count);
+    msg.imu_data_ready_count = imu_irq_ready_count;
+    msg.imu_poll_ready_count = imu_poll_ready_count;
 
     if (osMessageQueuePut(SensorSampleQueueHandle, &msg, 0U, 0U) != osOK) {
       APP_Sensor_SampleMessage drop;
@@ -526,21 +1111,44 @@ void Sensor_Task(void *argument)
       (void)osMessageQueuePut(SensorSampleQueueHandle, &msg, 0U, 0U);
     }
 
+    /* 步骤 7：Release 信号量 → 唤醒 StabilizerTask */
     (void)osSemaphoreRelease(imuDataReadySemaphore);
 
-    /* MAG 按自己的节奏运行（非阻塞步进） */
-    /* APP_Task_GPS_Step();  暂时停止 GPS */
-    APP_Task_MAG_Step();
+    /*
+     * 步骤 8：磁力计步进（非阻塞，20Hz 独立节奏）
+     * 磁力计挂在 I2C 总线上，读取速度慢（~100Hz max），且数据不需要 1kHz 更新。
+     * 使用独立的时间间隔 SENSOR_MAG_PERIOD_US (50ms = 20Hz) 来控制步进。
+     */
+                             /* APP_Task_GPS_Step();  暂时停止 GPS */
+    {
+      uint64_t now_us = msg.base.timestamp_us;
+
+      if ((last_mag_step_us == 0ULL) ||
+          ((now_us - last_mag_step_us) >= SENSOR_MAG_PERIOD_US)) {
+        last_mag_step_us = now_us;
+        APP_Task_MAG_Step();
+      }
+    }
   }
   /* USER CODE END Sensor_Task */
 }
 
 /* USER CODE BEGIN Header_message_push */
 /**
-* @brief Function implementing the messageTask thread.
-* @param argument: Not used
-* @retval None
-*/
+  * @brief  messageTask —— 消息协议处理（JSON 解析 / 二进制帧编解码）
+  * @param  argument: Not used
+  * @retval None
+  *
+  * 功能：
+  *   处理来自上位机 / 遥控器的消息协议，包括：
+  *   - JSON 消息解析与应答
+  *   - 二进制帧封包 / 解包
+  *   - 参数读写请求的协议层处理
+  *   - WiFi 模块（Ai-WB2）的命令交互
+  *
+  * 优先级 BelowNormal：消息处理不影响飞控实时性。
+  * 栈 1024×4：JSON 处理和字符串操作需要较大栈空间。
+  */
 /* USER CODE END Header_message_push */
 void message_push(void *argument)
 {
@@ -556,10 +1164,22 @@ void message_push(void *argument)
 
 /* USER CODE BEGIN Header_UART_fun */
 /**
-* @brief Function implementing the UARTTask thread.
-* @param argument: Not used
-* @retval None
-*/
+  * @brief  UARTTask —— UART 收发调度
+  * @param  argument: Not used
+  * @retval None
+  *
+  * 功能：
+  *   统一管理所有 UART 外设的数据收发：
+  *   - UART4 (PD.1) → 舵机总线（半双工串行舵机协议）
+  *   - UART7 → ELRS 遥控器接收机（Crossfire 协议）
+  *   - UART8 → Ai-WB2 WiFi 模块（AT 命令 + 数据透传）
+  *
+  * 从 uartTxQueue 中取出待发送数据，分别投递到对应的 UART 外设。
+  * 各 UART 的接收在中断（IDLE / RXNE）中完成，此任务做分发调度。
+  *
+  * 优先级 Normal：UART 发送不及时会导致舵机丢帧或 WiFi 阻塞。
+  * 栈 1024×4：三个 UART 通道的缓冲区和协议栈需要较大空间。
+  */
 /* USER CODE END Header_UART_fun */
 void UART_fun(void *argument)
 {
@@ -575,15 +1195,25 @@ void UART_fun(void *argument)
 
 /* USER CODE BEGIN Header_BackgroundTask */
 /**
-* @brief Function implementing the backgroundTask thread.
-* @param argument: Not used
-* @retval None
-*
-* 功能：后台低优先级任务。
-* 这个任务负责执行不应该阻塞控制环的慢操作，例如参数从 FLASH 自动加载、
-* 参数异步保存、维护模式 FLASH 块读写。它是任务执行体；真正的数据规则
-* 放在 Services 层的 Param/Background API 中。
-*/
+  * @brief  BackgroundTask —— 后台低优先级任务（FLASH 参数管理）
+  * @param  argument: Not used
+  * @retval None
+  *
+  * 功能：
+  *   执行不应该阻塞控制环（SensorTask / StabilizerTask）的慢操作：
+  *   - 参数从 FLASH 自动加载（上电后首次运行）
+  *   - 参数异步保存（修改参数后延迟写入 FLASH，减少擦写次数）
+  *   - 维护模式 FLASH 块读写（坏块管理、磨损均衡等）
+  *
+  * 交互方式：请求-响应模式
+  *   - 请求者（任意任务）→ backgroundReqQueue → 本任务处理
+  *   - 本任务 → backgroundRespQueue → 请求者取走结果
+  *
+  * 所有 FLASH 操作前必须获取 flashBusMutex（递归互斥锁）。
+  *
+  * 优先级 BelowNormal：只在所有实时任务空闲时执行。
+  * 栈 1024×4：FLASH 页缓冲需要较大栈空间（一页 = 128 字节，需双缓冲）。
+  */
 /* USER CODE END Header_BackgroundTask */
 void BackgroundTask(void *argument)
 {
@@ -599,20 +1229,42 @@ void BackgroundTask(void *argument)
 
 /* USER CODE BEGIN Header_VOFA_task */
 /**
-* @brief Function implementing the VOFA_Task thread.
-* @param argument: Not used
-* @retval None
-*/
+  * @brief  VOFA_Task —— VOFA 上位机数据发送（50Hz 定时）
+  * @param  argument: Not used
+  * @retval None
+  *
+  * 功能：
+  *   从 vofaLogQueue 取出姿态/传感器数据，按固定格式打包后
+  *   通过 WiFi 透传发送到 VOFA 上位机进行实时可视化。
+  *
+  * 发送数据帧（11 个 float，44 字节）：
+  *   [0]  roll      横滚角 [°]
+  *   [1]  pitch     俯仰角 [°]
+  *   [2]  yaw       偏航角 [°]
+  *   [3]  altitude  相对高度 [m]（基于气压计 + 地面气压基准）
+  *   [4]  ax        加速度 X [g]
+  *   [5]  ay        加速度 Y [g]
+  *   [6]  az        加速度 Z [g]
+  *   [7]  gx        陀螺仪 X [dps]
+  *   [8]  gy        陀螺仪 Y [dps]
+  *   [9]  gz        陀螺仪 Z [dps]
+  *   [10] time      时间戳 [s]
+  *
+  * 高度计算：
+  *   开机后前 50 帧（≈1 秒 @ 50Hz）累积气压计数据求均值
+  *   作为地面基准气压 p0，之后用标准气压高度公式实时计算。
+  *   气压值有效性检查：10kPa < p < 110kPa（排除传感器异常值）。
+  *
+  * vofaStreamActive 标志可由上位机远程控制，方便暂停 / 恢复数据流。
+  *
+  * 优先级 Low：可视化数据允许延迟或丢帧，不影响飞行安全。
+  * 周期 50Hz（osDelay(20)）：匹配 WiFi 透传模式的分包策略。
+  */
 /* USER CODE END Header_VOFA_task */
 void VOFA_task(void *argument)
 {
   /* USER CODE BEGIN VOFA_task */
 
-  /*
-   * 高度：开机后气压计数据先累积 50 帧做平均作为地面气压 p0_pa，
-   * 之后用相对高度公式估算。
-   * TODO: 若需要更精确的高度，可以在 Stabilizer 里做卡尔曼融合。
-   */
   APP_Sensor_SampleMessage msg;
   #define VOFA_DATA_SIZE 11U
   float vofa_data[VOFA_DATA_SIZE];
@@ -624,19 +1276,28 @@ void VOFA_task(void *argument)
 
   for(;;)
   {
-    osDelay(20);  /* 10Hz 发送（WiFi 透传不积包） */
+    /*
+     * VOFA 诊断降频发送，避免 WiFi/USART1 调试流量影响实时任务调度。
+     */
+    osDelay(VOFA_SEND_PERIOD_MS);
 
     if (!vofaStreamActive) {
       continue;
     }
 
     if (osMessageQueueGet(vofaLogQueueHandle, &msg, 0U, 0U) == osOK) {
-      /* 姿态 */
+      /* ---- 组装 VOFA 数据帧 ---- */
+
+      /* 姿态角 */
       vofa_data[0] = msg.roll_deg;             /* 横滚  °   */
       vofa_data[1] = msg.pitch_deg;            /* 俯仰  °   */
       vofa_data[2] = msg.yaw_deg;              /* 偏航  °   */
 
-      /* 高度（开机前 50 帧做地面气压平均） */
+      /*
+       * 高度：开机前 VOFA_P0_SAMPLES 帧做地面气压平均
+       * 气压值范围检查：10kPa ~ 110kPa（正常大气范围）
+       * 使用标准气压高度公式：h = 44330 × (1 - (p/p0)^0.190295)
+       */
       if (p0_cnt < VOFA_P0_SAMPLES) {
         if (msg.baro_pressure_pa > 10000.0f && msg.baro_pressure_pa < 110000.0f) {
           p0_sum += msg.baro_pressure_pa;
@@ -653,17 +1314,20 @@ void VOFA_task(void *argument)
         }
       }
 
-      /* 加速度原始值 */
-      vofa_data[4] = msg.imu.accel_x_g;        /* ax [g] */
-      vofa_data[5] = msg.imu.accel_y_g;        /* ay [g] */
-      vofa_data[6] = msg.imu.accel_z_g;        /* az [g] */
+      /* 加速度原始值 [g] */
+      vofa_data[4] = msg.imu.accel_x_g;
+      vofa_data[5] = msg.imu.accel_y_g;
+      vofa_data[6] = msg.imu.accel_z_g;
 
-      /* 陀螺仪原始值（已减零偏 + 低通） */
-      vofa_data[7] = msg.imu.gyro_x_dps;       /* gx [dps] */
-      vofa_data[8] = msg.imu.gyro_y_dps;       /* gy [dps] */
-      vofa_data[9] = msg.imu.gyro_z_dps;       /* gz [dps] */
-      vofa_data[10] = (float)(SVC_Timestamp_Us() / 1000ULL) * 0.001f;  /* 时间戳 [s] */
+      /* 陀螺仪原始值 [dps]（已减零偏 + 低通滤波） */
+      vofa_data[7] = msg.imu.gyro_x_dps;
+      vofa_data[8] = msg.imu.gyro_y_dps;
+      vofa_data[9] = msg.imu.gyro_z_dps;
 
+      /* 时间戳 [s]（微秒硬件计数器 → 秒） */
+      vofa_data[10] = (float)(SVC_Timestamp_Us() / 1000ULL) * 0.001f;
+
+      /* 发送：11 个 float → 44 字节二进制帧 → WiFi 透传 → 上位机 */
       APP_VOFA_SendFloats(vofa_data, VOFA_DATA_SIZE);
     }
   }

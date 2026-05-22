@@ -13,7 +13,8 @@ typedef enum {
     DRV_SERVO_OK = 0,
     DRV_SERVO_ERROR,
     DRV_SERVO_INVALID_PARAM,
-    DRV_SERVO_TIMEOUT
+    DRV_SERVO_TIMEOUT,
+    DRV_SERVO_BUSY
 } DRV_SERVO_Status;
 
 typedef struct {
@@ -29,6 +30,20 @@ typedef struct {
 typedef struct {
     DRV_SERVO_Bus bus;
 } DRV_SERVO_Device;
+
+typedef struct {
+    uint32_t tx_start_count;
+    uint32_t tx_complete_count;
+    uint32_t tx_busy_count;
+    uint32_t tx_error_count;
+    uint32_t tx_recover_count;
+    uint32_t last_length;
+    uint32_t last_status;
+    uint32_t last_uart_state;
+    uint32_t last_uart_error;
+    uint32_t last_dma_state;
+    uint32_t last_dma_error;
+} DRV_SERVO_Diag;
 
 #define DRV_SERVO_MIN_PULSE_US    500U
 #define DRV_SERVO_MAX_PULSE_US    2500U
@@ -49,6 +64,12 @@ DRV_SERVO_Status DRV_SERVO_MovePosition(DRV_SERVO_Device *dev, uint8_t id,
 DRV_SERVO_Status DRV_SERVO_MoveMany(DRV_SERVO_Device *dev,
                                     const DRV_SERVO_MoveCmd *moves,
                                     uint8_t count, uint16_t time_ms);
+DRV_SERVO_Status DRV_SERVO_MoveManyAsync(DRV_SERVO_Device *dev,
+                                         const DRV_SERVO_MoveCmd *moves,
+                                         uint8_t count, uint16_t time_ms);
+void DRV_SERVO_GetDiag(DRV_SERVO_Diag *diag);
+void DRV_SERVO_OnUartTxComplete(UART_HandleTypeDef *huart);
+void DRV_SERVO_OnUartError(UART_HandleTypeDef *huart);
 DRV_SERVO_Status DRV_SERVO_ReadVersion(DRV_SERVO_Device *dev, uint8_t id);
 DRV_SERVO_Status DRV_SERVO_ReadId(DRV_SERVO_Device *dev, uint8_t id);
 DRV_SERVO_Status DRV_SERVO_SetId(DRV_SERVO_Device *dev, uint8_t old_id, uint8_t new_id);

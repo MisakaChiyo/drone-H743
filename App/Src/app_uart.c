@@ -9,6 +9,7 @@
 #include "bsp_gps.h"
 #include "bsp_uart.h"
 #include "bsp_cache.h"
+#include "drv_servo.h"
 
 #include "usart.h"
 
@@ -18,6 +19,7 @@
 #define APP_UART_BOOT_DIAG_ENABLED    0U
 #define APP_UART_LINE_DEBUG_ENABLED   0U
 #define APP_UART_PERIODIC_STATS_ENABLED 0U
+#define APP_UART_DISABLE_USART1       0U  /* 设为 1 释放 USART1 给烧录工具 */
 #define APP_UART_DIRECT_CONTROL_ENABLED 1U
 #define APP_UART_TX_WAIT_FOR_TRANSPARENT 1U //是否等待WIFI模块初始化
 #define APP_UART_LEGACY_ASCII_CONTROL_ENABLED 1U
@@ -114,6 +116,10 @@ static void app_uart_prepare_tx_dma(void)
 
 static void app_uart_start_rx_dma(void)
 {
+#if (APP_UART_DISABLE_USART1 != 0U)
+    (void)app_uart_rx_errors;
+    return;
+#else
     HAL_StatusTypeDef status;
 
 #if (APP_UART_RX_USE_DMA != 0U)
@@ -147,6 +153,7 @@ static void app_uart_start_rx_dma(void)
 #endif
     app_uart_dma_started = 1U;
     ++app_uart_rx_restarts;
+#endif
 }
 
 static uint8_t app_uart_rx_dma_needs_restart(void)
@@ -196,14 +203,6 @@ static char *app_uart_normalize_line(char *line, uint16_t length)
     while ((start_index < end_index) &&
            ((uint8_t)line[start_index] <= (uint8_t)' ')) {
         ++start_index;
-    }
-
-    if ((start_index < end_index) && (line[start_index] == '>')) {
-        ++start_index;
-        while ((start_index < end_index) &&
-               ((uint8_t)line[start_index] <= (uint8_t)' ')) {
-            ++start_index;
-        }
     }
 
     while ((end_index > start_index) &&
@@ -304,6 +303,11 @@ static void app_uart_clear_errors(void)
 
 void APP_UART_Task_Init(void)
 {
+#if (APP_UART_DISABLE_USART1 != 0U)
+    /* 彻底释放 USART1 引脚：DeInit 关闭时钟、NVIC、GPIO 复位为高阻态 */
+    HAL_UART_DeInit(&huart1);
+    return;
+#else
 #if (APP_UART_RX_USE_DMA != 0U)
     static const char boot_text[] = "BOOT uart_task_init rx=dma\r\n";
 #else
@@ -345,6 +349,7 @@ void APP_UART_Task_Init(void)
     APP_Task_MaintUART_Init();
     app_uart_prepare_tx_dma();
     app_uart_start_rx_dma();
+#endif
 }
 
 static void app_uart_ensure_control_ready(void)
@@ -486,6 +491,9 @@ static uint16_t app_uart_dma_write_pos(void)
 
 static void app_uart_poll_rx(void)
 {
+#if (APP_UART_DISABLE_USART1 != 0U)
+    return;
+#else
     app_uart_clear_errors();
 
 #if (APP_UART_RX_USE_DMA == 0U)
@@ -524,10 +532,14 @@ static void app_uart_poll_rx(void)
         app_uart_dma_started = 0U;
         app_uart_start_rx_dma();
     }
+#endif
 }
 
 static void app_uart_poll_tx(void)
 {
+#if (APP_UART_DISABLE_USART1 != 0U)
+    return;
+#else
     uint16_t frame_length = 0U;
     HAL_StatusTypeDef status;
 
@@ -607,6 +619,7 @@ static void app_uart_poll_tx(void)
     } else if (status != HAL_BUSY) {
         ++app_uart_rx_errors;
     }
+#endif
 }
 
 static void app_uart_sync_tx_state(void)
@@ -843,6 +856,10 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
+    if (huart->Instance == UART7) {
+        DRV_SERVO_OnUartTxComplete(huart);
+        return;
+    }
     if (huart->Instance == UART4) {
         APP_ELRS_OnTxComplete();
         return;
@@ -858,6 +875,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
+    if (huart->Instance == UART7) {
+        DRV_SERVO_OnUartError(huart);
+        return;
+    }
     if (huart->Instance == UART4) {
         APP_ELRS_OnError();
         return;

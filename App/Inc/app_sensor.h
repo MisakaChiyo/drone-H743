@@ -113,7 +113,7 @@ void APP_IMU_UpdateAttitude(const DRV_IMU_ScaledData *imu,
                             float *roll_deg,
                             float *pitch_deg,
                             float *yaw_deg,
-                            uint32_t *last_tick_ms,
+                            float dt_sec,
                             uint32_t sample_count);
 
 /* TODO: barometer raw → pressure/temperature (SPL06-007, fill after datasheet review) */
@@ -158,6 +158,17 @@ typedef struct {
  * 内部累加，采集满后算出零偏。返回 1 表示刚完成校准。 */
 uint8_t APP_Sensor_CalibrateGyroBias(float gx, float gy, float gz,
                                      APP_Sensor_GyroBias *cal);
+
+typedef struct {
+    uint64_t window_start_us;
+    uint32_t window_start_count;
+    float    hz;
+} APP_Sensor_RateMeter;
+
+void APP_SensorRateMeter_Reset(APP_Sensor_RateMeter *meter);
+float APP_SensorRateMeter_Update(APP_Sensor_RateMeter *meter,
+                                  uint64_t timestamp_us,
+                                  uint32_t sample_count);
 
 /* ════════════════════════════════════════════════════════════════════════ */
 /*  坐标系对齐（IMU 芯片坐标系 → 机体坐标系）                               */

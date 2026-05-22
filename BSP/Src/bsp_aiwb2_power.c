@@ -14,7 +14,22 @@ void BSP_AiWB2_SetEnabled(uint8_t enabled)
 {
     aiwb2_last_written_state = (enabled != 0U) ? 1U : 0U;
     ++aiwb2_write_count;
-    BSP_GPIO_Write(BSP_GPIO_PC6, aiwb2_last_written_state);
+
+    /* PB5 按钮: 默认高电平，按下为低 → 按住时强制关 WiFi，松手恢复 = 硬件复位 */
+    if (aiwb2_last_written_state && (BSP_GPIO_Read(BSP_GPIO_PB5) == 0U)) {
+        BSP_GPIO_Write(BSP_GPIO_PC6, 0U);
+    } else {
+        BSP_GPIO_Write(BSP_GPIO_PC6, aiwb2_last_written_state);
+    }
+}
+
+void BSP_AiWB2_UpdateButton(void)
+{
+    if (BSP_GPIO_Read(BSP_GPIO_PB5) == 0U) {
+        BSP_GPIO_Write(BSP_GPIO_PC6, 0U);
+    } else {
+        BSP_GPIO_Write(BSP_GPIO_PC6, aiwb2_last_written_state);
+    }
 }
 
 uint8_t BSP_AiWB2_IsEnabled(void)
