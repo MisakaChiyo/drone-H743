@@ -66,14 +66,17 @@ static float rt_atan2f_snf(float u0, float u1)
  *
  * Arguments    : const float x_rb[18]
  *                const float ref_cmd[4]
+ *                const DRV_COAX_CTRL_Params *params
  *                float cmd[4]
  * Return Type  : void
  */
 void coax_tiltrotor_controller_codegen(const float x_rb[18],
-                                       const float ref_cmd[4], float cmd[4])
+                                       const float ref_cmd[4],
+                                       const DRV_COAX_CTRL_Params *params,
+                                       float cmd[4])
 {
-  static const float fv[3] = {2.2F, 2.2F, 3.8F};
-  static const float fv1[3] = {2.5F, 2.5F, 3.1F};
+  float fv[3];
+  float fv1[3];
   static const signed char b_y[9] = {3, 0, 0, 0, 3, 0, 0, 0, 3};
   float R_EB[9];
   float b_x_rb[9];
@@ -92,9 +95,20 @@ void coax_tiltrotor_controller_codegen(const float x_rb[18],
   int i;
   int y_tmp;
   boolean_T rEQ0;
+  DRV_COAX_CTRL_Params default_params;
   if (!isInitialized_coax_tiltrotor_controller_codegen) {
     coax_tiltrotor_controller_codegen_initialize();
   }
+  if (params == NULL) {
+    DRV_COAX_CTRL_GetDefaultParams(&default_params);
+    params = &default_params;
+  }
+  fv[0] = params->pos_x_kp;
+  fv[1] = params->pos_y_kp;
+  fv[2] = params->pos_z_kp;
+  fv1[0] = params->vel_x_kd;
+  fv1[1] = params->vel_y_kd;
+  fv1[2] = params->vel_z_kd;
   for (i = 0; i < 9; i++) {
     x_rb_tmp = x_rb[i + 6];
     b_x_rb[i] = x_rb_tmp;
@@ -120,8 +134,9 @@ void coax_tiltrotor_controller_codegen(const float x_rb[18],
     T_des = 0.0F;
     for (b_i = 0; b_i < 3; b_i++) {
       b_u0 =
-          (0.5F * alpha_cmd * y[3 * b_i] + 0.5F * x_rb_tmp * y[3 * b_i + 1]) +
-          0.5F * q * y[3 * b_i + 2];
+          (params->rotation_error_gain * alpha_cmd * y[3 * b_i] +
+           params->rotation_error_gain * x_rb_tmp * y[3 * b_i + 1]) +
+          params->rotation_error_gain * q * y[3 * b_i + 2];
       R_EB[i + 3 * b_i] = b_u0;
       T_des += b_u0 * x_rb[b_i + 3];
     }
@@ -132,35 +147,35 @@ void coax_tiltrotor_controller_codegen(const float x_rb[18],
   } else {
     u0 = -1.0F;
   }
-  if (acc_cmd_E[0] >= -3.0F) {
+  if (acc_cmd_E[0] >= -params->accel_xy_limit_m_s2) {
     alpha_cmd = acc_cmd_E[0];
   } else {
-    alpha_cmd = -3.0F;
+    alpha_cmd = -params->accel_xy_limit_m_s2;
   }
-  if (alpha_cmd <= 3.0F) {
+  if (alpha_cmd <= params->accel_xy_limit_m_s2) {
     acc_cmd_E[0] = alpha_cmd;
   } else {
-    acc_cmd_E[0] = 3.0F;
+    acc_cmd_E[0] = params->accel_xy_limit_m_s2;
   }
-  if (acc_cmd_E[1] >= -3.0F) {
+  if (acc_cmd_E[1] >= -params->accel_xy_limit_m_s2) {
     alpha_cmd = acc_cmd_E[1];
   } else {
-    alpha_cmd = -3.0F;
+    alpha_cmd = -params->accel_xy_limit_m_s2;
   }
-  if (acc_cmd_E[2] >= -2.5F) {
+  if (acc_cmd_E[2] >= -params->accel_z_limit_m_s2) {
     b_u0 = acc_cmd_E[2];
   } else {
-    b_u0 = -2.5F;
+    b_u0 = -params->accel_z_limit_m_s2;
   }
-  q = 2.2F * acc_cmd_E[0];
-  if (!(alpha_cmd <= 3.0F)) {
-    alpha_cmd = 3.0F;
+  q = params->mass_kg * acc_cmd_E[0];
+  if (!(alpha_cmd <= params->accel_xy_limit_m_s2)) {
+    alpha_cmd = params->accel_xy_limit_m_s2;
   }
-  T_des = 2.2F * alpha_cmd;
-  if (!(b_u0 <= 2.5F)) {
-    b_u0 = 2.5F;
+  T_des = params->mass_kg * alpha_cmd;
+  if (!(b_u0 <= params->accel_z_limit_m_s2)) {
+    b_u0 = params->accel_z_limit_m_s2;
   }
-  x_rb_tmp = 2.2F * (b_u0 - 9.81F);
+  x_rb_tmp = params->mass_kg * (b_u0 - params->gravity_m_s2);
   for (i = 0; i < 3; i++) {
     alpha_cmd = (R_EB[3 * i] * q + R_EB[3 * i + 1] * T_des) +
                 R_EB[3 * i + 2] * x_rb_tmp;
@@ -192,45 +207,49 @@ void coax_tiltrotor_controller_codegen(const float x_rb[18],
   } else {
     b_u0 = -1.0F;
   }
-  if (T_des >= 7.5537014F) {
+  if (T_des >= params->min_total_force_n) {
     x_rb_tmp = T_des;
   } else {
-    x_rb_tmp = 7.5537014F;
+    x_rb_tmp = params->min_total_force_n;
   }
-  x_rb_tmp *= 0.18F;
+  x_rb_tmp *= params->tilt_lever_arm_m;
   if (!(b_u0 <= 1.0F)) {
     b_u0 = 1.0F;
   }
   b_u0 =
       (float)asin(b_u0) +
-      (-6.5F * rt_atan2f_snf(R_EB[5], R_EB[8]) - 0.66F * x_rb[15]) / x_rb_tmp;
+      (-params->roll_angle_kp * rt_atan2f_snf(R_EB[5], R_EB[8]) -
+       params->roll_rate_kd * x_rb[15]) /
+          x_rb_tmp;
   if (!(u0 <= 1.0F)) {
     u0 = 1.0F;
   }
   u0 = rt_atan2f_snf(FT_des_B[0], FT_des_B[2]) +
-       (-6.5F * -(float)asin(u0) - 0.7F * x_rb[16]) / x_rb_tmp;
-  if (!(u0 >= -0.261799395F)) {
-    u0 = -0.261799395F;
+       (-params->pitch_angle_kp * -(float)asin(u0) -
+        params->pitch_rate_kd * x_rb[16]) /
+           x_rb_tmp;
+  if (!(u0 >= -params->tilt_limit_rad)) {
+    u0 = -params->tilt_limit_rad;
   }
-  if (u0 <= 0.261799395F) {
+  if (u0 <= params->tilt_limit_rad) {
     alpha_cmd = u0;
   } else {
-    alpha_cmd = 0.261799395F;
+    alpha_cmd = params->tilt_limit_rad;
   }
-  if (b_u0 >= -0.261799395F) {
+  if (b_u0 >= -params->tilt_limit_rad) {
     u0 = b_u0;
   } else {
-    u0 = -0.261799395F;
+    u0 = -params->tilt_limit_rad;
   }
-  if (u0 <= 0.261799395F) {
+  if (u0 <= params->tilt_limit_rad) {
     beta_cmd = u0;
   } else {
-    beta_cmd = 0.261799395F;
+    beta_cmd = params->tilt_limit_rad;
   }
-  if (T_des >= 7.5537F) {
+  if (T_des >= params->min_total_force_n) {
     u0 = T_des;
   } else {
-    u0 = 7.5537F;
+    u0 = params->min_total_force_n;
   }
   x_rb_tmp = ref_cmd[3] - rt_atan2f_snf(R_EB[1], R_EB[0]);
   if (rtIsNaNF(x_rb_tmp + 3.14159274F) || rtIsInfF(x_rb_tmp + 3.14159274F)) {
@@ -250,19 +269,20 @@ void coax_tiltrotor_controller_codegen(const float x_rb[18],
       b_u0 += 6.28318548F;
     }
   }
-  b_u0 = 2.8F * (b_u0 - 3.14159274F);
-  if (!(b_u0 >= -1.04719758F)) {
-    b_u0 = -1.04719758F;
+  b_u0 = params->yaw_angle_kp * (b_u0 - 3.14159274F);
+  if (!(b_u0 >= -params->yaw_rate_limit_rad_s)) {
+    b_u0 = -params->yaw_rate_limit_rad_s;
   }
-  if (!(u0 <= 38.8476F)) {
-    u0 = 38.8476F;
+  if (!(u0 <= params->max_total_force_n)) {
+    u0 = params->max_total_force_n;
   }
-  T_des = u0 / 3.0E-5F;
-  if (!(b_u0 <= 1.04719758F)) {
-    b_u0 = 1.04719758F;
+  T_des = u0 / params->thrust_coeff_n_per_rad2;
+  if (!(b_u0 <= params->yaw_rate_limit_rad_s)) {
+    b_u0 = params->yaw_rate_limit_rad_s;
   }
-  x_rb_tmp = 0.52F * (b_u0 - x_rb[17]) /
-             ((float)cos(alpha_cmd) * (float)cos(beta_cmd)) / 1.5E-6F;
+  x_rb_tmp = params->yaw_inertia * (b_u0 - params->yaw_rate_kd * x_rb[17]) /
+             ((float)cos(alpha_cmd) * (float)cos(beta_cmd)) /
+             params->yaw_torque_coeff_n_m_per_rad2;
   u0 = 0.5F * (T_des - x_rb_tmp);
   b_u0 = 0.5F * (T_des + x_rb_tmp);
   if (!(u0 >= 0.0F)) {
@@ -271,12 +291,12 @@ void coax_tiltrotor_controller_codegen(const float x_rb[18],
   if (!(b_u0 >= 0.0F)) {
     b_u0 = 0.0F;
   }
-  if (!(u0 <= 810000.0F)) {
-    u0 = 810000.0F;
+  if (!(u0 <= params->motor_omega_max_rad_s * params->motor_omega_max_rad_s)) {
+    u0 = params->motor_omega_max_rad_s * params->motor_omega_max_rad_s;
   }
   cmd[0] = (float)sqrt(u0);
-  if (!(b_u0 <= 810000.0F)) {
-    b_u0 = 810000.0F;
+  if (!(b_u0 <= params->motor_omega_max_rad_s * params->motor_omega_max_rad_s)) {
+    b_u0 = params->motor_omega_max_rad_s * params->motor_omega_max_rad_s;
   }
   cmd[1] = (float)sqrt(b_u0);
   cmd[2] = alpha_cmd;

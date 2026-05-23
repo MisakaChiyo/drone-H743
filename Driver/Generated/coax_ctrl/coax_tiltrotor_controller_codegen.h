@@ -13,6 +13,7 @@
 
 /* Include Files */
 #include "rtwtypes.h"
+#include "drv_coax_ctrl.h"
 #include <stddef.h>
 #include <stdlib.h>
 
@@ -23,6 +24,7 @@ extern "C" {
 /* Function Declarations */
 extern void coax_tiltrotor_controller_codegen(const float x_rb[18],
                                               const float ref_cmd[4],
+                                              const DRV_COAX_CTRL_Params *params,
                                               float cmd[4]);
 
 #ifdef __cplusplus

@@ -60,7 +60,23 @@ DRV_MOTOR_Status DRV_Motor_SetPercent(uint32_t motor, uint32_t percent)
 
 DRV_MOTOR_Status DRV_Motor_Stop(uint32_t motor)
 {
-    return DRV_Motor_SetPercent(motor, 0U);
+    uint32_t pwm_channel = motor_to_pwm_channel(motor);
+    BSP_PWM_Status pwm_status;
+
+    if (motor == DRV_MOTOR_ID_BOTH) {
+        return DRV_Motor_StopAll();
+    }
+
+    if (pwm_channel == 0U) {
+        return DRV_MOTOR_INVALID_PARAM;
+    }
+
+    pwm_status = BSP_PWM_DisableEsc(pwm_channel);
+    if (pwm_status == BSP_PWM_OK) {
+        motor_percent[motor - 1U] = 0U;
+    }
+
+    return motor_from_pwm_status(pwm_status);
 }
 
 DRV_MOTOR_Status DRV_Motor_StopAll(void)

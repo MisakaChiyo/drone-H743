@@ -102,6 +102,17 @@ typedef struct {
     uint8_t  diag_valid;
 } APP_IMU_Status;
 
+typedef struct {
+    float roll_acc_deg;
+    float pitch_acc_deg;
+    float roll_gyro_deg;
+    float pitch_gyro_deg;
+    float roll_residual_deg;
+    float pitch_residual_deg;
+    float alpha;
+    float dt_ms;
+} APP_IMU_AttitudeDebug;
+
 /* ── sensor conversion API (called from Sensor_Task in freertos.c) ── */
 
 /* ICM-42688 raw counts → physical units (g, dps, °C) */
@@ -115,6 +126,7 @@ void APP_IMU_UpdateAttitude(const DRV_IMU_ScaledData *imu,
                             float *yaw_deg,
                             float dt_sec,
                             uint32_t sample_count);
+void APP_IMU_GetAttitudeDebug(APP_IMU_AttitudeDebug *debug);
 
 /* TODO: barometer raw → pressure/temperature (SPL06-007, fill after datasheet review) */
 void APP_IMU_ConvertBaro(const int32_t pressure_raw,
@@ -173,7 +185,7 @@ float APP_SensorRateMeter_Update(APP_Sensor_RateMeter *meter,
 /* ════════════════════════════════════════════════════════════════════════ */
 /*  坐标系对齐（IMU 芯片坐标系 → 机体坐标系）                               */
 /*                                                                        */
-/*  默认直通（恒等变换）。如果 IMU 安装方向不同，修改此函数内的轴映射。       */
+/*  当前安装：IMU +Y 朝下，+Z 朝前，+X 朝左。输出机体系为前右下。             */
 /* ════════════════════════════════════════════════════════════════════════ */
 
 void APP_Sensor_AlignToAirframe(const float in[3], float out[3]);

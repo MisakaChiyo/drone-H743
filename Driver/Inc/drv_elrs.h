@@ -44,6 +44,10 @@ void     DRV_ELRS_GetChannels(uint16_t raw_out[CRSF_CHANNEL_COUNT],
                               uint16_t us_out[CRSF_CHANNEL_COUNT]);
 const DRV_ELRS_LinkStats *DRV_ELRS_GetLinkStats(void);
 
+void     DRV_ELRS_MarkRcFrameTime(uint32_t now_ms);
+uint32_t DRV_ELRS_GetLastRcMs(void);
+uint8_t  DRV_ELRS_IsRcFresh(uint32_t now_ms, uint32_t timeout_ms);
+
 uint8_t  DRV_ELRS_IsRcUpdated(void);
 void     DRV_ELRS_ClearRcUpdated(void);
 

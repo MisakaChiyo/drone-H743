@@ -81,10 +81,10 @@ uint8_t DRV_ELRS_BuildTelemetry(uint8_t type, const uint8_t *payload,
 
 /* ---------- frame handling ---------- */
 
-static void Crsf_HandleRcChannels(const uint8_t *payload, uint8_t payload_len)
+static uint8_t Crsf_HandleRcChannels(const uint8_t *payload, uint8_t payload_len)
 {
     if (payload_len != CRSF_RC_PAYLOAD_LEN)
-        return;
+        return 0U;
 
     for (uint8_t i = 0U; i < CRSF_CHANNEL_COUNT; i++) {
         g_channels_raw[i] = Crsf_ReadPackedChannel(payload, i);
@@ -93,6 +93,7 @@ static void Crsf_HandleRcChannels(const uint8_t *payload, uint8_t payload_len)
 
     g_rc_frames++;
     g_rc_updated = 1U;
+    return 1U;
 }
 
 static void Crsf_HandleLinkStats(const uint8_t *payload, uint8_t payload_len)
@@ -113,7 +114,7 @@ static void Crsf_HandleLinkStats(const uint8_t *payload, uint8_t payload_len)
     g_link_stats.downlink_snr   = (int8_t)payload[9];
 }
 
-static void Crsf_HandleFrame(const uint8_t *frame, uint8_t total_len)
+static uint8_t Crsf_HandleFrame(const uint8_t *frame, uint8_t total_len)
 {
     uint8_t len         = frame[1];
     uint8_t type        = frame[2];
@@ -124,15 +125,17 @@ static void Crsf_HandleFrame(const uint8_t *frame, uint8_t total_len)
 
     if (crc_rx != crc_calc) {
         g_crc_errors++;
-        return;
+        return 0U;
     }
 
     g_total_frames++;
 
     if (type == CRSF_FRAME_RC_CHANNELS_PACKED)
-        Crsf_HandleRcChannels(payload, payload_len);
+        return Crsf_HandleRcChannels(payload, payload_len);
     else if (type == CRSF_FRAME_LINK_STATISTICS)
         Crsf_HandleLinkStats(payload, payload_len);
+
+    return 0U;
 }
 
 /* ---------- byte-level parser ---------- */
@@ -160,9 +163,7 @@ uint8_t DRV_ELRS_ProcessByte(uint8_t byte)
 
     g_frame[g_frame_index++] = byte;
     if (g_frame_index >= (uint8_t)(g_frame_len + 2U)) {
-        uint8_t handled = (g_frame[2] == CRSF_FRAME_RC_CHANNELS_PACKED ||
-                           g_frame[2] == CRSF_FRAME_LINK_STATISTICS) ? 1U : 0U;
-        Crsf_HandleFrame(g_frame, g_frame_index);
+        uint8_t handled = Crsf_HandleFrame(g_frame, g_frame_index);
         g_frame_index = 0U;
         return handled;
     }
@@ -193,6 +194,7 @@ void DRV_ELRS_Init(void)
     g_length_errors = 0U;
     g_rc_frames    = 0U;
     g_rc_updated   = 0U;
+    g_last_rc_tick = 0U;
     g_fps_x10      = 0U;
     g_last_fps_tick = 0U;
     g_last_fps_frames = 0U;
@@ -212,14 +214,38 @@ void DRV_ELRS_GetChannels(uint16_t raw_out[CRSF_CHANNEL_COUNT],
     if (us_out != NULL)
         memcpy(us_out, g_channels_us, sizeof(g_channels_us));
 
-    uint32_t now = g_last_rc_tick;
-    if (now == 0U) now = 1U;
-    UpdateFps(now);
+    if (g_last_rc_tick != 0U) {
+        UpdateFps(g_last_rc_tick);
+    }
 }
 
 const DRV_ELRS_LinkStats *DRV_ELRS_GetLinkStats(void)
 {
     return &g_link_stats;
+}
+
+void DRV_ELRS_MarkRcFrameTime(uint32_t now_ms)
+{
+    if (now_ms == 0U) {
+        now_ms = 1U;
+    }
+
+    g_last_rc_tick = now_ms;
+    UpdateFps(now_ms);
+}
+
+uint32_t DRV_ELRS_GetLastRcMs(void)
+{
+    return g_last_rc_tick;
+}
+
+uint8_t DRV_ELRS_IsRcFresh(uint32_t now_ms, uint32_t timeout_ms)
+{
+    if (g_last_rc_tick == 0U) {
+        return 0U;
+    }
+
+    return ((now_ms - g_last_rc_tick) <= timeout_ms) ? 1U : 0U;
 }
 
 uint8_t DRV_ELRS_IsRcUpdated(void)

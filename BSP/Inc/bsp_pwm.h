@@ -22,6 +22,7 @@ typedef enum {
 BSP_PWM_Status BSP_PWM_Init(void);
 BSP_PWM_Status BSP_PWM_SetEscPulse(uint32_t channel, uint16_t pulse_us);
 BSP_PWM_Status BSP_PWM_SetEscPercent(uint32_t channel, uint32_t percent);
+BSP_PWM_Status BSP_PWM_DisableEsc(uint32_t channel);
 uint16_t BSP_PWM_PercentToPulse(uint32_t percent);
 uint16_t BSP_PWM_GetEscPulse(uint32_t channel);
 uint8_t BSP_PWM_GetStartStatus(uint32_t channel);

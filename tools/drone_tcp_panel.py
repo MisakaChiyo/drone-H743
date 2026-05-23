@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TCP ground-station panel for the drone-H743 Ai-WB2 transparent link."""
+"""Ground-station panel for the drone-H743 Ai-WB2 transparent link."""
 
 from __future__ import annotations
 
@@ -18,6 +18,9 @@ from tkinter import filedialog, messagebox, ttk
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 6666
+DEFAULT_MODULE_IP = "192.168.223.181"
+DEFAULT_UDP_LOCAL_PORT = 6668
+DEFAULT_UDP_MODULE_PORT = 7777
 MAX_BARO_SAMPLES = 2000
 MAX_GPS_TRACK_POINTS = 5000
 BARO_STREAM_PERIOD_MS = 50
@@ -415,6 +418,94 @@ class TcpTransport(TransportBase):
         self.rx_queue.put("[上位机] 板子已断开")
 
 
+class UdpTransport(TransportBase):
+    def __init__(self, rx_queue: "queue.Queue[str]") -> None:
+        super().__init__(rx_queue)
+        self.sock: socket.socket | None = None
+        self.thread: threading.Thread | None = None
+        self.remote: tuple[str, int] | None = None
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+
+    @property
+    def is_connected(self) -> bool:
+        with self.lock:
+            return self.sock is not None and self.remote is not None
+
+    def start(self, bind_ip: str, local_port: int, module_ip: str, module_port: int) -> None:
+        self.stop()
+        self.stop_event.clear()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((bind_ip, local_port))
+            sock.settimeout(0.5)
+        except OSError as exc:
+            self.rx_queue.put(f"[host] UDP open failed: {exc}")
+            return
+
+        with self.lock:
+            self.sock = sock
+            self.remote = (module_ip, module_port)
+        self.rx_queue.put(f"[host] UDP ready local={bind_ip}:{local_port} module={module_ip}:{module_port}")
+        self.thread = threading.Thread(target=self._read_loop, args=(sock,), daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        with self.lock:
+            sock = self.sock
+            self.sock = None
+            self.remote = None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def send_frame(self, function: int, payload: bytes = b"") -> bool:
+        del function
+        try:
+            text = payload.decode("utf-8") if payload else ""
+        except UnicodeDecodeError:
+            return False
+        return self.send_line(text)
+
+    def send_line(self, line: str) -> bool:
+        data = (line.rstrip("\r\n") + "\r\n").encode("utf-8")
+        with self.lock:
+            sock = self.sock
+            remote = self.remote
+        if sock is None or remote is None:
+            return False
+        try:
+            sock.sendto(data, remote)
+            return True
+        except OSError as exc:
+            self.rx_queue.put(f"[host] UDP send failed: {exc}")
+            return False
+
+    def _read_loop(self, sock: socket.socket) -> None:
+        while not self.stop_event.is_set():
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            self.rx_queue.put(f"[host] UDP RX {addr[0]}:{addr[1]} {len(data)}B")
+            buffer = bytearray(data)
+            self._consume_buffer(buffer)
+            if buffer:
+                shown = bytes(buffer).decode("utf-8", errors="replace").replace("\r", "\\r").replace("\n", "\\n")
+                self.rx_queue.put(f"RXRAW len={len(buffer)} data={shown}")
+        with self.lock:
+            if self.sock is sock:
+                self.sock = None
+                self.remote = None
+        self.rx_queue.put("[host] UDP stopped")
+
+
 class SerialTransport(TransportBase):
     def __init__(self, rx_queue: "queue.Queue[str]") -> None:
         super().__init__(rx_queue)
@@ -560,6 +651,7 @@ class DronePanel(tk.Tk):
 
         self.rx_queue: "queue.Queue[str]" = queue.Queue()
         self.tcp_transport = TcpTransport(self.rx_queue)
+        self.udp_transport = UdpTransport(self.rx_queue)
         self.serial_transport = SerialTransport(self.rx_queue)
         self.transport: TransportBase = self.tcp_transport
         self.last_board_rx = 0.0
@@ -594,6 +686,10 @@ class DronePanel(tk.Tk):
         self.gps_count_var = tk.StringVar(value="轨迹点: 0")
         self.gps_status_var = tk.StringVar(value="等待 GPS")
         self.transport_var = tk.StringVar(value="tcp")
+        self.udp_bind_var = tk.StringVar(value=DEFAULT_HOST)
+        self.udp_local_port_var = tk.IntVar(value=DEFAULT_UDP_LOCAL_PORT)
+        self.udp_module_ip_var = tk.StringVar(value=DEFAULT_MODULE_IP)
+        self.udp_module_port_var = tk.IntVar(value=DEFAULT_UDP_MODULE_PORT)
         self._serial_port_map: dict[str, str] = {}
         self.serial_port_var = tk.StringVar(value=self._default_serial_port())
         self.serial_baud_var = tk.IntVar(value=115200)
@@ -658,16 +754,26 @@ class DronePanel(tk.Tk):
             self.serial_port_var.set(names[0])
 
     def _on_transport_mode_change(self, *args) -> None:
-        if self.transport_var.get() == "serial":
-            self._tcp_frame.pack_forget()
+        self._tcp_frame.pack_forget()
+        self._udp_frame.pack_forget()
+        self._serial_frame.pack_forget()
+
+        mode = self.transport_var.get()
+        if mode == "serial":
             self._serial_frame.pack(side=tk.LEFT, padx=(0, 12), before=self._action_frame)
             self._on_refresh_ports()
+        elif mode == "udp":
+            self._udp_frame.pack(side=tk.LEFT, padx=(0, 12), before=self._action_frame)
         else:
-            self._serial_frame.pack_forget()
             self._tcp_frame.pack(side=tk.LEFT, padx=(0, 12), before=self._action_frame)
 
     def _current_transport(self) -> TransportBase:
-        return self.serial_transport if self.transport_var.get() == "serial" else self.tcp_transport
+        mode = self.transport_var.get()
+        if mode == "serial":
+            return self.serial_transport
+        if mode == "udp":
+            return self.udp_transport
+        return self.tcp_transport
 
     def _transport_connected(self) -> bool:
         return self.transport.is_connected
@@ -724,7 +830,7 @@ class DronePanel(tk.Tk):
         ttk.Combobox(
             conn,
             textvariable=self.transport_var,
-            values=("tcp", "serial"),
+            values=("tcp", "udp", "serial"),
             width=8,
             state="readonly",
         ).pack(side=tk.LEFT, padx=(4, 12))
@@ -737,6 +843,15 @@ class DronePanel(tk.Tk):
         ttk.Label(self._tcp_frame, text="端口").pack(side=tk.LEFT)
         self.port_var = tk.IntVar(value=DEFAULT_PORT)
         ttk.Entry(self._tcp_frame, textvariable=self.port_var, width=8).pack(side=tk.LEFT)
+
+        # --- UDP controls ---
+        self._udp_frame = ttk.Frame(conn)
+        ttk.Label(self._udp_frame, text="本地").pack(side=tk.LEFT)
+        ttk.Entry(self._udp_frame, textvariable=self.udp_bind_var, width=13).pack(side=tk.LEFT, padx=(4, 4))
+        ttk.Entry(self._udp_frame, textvariable=self.udp_local_port_var, width=7).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(self._udp_frame, text="模块").pack(side=tk.LEFT)
+        ttk.Entry(self._udp_frame, textvariable=self.udp_module_ip_var, width=15).pack(side=tk.LEFT, padx=(4, 4))
+        ttk.Entry(self._udp_frame, textvariable=self.udp_module_port_var, width=7).pack(side=tk.LEFT)
 
         # --- Serial controls (hidden by default) ---
         self._serial_frame = ttk.Frame(conn)
@@ -1292,6 +1407,21 @@ class DronePanel(tk.Tk):
             self.transport.start(self.host_var.get(), port)
             return
 
+        if self.transport is self.udp_transport:
+            try:
+                local_port = int(self.udp_local_port_var.get())
+                module_port = int(self.udp_module_port_var.get())
+            except tk.TclError:
+                messagebox.showerror("输入错误", "UDP 端口号无效")
+                return
+            module_ip = self.udp_module_ip_var.get().strip()
+            if not module_ip:
+                messagebox.showerror("输入错误", "请输入 Ai-WB2 模块 IP")
+                return
+            self.transport.start(self.udp_bind_var.get(), local_port, module_ip, module_port)
+            self.structured_protocol_supported = False
+            return
+
         try:
             baud = int(self.serial_baud_var.get())
         except tk.TclError:
@@ -1306,6 +1436,7 @@ class DronePanel(tk.Tk):
 
     def _stop(self) -> None:
         self.tcp_transport.stop()
+        self.udp_transport.stop()
         self.serial_transport.stop()
         self.transport = self._current_transport()
 
@@ -1326,7 +1457,9 @@ class DronePanel(tk.Tk):
             self._append("[上位机] 发送失败")
             return
         sent_at = time.monotonic()
-        if self.structured_protocol_supported is False and not (self.transport is self.serial_transport and SERIAL_ASCII_COMPAT_MODE):
+        if self.transport is self.udp_transport:
+            pass
+        elif self.structured_protocol_supported is False and not (self.transport is self.serial_transport and SERIAL_ASCII_COMPAT_MODE):
             self.transport.send_line(payload_text)
         elif self.structured_protocol_supported is None and function != PROTO_REQ_CAPS and self.transport is not self.serial_transport:
             self.after(
@@ -1362,6 +1495,9 @@ class DronePanel(tk.Tk):
         self.transport.send_line(legacy_line)
 
     def _begin_protocol_probe(self) -> None:
+        if self.transport is self.udp_transport:
+            self.structured_protocol_supported = False
+            return
         if self.transport is self.serial_transport and SERIAL_ASCII_COMPAT_MODE:
             self.structured_protocol_supported = False
             return
@@ -1462,6 +1598,13 @@ class DronePanel(tk.Tk):
         if int(self.status_text.index("end-1c").split(".")[0]) > self.MAX_LOG_LINES:
             self.status_text.delete("1.0", "2.0")
         self.status_text.see(tk.END)
+
+    def _transport_label(self) -> str:
+        if self.transport is self.tcp_transport:
+            return "TCP"
+        if self.transport is self.udp_transport:
+            return "UDP"
+        return "串口"
 
     def _handle_proto_frame(self, function: int, text: str) -> None:
         self.last_board_rx = time.monotonic()
@@ -2752,6 +2895,17 @@ class DronePanel(tk.Tk):
     def _payload_for_param_edit(self, name: str, value: str) -> tuple[int, str]:
         lowered = name.strip().lower()
         parts = lowered.split(".")
+        pid_aliases = {
+            "pid.roll.kp": "coax.roll_angle_kp",
+            "pid.roll.kd": "coax.roll_rate_kd",
+            "pid.pitch.kp": "coax.pitch_angle_kp",
+            "pid.pitch.kd": "coax.pitch_rate_kd",
+            "pid.yaw.kp": "coax.yaw_angle_kp",
+            "pid.yaw.kd": "coax.yaw_rate_kd",
+        }
+        if lowered in pid_aliases:
+            payload = f"PARAM SET {pid_aliases[lowered]} {value}"
+            return PROTO_REQ_PARAM_SET, payload
         if len(parts) == 2 and parts[0].startswith("servo") and parts[0][5:].isdigit():
             index = int(parts[0][5:])
             field = parts[1]

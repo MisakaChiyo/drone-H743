@@ -21,6 +21,13 @@ def test_attitude_filter_uses_fixed_1ms_dt_with_timestamp_option() -> None:
     assert "#if (STABILIZER_USE_FIXED_IMU_DT == 0U)" in freertos
     assert "msg.base.timestamp_us - last_imu_timestamp_us" in freertos
     assert "APP_IMU_UpdateAttitude(&msg.imu, &roll, &pitch, &yaw,\n                             dt_sec, stabilizer_seq)" in freertos
+    assert "APP_IMU_AttitudeDebug" in header
+    assert "APP_IMU_GetAttitudeDebug(&msg.attitude_debug);" in freertos
+    assert "imu_attitude_debug.roll_gyro_deg = roll_gyro;" in source
+    assert "#define APP_IMU_ROLL_SIGN         (1.0f)" in source
+    assert "#define APP_IMU_PITCH_SIGN        (-1.0f)" in source
+    assert "#define APP_IMU_GYRO_ROLL_SIGN    (-1.0f)" in source
+    assert "#define APP_IMU_GYRO_PITCH_SIGN   (-1.0f)" in source
 
 
 def test_slow_mag_step_is_not_run_for_every_imu_sample() -> None:
@@ -36,13 +43,38 @@ def test_vofa_stream_reports_imu_rate_and_interrupt_vs_poll_counts() -> None:
     freertos = read("Core/Src/freertos.c")
 
     assert "uint32_t imu_poll_ready_count;" in messages
+    assert "float imu_irq_sample_rate_hz;" in messages
+    assert "float imu_poll_sample_rate_hz;" in messages
+    assert "float imu_age_ms;" in messages
+    assert "APP_IMU_AttitudeDebug attitude_debug;" in messages
     assert "uint32_t imu_irq_ready_count = 0U;" in freertos
     assert "uint32_t imu_poll_ready_count = 0U;" in freertos
+    assert "APP_Sensor_RateMeter imu_irq_rate_meter = {0};" in freertos
+    assert "APP_Sensor_RateMeter imu_poll_rate_meter = {0};" in freertos
     assert "imu_irq_ready_count++;" in freertos
     assert "msg.imu_data_ready_count = imu_irq_ready_count;" in freertos
     assert "msg.imu_poll_ready_count = imu_poll_ready_count;" in freertos
-    assert "#define VOFA_DATA_SIZE 11U" in freertos
-    assert "vofa_data[10] = (float)(SVC_Timestamp_Us() / 1000ULL) * 0.001f;" in freertos
+    assert "msg.imu_irq_sample_rate_hz  = APP_SensorRateMeter_Update(&imu_irq_rate_meter," in freertos
+    assert "msg.imu_poll_sample_rate_hz = APP_SensorRateMeter_Update(&imu_poll_rate_meter," in freertos
+    assert "#define VOFA_SEND_PERIOD_MS            20U" in freertos
+    assert "#define VOFA_DATA_SIZE 22U" in freertos
+    assert "uint64_t now_us = SVC_Timestamp_Us();" in freertos
+    assert "msg.imu_age_ms = (float)(now_us - msg.base.timestamp_us) * 0.001f;" in freertos
+    assert "vofa_data[10] = (float)(now_us / 1000ULL) * 0.001f;" in freertos
+    assert "vofa_data[11] = msg.imu_irq_sample_rate_hz;" in freertos
+    assert "vofa_data[12] = msg.imu_poll_sample_rate_hz;" in freertos
+    assert "vofa_data[13] = msg.imu_age_ms;" in freertos
+    assert "vofa_data[14] = msg.attitude_debug.roll_acc_deg;" in freertos
+    assert "vofa_data[16] = msg.attitude_debug.roll_gyro_deg;" in freertos
+    assert "vofa_data[20] = msg.attitude_debug.alpha;" in freertos
+    assert "vofa_data[21] = msg.attitude_debug.dt_ms;" in freertos
+
+
+def test_message_task_does_not_consume_sensor_sample_queue() -> None:
+    source = read("App/Src/app_message.c")
+
+    assert "osMessageQueueGet(SensorSampleQueueHandle" not in source
+    assert "APP_MESSAGE_IMU_STREAM_ENABLED" not in source
 
 
 def test_sensor_task_uses_interrupt_with_bounded_ready_fallback() -> None:
@@ -83,8 +115,33 @@ def test_stabilizer_holds_last_servo_target_on_imu_dropout_after_first_sample() 
     assert "moves[1].pulse_us = stabilizer_latest_servo_target_us[1];" in freertos
     assert "else if (has_imu_sample == 0U)" in freertos
     assert "运行中 IMU 异常保持上一目标" in freertos
-    assert "moves[0].pulse_us = DRV_COAX_CTRL_SERVO_CENTER_US;" in freertos
-    assert "moves[1].pulse_us = DRV_COAX_CTRL_SERVO_CENTER_US;" in freertos
+    assert "moves[0].pulse_us = DRV_COAX_CTRL_SERVO_ALPHA_CENTER_US;" in freertos
+    assert "moves[1].pulse_us = DRV_COAX_CTRL_SERVO_BETA_CENTER_US;" in freertos
+
+
+def test_stabilizer_uses_boot_attitude_average_as_zero_point() -> None:
+    freertos = read("Core/Src/freertos.c")
+
+    assert "#define STABILIZER_ATTITUDE_ZERO_MS 1500U" in freertos
+    assert "float  roll_zero = 0.0f;" in freertos
+    assert "float  pitch_zero = 0.0f;" in freertos
+    assert "float  yaw_zero = 0.0f;" in freertos
+    assert "roll_zero_sum += roll;" in freertos
+    assert "pitch_zero_sum += pitch;" in freertos
+    assert "yaw_zero_sum += yaw;" in freertos
+    assert "roll_zero = roll_zero_sum / (float)attitude_zero_count;" in freertos
+    assert "pitch_zero = pitch_zero_sum / (float)attitude_zero_count;" in freertos
+    assert "yaw_zero = yaw_zero_sum / (float)attitude_zero_count;" in freertos
+    assert "roll_control = roll - roll_zero;" in freertos
+    assert "pitch_control = pitch - pitch_zero;" in freertos
+    assert "yaw_control = yaw - yaw_zero;" in freertos
+    assert "msg.roll_deg  = roll_control;" in freertos
+    assert "msg.pitch_deg = pitch_control;" in freertos
+    assert "msg.yaw_deg   = yaw_control;" in freertos
+    assert "(attitude_zero_ready != 0U)" in freertos
+    assert "attitude.roll_rad = roll_control * STABILIZER_DEG_TO_RAD;" in freertos
+    assert "attitude.pitch_rad = pitch_control * STABILIZER_DEG_TO_RAD;" in freertos
+    assert "attitude.yaw_rad = yaw_control * STABILIZER_DEG_TO_RAD;" in freertos
 
 
 def test_imu_spi_timeout_is_short_but_not_overly_aggressive() -> None:

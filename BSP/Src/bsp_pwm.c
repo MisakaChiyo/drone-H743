@@ -71,6 +71,26 @@ BSP_PWM_Status BSP_PWM_SetEscPulse(uint32_t channel, uint16_t pulse_us)
     return BSP_PWM_OK;
 }
 
+BSP_PWM_Status BSP_PWM_DisableEsc(uint32_t channel)
+{
+    uint32_t tim_channel = pwm_tim_channel(channel);
+
+    if ((channel == 0U) || (channel > BSP_PWM_ESC_CHANNEL_COUNT)) {
+        return BSP_PWM_INVALID_PARAM;
+    }
+
+    if (pwm_started == 0U) {
+        BSP_PWM_Status init_status = BSP_PWM_Init();
+        if (init_status != BSP_PWM_OK) {
+            return init_status;
+        }
+    }
+
+    esc_pulses_us[channel - 1U] = 0U;
+    __HAL_TIM_SET_COMPARE(&htim2, tim_channel, 0U);
+    return BSP_PWM_OK;
+}
+
 BSP_PWM_Status BSP_PWM_SetEscPercent(uint32_t channel, uint32_t percent)
 {
     if (percent > BSP_PWM_ESC_MAX_PERCENT) {

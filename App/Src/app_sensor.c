@@ -64,6 +64,13 @@ void APP_IMU_RawToScaled(const DRV_IMU_RawData *raw,
 #define APP_IMU_DEFAULT_DT_SEC            0.001f
 #define APP_IMU_MAX_DT_SEC                0.05f
 #define APP_IMU_RAD_TO_DEG        57.2957795f
+#define APP_IMU_ROLL_SIGN         (1.0f)
+#define APP_IMU_PITCH_SIGN        (-1.0f)
+#define APP_IMU_GYRO_ROLL_SIGN    (-1.0f)
+#define APP_IMU_GYRO_PITCH_SIGN   (1.0f)
+#define APP_IMU_GYRO_YAW_SIGN     (1.0f)//-1
+
+static APP_IMU_AttitudeDebug imu_attitude_debug;
 
 void APP_IMU_UpdateAttitude(const DRV_IMU_ScaledData *imu,
                             float *roll_deg,
@@ -83,24 +90,45 @@ void APP_IMU_UpdateAttitude(const DRV_IMU_ScaledData *imu,
     alpha = APP_IMU_ACCEL_CORRECTION_TAU_SEC /
             (APP_IMU_ACCEL_CORRECTION_TAU_SEC + dt_sec);
 
-    float roll_acc  = atan2f(imu->accel_y_g, imu->accel_z_g) * APP_IMU_RAD_TO_DEG;
-    float pitch_acc = atan2f(-imu->accel_x_g,
+    float roll_acc  = APP_IMU_ROLL_SIGN *
+                      atan2f(imu->accel_y_g, imu->accel_z_g) * APP_IMU_RAD_TO_DEG;
+    float pitch_acc = APP_IMU_PITCH_SIGN *
+                      atan2f(-imu->accel_x_g,
                              sqrtf(imu->accel_y_g * imu->accel_y_g +
                                    imu->accel_z_g * imu->accel_z_g)) * APP_IMU_RAD_TO_DEG;
+    float roll_gyro = *roll_deg +
+                      APP_IMU_GYRO_ROLL_SIGN * imu->gyro_x_dps * dt_sec;
+    float pitch_gyro = *pitch_deg +
+                       APP_IMU_GYRO_PITCH_SIGN * imu->gyro_y_dps * dt_sec;
 
     if (sample_count <= 1U) {
         *roll_deg  = roll_acc;
         *pitch_deg = pitch_acc;
+        roll_gyro = roll_acc;
+        pitch_gyro = pitch_acc;
     } else {
-        *roll_deg  = alpha * (*roll_deg  + imu->gyro_x_dps * dt_sec)
-                   + (1.0f - alpha) * roll_acc;
-        *pitch_deg = alpha * (*pitch_deg + imu->gyro_y_dps * dt_sec)
-                   + (1.0f - alpha) * pitch_acc;
-        *yaw_deg  += imu->gyro_z_dps * dt_sec;
+        *roll_deg  = alpha * roll_gyro + (1.0f - alpha) * roll_acc;
+        *pitch_deg = alpha * pitch_gyro + (1.0f - alpha) * pitch_acc;
+        *yaw_deg  += APP_IMU_GYRO_YAW_SIGN * imu->gyro_z_dps * dt_sec;
     }
+
+    imu_attitude_debug.roll_acc_deg = roll_acc;
+    imu_attitude_debug.pitch_acc_deg = pitch_acc;
+    imu_attitude_debug.roll_gyro_deg = roll_gyro;
+    imu_attitude_debug.pitch_gyro_deg = pitch_gyro;
+    imu_attitude_debug.roll_residual_deg = roll_acc - roll_gyro;
+    imu_attitude_debug.pitch_residual_deg = pitch_acc - pitch_gyro;
+    imu_attitude_debug.alpha = alpha;
+    imu_attitude_debug.dt_ms = dt_sec * 1000.0f;
 
     if (*yaw_deg > 180.0f)       *yaw_deg -= 360.0f;
     else if (*yaw_deg < -180.0f) *yaw_deg += 360.0f;
+}
+
+void APP_IMU_GetAttitudeDebug(APP_IMU_AttitudeDebug *debug)
+{
+    if (debug == NULL) return;
+    *debug = imu_attitude_debug;
 }
 
 /* ════════════════════════════════════════════════════════════════════════ */
@@ -302,21 +330,26 @@ float APP_SensorRateMeter_Update(APP_Sensor_RateMeter *meter,
 /* ════════════════════════════════════════════════════════════════════════ */
 /*  坐标系对齐（IMU 芯片坐标系 → 机体坐标系）                               */
 /*                                                                        */
-/*  默认直通（恒等变换）。调整 in→out 的映射关系来适配 IMU 安装方向。        */
+/*  当前飞控板安装方向：                                                    */
+/*    IMU +Y 朝飞机下方，IMU +Z 朝飞机前方，IMU +X 朝飞机左方。              */
+/*                                                                        */
+/*  机体系采用前右下约定（与当前互补滤波公式一致）：                          */
+/*    body X = 前，body Y = 右，body Z = 下。                                */
+/*                                                                        */
+/*  因此轴映射为：                                                           */
+/*    body X =  imu Z                                                       */
+/*    body Y = -imu X                                                       */
+/*    body Z =  imu Y                                                       */
+/*                                                                        */
+/*  加速度和陀螺仪都必须使用同一套刚体轴变换。                               */
 /* ════════════════════════════════════════════════════════════════════════ */
 
 void APP_Sensor_AlignToAirframe(const float in[3], float out[3])
 {
     if ((in == NULL) || (out == NULL)) return;
-    /* 直通：X→X, Y→Y, Z→Z */
-    out[0] =  in[0];
-    out[1] =  in[1];
-    out[2] =  in[2];
-    /* 示例：如果 IMU 绕 Z 轴转了 180°（倒装）：
-     *   out[0] = -in[0];
-     *   out[1] = -in[1];
-     *   out[2] =  in[2];
-     */
+    out[0] =  in[2];
+    out[1] = -in[0];
+    out[2] =  in[1];
 }
 
 /* ════════════════════════════════════════════════════════════════════════ */

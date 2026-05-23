@@ -25,3 +25,30 @@ def test_wifi_diag_escapes_transparent_mode_before_at_queries() -> None:
     assert 'aiwb2_provision_commands[6] = (APP_AiWB2Command){ "AT+SOCKETTT"' in app_aiwb2
     assert "aiwb2_state = APP_AIWB2_STATE_ESCAPE_BEFORE;" in app_aiwb2
     assert 'APP_AiWB2_SendRawCommand(commands[i])' not in app_aiwb2
+
+
+def test_usart1_wifi_udp_pid_tuning_path_is_text_line_based() -> None:
+    usart = read("Core/Src/usart.c")
+    app_uart = read("App/Src/app_uart.c")
+    app_aiwb2 = read("App/Src/app_aiwb2.c")
+    app_control = read("App/Src/app_control.c")
+    panel = read("tools/drone_tcp_panel.py")
+
+    assert "huart1.Init.Mode = UART_MODE_TX_RX;" in usart
+    assert "DMA_REQUEST_USART1_RX" in usart
+    assert "DMA_REQUEST_USART1_TX" in usart
+    assert "HAL_UARTEx_ReceiveToIdle_DMA(&huart1" in app_uart
+    assert "HAL_UART_Transmit_DMA(&huart1" in app_uart
+
+    assert 'strcmp(line, "PARAM?") == 0' in app_aiwb2
+    assert 'strcmp(line, "PID?") == 0' in app_aiwb2
+    assert 'aiwb2_starts_with(line, "PARAM ")' in app_aiwb2
+    assert 'aiwb2_starts_with(line, "PID ")' in app_aiwb2
+    assert "APP_Control_ProcessLine(normalized);" in app_uart
+    assert "DRV_COAX_CTRL_SetParam(kp_name, kp)" in app_control
+    assert "DRV_COAX_CTRL_SetParam(name, value)" in app_control
+
+    assert "class UdpTransport" in panel
+    assert 'values=("tcp", "udp", "serial")' in panel
+    assert "return self.send_line(text)" in panel
+    assert "self.structured_protocol_supported = False" in panel

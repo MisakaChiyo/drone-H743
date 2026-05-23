@@ -124,6 +124,7 @@
 #include "app_messages.h"
 #include "app_tasks.h"
 #include <math.h>
+#include <string.h>
 
 #include "app_vofa.h"
 #include "app_elrs.h"
@@ -171,15 +172,15 @@
  *   STABILIZER_USE_DIRECT_ANGLE_SERVO = 0 → 同轴控制器（Simulink 生成）
  *         经过完整的同轴倾转旋翼控制律，RC 遥控器参与参考输入。
  */
-#define STABILIZER_CONTROL_PERIOD_MS   20U      /* 控制输出周期 20ms = 50Hz            */
+#define STABILIZER_CONTROL_PERIOD_MS   2U       /* 控制输出周期 2ms = 500Hz            */
 #define STABILIZER_IMU_STALE_MS        50U      /* 超过此年龄后不再用旧姿态算新舵机   */
 #define STABILIZER_DEG_TO_RAD          0.0174532925f /* 度 → 弧度  (π/180)            */
 #define STABILIZER_USE_DIRECT_ANGLE_SERVO 0U     /* 1=角度直驱舵机, 0=同轴控制器       */
 #define STABILIZER_DIRECT_ALPHA_SIGN    (1.0f)   /* α 轴（俯仰→舵机1）方向符号         */
-#define STABILIZER_DIRECT_BETA_SIGN    (-1.0f)   /* β 轴（横滚→舵机2）方向符号         */
-#define STABILIZER_YAW_REF_LIMIT_RAD   0.34906585f /* 偏航参考限幅 ±20°               */
+#define STABILIZER_DIRECT_BETA_SIGN    (1.0f)   /* β 轴（横滚→舵机2）方向符号         */
+#define STABILIZER_YAW_REF_LIMIT_RAD   0.523599f /* 偏航参考限幅 ±30°               */
 #define STABILIZER_XY_REF_RANGE_M      1.20f     /* CH1/CH2 速度意图对应的虚拟 XY 参考 */
-#define STABILIZER_Z_REF_RANGE_M       0.25f     /* CH3 回中油门/升降参考范围 ±0.25m   */
+#define STABILIZER_Z_REF_RANGE_M       0.25f     /* CH3 单向油门/升降参考范围 0..0.25m  */
 #define STABILIZER_RC_DEADBAND_US      20        /* RC 摇杆死区 [μs]，中位 1500±20      */
 
 /*
@@ -190,13 +191,13 @@
  *
  *   CH1 → 左右 / roll stick      → 自稳定速度意图 / 控制器 y_ref，右为正，回中 0
  *   CH2 → 前后 / pitch stick     → 自稳定速度意图 / 控制器 x_ref，前为正，回中 0
- *   CH3 → 左摇杆上下，回中油门   → 控制器 z_ref，向上为正，回中 0
+ *   CH3 → 左摇杆上下，单向油门   → 控制器 z_ref，最低为 0，最高为正
  *   CH4 → 偏航 / yaw stick       → 控制器 yaw_ref，右偏航为正，回中 0
  *   CH5 → 二值开关 / arm switch  → +100=开锁，-100=关锁
  *
  * CRSF 驱动输出的是 16 路 us 值，数组下标从 0 开始，所以 CH1 对应 ch[0]。
  * CH5 用阈值判断：>1500us 视为开锁，<=1500us 视为上锁。
- * 由于 CH3 是回中油门，不使用“油门最低才能开锁”的传统单向油门规则。
+ * 解锁还必须满足 CH3 低油门：CH3 <=1100us。防止开关误触后电机带油门启动。
  */
 #define STABILIZER_RC_CH_ROLL          0U
 #define STABILIZER_RC_CH_PITCH         1U
@@ -204,6 +205,15 @@
 #define STABILIZER_RC_CH_YAW           3U
 #define STABILIZER_RC_CH_ARM           4U
 #define STABILIZER_RC_ARM_THRESHOLD_US 1500U
+#define STABILIZER_RC_THROTTLE_INPUT_LOW_US  1000U
+#define STABILIZER_RC_THROTTLE_INPUT_HIGH_US 2000U
+#define STABILIZER_RC_THROTTLE_ARM_LOW_US    1100U
+#define STABILIZER_RC_STABILIZE_MIN_PERCENT 20U
+#define STABILIZER_RC_STABILIZE_MIN_US \
+  (STABILIZER_RC_THROTTLE_INPUT_LOW_US + \
+   (((STABILIZER_RC_THROTTLE_INPUT_HIGH_US - STABILIZER_RC_THROTTLE_INPUT_LOW_US) * \
+     STABILIZER_RC_STABILIZE_MIN_PERCENT) / 100U))
+#define STABILIZER_RC_LOSS_TIMEOUT_MS  150U
 #define STABILIZER_USE_RC_DIRECT_TILT_SERVO 0U   /* 0=自稳定控制器, 1=CH1/CH2 直控舵机调试 */
 #define STABILIZER_RC_DIRECT_TILT_LIMIT_RAD 0.261799395f /* 遥控直控调试最大 ±15° */
 
@@ -217,7 +227,7 @@
 #define STABILIZER_SERVO_MOVE_TIME_MS  0U        /* 舵机到位时间 [ms]，0 表示尽快到位     */
 #define STABILIZER_SERVO_REFRESH_MS    500U      /* 强制刷新间隔 [ms]（即使脉宽未变）    */
 #define STABILIZER_SERVO_DELTA_US      3U        /* 脉宽变化死区 [μs]（小于此值不发送）  */
-#define VOFA_SEND_PERIOD_MS            200U      /* VOFA 诊断输出周期，降低 WiFi/UART 负载 */
+#define VOFA_SEND_PERIOD_MS            20U       /* VOFA 姿态诊断输出周期 20ms = 50Hz */
 
 /* USER CODE END PD */
 
@@ -255,6 +265,9 @@ static volatile StabilizerImuFaultReason stabilizer_imu_fault_reason =
   STABILIZER_IMU_FAULT_NONE;
 static volatile uint32_t stabilizer_imu_fault_count = 0U;
 static volatile uint32_t stabilizer_imu_last_sample_ms = 0U;
+static uint8_t stabilizer_rc_arm_latched = 0U;
+static uint8_t stabilizer_rc_switch_seen_low = 0U;
+static uint8_t stabilizer_rc_switch_prev_high = 0U;
 
 static void stabilizer_latch_imu_fault(StabilizerImuFaultReason reason)
 {
@@ -299,9 +312,87 @@ static float stabilizer_rc_normalized(uint16_t ch_us)
   return (float)centered / 500.0f;
 }
 
-static uint8_t stabilizer_rc_is_armed(const uint16_t ch[CRSF_CHANNEL_COUNT])
+static float stabilizer_rc_throttle_01(uint16_t ch_us)
 {
-  return (ch[STABILIZER_RC_CH_ARM] > STABILIZER_RC_ARM_THRESHOLD_US) ? 1U : 0U;
+  const int32_t span =
+    (int32_t)STABILIZER_RC_THROTTLE_INPUT_HIGH_US -
+    (int32_t)STABILIZER_RC_THROTTLE_INPUT_LOW_US;
+  int32_t value = (int32_t)ch_us - (int32_t)STABILIZER_RC_THROTTLE_INPUT_LOW_US;
+
+  if (value < 0) { value = 0; }
+  if (value > span) { value = span; }
+
+  return (float)value / (float)span;
+}
+
+static uint16_t stabilizer_motor_pulse_clamp(int32_t pulse_us)
+{
+  if (pulse_us < (int32_t)BSP_PWM_ESC_MIN_US) {
+    return BSP_PWM_ESC_MIN_US;
+  }
+  if (pulse_us > (int32_t)BSP_PWM_ESC_MAX_US) {
+    return BSP_PWM_ESC_MAX_US;
+  }
+  return (uint16_t)pulse_us;
+}
+
+static uint16_t stabilizer_rc_throttle_to_motor_pulse(uint16_t ch_us)
+{
+  float throttle_01 = stabilizer_rc_throttle_01(ch_us);
+  float pulse_f = (float)BSP_PWM_ESC_MIN_US +
+                  throttle_01 * (float)(BSP_PWM_ESC_MAX_US - BSP_PWM_ESC_MIN_US);
+  int32_t pulse_i = (int32_t)(pulse_f + 0.5f);
+
+  return stabilizer_motor_pulse_clamp(pulse_i);
+}
+
+static uint8_t stabilizer_rc_use_stabilized_motor_mix(uint16_t ch_us)
+{
+  return (ch_us >= STABILIZER_RC_STABILIZE_MIN_US) ? 1U : 0U;
+}
+
+static uint16_t stabilizer_mix_rc_base_with_ctrl(uint16_t rc_base_us,
+                                                 uint16_t ctrl_us,
+                                                 uint16_t ctrl_avg_us)
+{
+  int32_t pulse_us =
+    (int32_t)rc_base_us + (int32_t)ctrl_us - (int32_t)ctrl_avg_us;
+
+  return stabilizer_motor_pulse_clamp(pulse_us);
+}
+
+static uint8_t stabilizer_rc_update_armed(const uint16_t ch[CRSF_CHANNEL_COUNT],
+                                          uint8_t rc_link_ok)
+{
+  uint8_t switch_high =
+    (ch[STABILIZER_RC_CH_ARM] > STABILIZER_RC_ARM_THRESHOLD_US) ? 1U : 0U;
+  uint8_t throttle_low =
+    (ch[STABILIZER_RC_CH_THROTTLE_Z] <= STABILIZER_RC_THROTTLE_ARM_LOW_US) ? 1U : 0U;
+
+  if (rc_link_ok == 0U) {
+    stabilizer_rc_arm_latched = 0U;
+    stabilizer_rc_switch_seen_low = 0U;
+    stabilizer_rc_switch_prev_high = 0U;
+    return 0U;
+  }
+
+  if (switch_high == 0U) {
+    stabilizer_rc_arm_latched = 0U;
+    stabilizer_rc_switch_seen_low = 1U;
+    stabilizer_rc_switch_prev_high = 0U;
+    return 0U;
+  }
+
+  /* Arm only on a low-to-high switch edge while throttle is low. */
+  if ((stabilizer_rc_arm_latched == 0U) &&
+      (stabilizer_rc_switch_seen_low != 0U) &&
+      (stabilizer_rc_switch_prev_high == 0U) &&
+      (throttle_low != 0U)) {
+    stabilizer_rc_arm_latched = 1U;
+  }
+
+  stabilizer_rc_switch_prev_high = 1U;
+  return stabilizer_rc_arm_latched;
 }
 
 #if (STABILIZER_USE_RC_DIRECT_TILT_SERVO != 0U)
@@ -315,8 +406,8 @@ static void stabilizer_map_rc_direct_to_servo(const uint16_t ch[CRSF_CHANNEL_COU
                    STABILIZER_RC_DIRECT_TILT_LIMIT_RAD *
                    STABILIZER_DIRECT_BETA_SIGN;
 
-  moves[0].pulse_us = DRV_COAX_CTRL_TiltRadToServoPulse(alpha_rad);
-  moves[1].pulse_us = DRV_COAX_CTRL_TiltRadToServoPulse(beta_rad);
+  moves[0].pulse_us = DRV_COAX_CTRL_AlphaTiltRadToServoPulse(alpha_rad);
+  moves[1].pulse_us = DRV_COAX_CTRL_BetaTiltRadToServoPulse(beta_rad);
 }
 #endif
 #endif
@@ -337,8 +428,8 @@ static void stabilizer_map_angle_direct_to_servo(float roll_deg,
   float direct_beta_rad = roll_deg * STABILIZER_DEG_TO_RAD *
                           STABILIZER_DIRECT_BETA_SIGN;
 
-  moves[0].pulse_us = DRV_COAX_CTRL_TiltRadToServoPulse(direct_alpha_rad);
-  moves[1].pulse_us = DRV_COAX_CTRL_TiltRadToServoPulse(direct_beta_rad);
+  moves[0].pulse_us = DRV_COAX_CTRL_AlphaTiltRadToServoPulse(direct_alpha_rad);
+  moves[1].pulse_us = DRV_COAX_CTRL_BetaTiltRadToServoPulse(direct_beta_rad);
 }
 #endif
 
@@ -350,12 +441,12 @@ static void stabilizer_map_angle_direct_to_servo(float roll_deg,
  *   目的：避免在脉宽几乎不变时反复占用舵机总线
  */
 static volatile uint16_t stabilizer_latest_servo_target_us[2] = {
-  DRV_COAX_CTRL_SERVO_CENTER_US,
-  DRV_COAX_CTRL_SERVO_CENTER_US,
+  DRV_COAX_CTRL_SERVO_ALPHA_CENTER_US,
+  DRV_COAX_CTRL_SERVO_BETA_CENTER_US,
 };
 static volatile uint16_t stabilizer_last_sent_servo_pulse_us[2] = {
-  DRV_COAX_CTRL_SERVO_CENTER_US,
-  DRV_COAX_CTRL_SERVO_CENTER_US,
+  DRV_COAX_CTRL_SERVO_ALPHA_CENTER_US,
+  DRV_COAX_CTRL_SERVO_BETA_CENTER_US,
 };
 static uint32_t stabilizer_last_servo_send_ms;
 
@@ -696,9 +787,11 @@ void MX_FREERTOS_Init(void) {
   *   模式 A (USE_DIRECT_ANGLE_SERVO=1)：姿态角直接映射为舵机脉宽
   *   模式 B (USE_DIRECT_ANGLE_SERVO=0)：经过 Simulink 生成的同轴控制器
   *
-  * 注意：电调当前固定输出最小油门（BSP_PWM_ESC_MIN_US），处于安全锁定状态。
+  * 注意：未满足安全条件时断开电调 PWM 输出（CCR=0）。
   */
 /* USER CODE END Header_StabilizerTask */
+#define STABILIZER_ATTITUDE_ZERO_MS 1500U
+
 void StabilizerTask(void *argument)
 {
   /* init code for USB_DEVICE */
@@ -709,6 +802,18 @@ void StabilizerTask(void *argument)
   float  roll  = 0.0f;                /* 当前横滚角 [度]                       */
   float  pitch = 0.0f;                /* 当前俯仰角 [度]                       */
   float  yaw   = 0.0f;                /* 当前偏航角 [度]                       */
+  float  roll_zero = 0.0f;
+  float  pitch_zero = 0.0f;
+  float  yaw_zero = 0.0f;
+  float  roll_control = 0.0f;
+  float  pitch_control = 0.0f;
+  float  yaw_control = 0.0f;
+  float  roll_zero_sum = 0.0f;
+  float  pitch_zero_sum = 0.0f;
+  float  yaw_zero_sum = 0.0f;
+  uint32_t attitude_zero_count = 0U;
+  uint32_t attitude_zero_start_ms = 0U;
+  uint8_t attitude_zero_ready = 0U;
 #if (STABILIZER_USE_FIXED_IMU_DT == 0U)
   uint64_t last_imu_timestamp_us = 0ULL; /* 上一帧 IMU 时间戳（用于计算 dt）   */
 #endif
@@ -753,16 +858,51 @@ void StabilizerTask(void *argument)
        */
       APP_IMU_UpdateAttitude(&msg.imu, &roll, &pitch, &yaw,
                              dt_sec, stabilizer_seq);
+      APP_IMU_GetAttitudeDebug(&msg.attitude_debug);
       has_imu_sample = 1U;
+
+      if (attitude_zero_start_ms == 0U) {
+        attitude_zero_start_ms = HAL_GetTick();
+      }
+
+      if (attitude_zero_ready == 0U) {
+        roll_zero_sum += roll;
+        pitch_zero_sum += pitch;
+        yaw_zero_sum += yaw;
+        ++attitude_zero_count;
+
+        if (((HAL_GetTick() - attitude_zero_start_ms) >= STABILIZER_ATTITUDE_ZERO_MS) &&
+            (attitude_zero_count > 0U)) {
+          roll_zero = roll_zero_sum / (float)attitude_zero_count;
+          pitch_zero = pitch_zero_sum / (float)attitude_zero_count;
+          yaw_zero = yaw_zero_sum / (float)attitude_zero_count;
+          attitude_zero_ready = 1U;
+        }
+      }
+
+      if (attitude_zero_ready != 0U) {
+        roll_control = roll - roll_zero;
+        pitch_control = pitch - pitch_zero;
+        yaw_control = yaw - yaw_zero;
+        if (yaw_control > 180.0f) {
+          yaw_control -= 360.0f;
+        } else if (yaw_control < -180.0f) {
+          yaw_control += 360.0f;
+        }
+      } else {
+        roll_control = 0.0f;
+        pitch_control = 0.0f;
+        yaw_control = 0.0f;
+      }
 
       /*
        * ② 写入 VOFA 日志队列（覆盖模式）
        * vofaLogQueue 深度为 1，如果队列满则丢弃旧数据再写入新数据。
        * VOFA_task 以 50Hz 频率从此队列读取并发送到上位机。
        */
-      msg.roll_deg  = roll;
-      msg.pitch_deg = pitch;
-      msg.yaw_deg   = yaw;
+      msg.roll_deg  = roll_control;
+      msg.pitch_deg = pitch_control;
+      msg.yaw_deg   = yaw_control;
 
       if (osMessageQueuePut(vofaLogQueueHandle, &msg, 0U, 0U) != osOK) {
         APP_Sensor_SampleMessage drop;
@@ -787,6 +927,10 @@ void StabilizerTask(void *argument)
 #endif
         DRV_COAX_CTRL_Output ctrl_out;
         uint8_t rc_armed = 0U;
+        uint8_t rc_link_ok = 0U;
+        uint8_t rc_link_seen = 0U;
+        uint16_t rc_throttle_motor_us = BSP_PWM_ESC_MIN_US;
+        uint8_t rc_use_stabilized_motor_mix = 0U;
 #endif
         DRV_SERVO_MoveCmd moves[2];     /* [0]=舵机1(α/pitch), [1]=舵机2(β/roll) */
         uint8_t imu_control_valid = 0U;
@@ -795,7 +939,13 @@ void StabilizerTask(void *argument)
 
 #if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
         APP_ELRS_GetChannels(ch);       /* 读取 ELRS 遥控器 16 通道             */
-        rc_armed = stabilizer_rc_is_armed(ch);
+        rc_link_ok = APP_ELRS_IsRcFresh(now, STABILIZER_RC_LOSS_TIMEOUT_MS);
+        rc_link_seen = (APP_ELRS_GetLastRcMs() != 0U) ? 1U : 0U;
+        rc_armed = stabilizer_rc_update_armed(ch, rc_link_ok);
+        rc_throttle_motor_us =
+          stabilizer_rc_throttle_to_motor_pulse(ch[STABILIZER_RC_CH_THROTTLE_Z]);
+        rc_use_stabilized_motor_mix =
+          stabilizer_rc_use_stabilized_motor_mix(ch[STABILIZER_RC_CH_THROTTLE_Z]);
 #endif
         BSP_AiWB2_UpdateButton();       /* 更新 WiFi 模块按键状态                */
 
@@ -806,6 +956,7 @@ void StabilizerTask(void *argument)
         moves[1].pulse_us = stabilizer_latest_servo_target_us[1];
 
         if ((has_imu_sample != 0U) &&
+            (attitude_zero_ready != 0U) &&
             ((now - stabilizer_imu_last_sample_ms) <= STABILIZER_IMU_STALE_MS)) {
           imu_control_valid = 1U;
         }
@@ -817,7 +968,7 @@ void StabilizerTask(void *argument)
            *   pitch → alpha → 舵机1
            *   roll  → beta  → 舵机2
            */
-          stabilizer_map_angle_direct_to_servo(roll, pitch, moves);
+          stabilizer_map_angle_direct_to_servo(roll_control, pitch_control, moves);
 #else
           /*
            * 模式 B：同轴控制器（Simulink 代码生成）
@@ -834,9 +985,9 @@ void StabilizerTask(void *argument)
           ctrl_out.omega_upper = 0.0f;
           ctrl_out.omega_lower = 0.0f;
 #else
-          attitude.roll_rad = roll * STABILIZER_DEG_TO_RAD;
-          attitude.pitch_rad = pitch * STABILIZER_DEG_TO_RAD;
-          attitude.yaw_rad = yaw * STABILIZER_DEG_TO_RAD;
+          attitude.roll_rad = roll_control * STABILIZER_DEG_TO_RAD;
+          attitude.pitch_rad = pitch_control * STABILIZER_DEG_TO_RAD;
+          attitude.yaw_rad = yaw_control * STABILIZER_DEG_TO_RAD;
           attitude.gyro_x_rad_s = msg.imu.gyro_x_dps * STABILIZER_DEG_TO_RAD;
           attitude.gyro_y_rad_s = msg.imu.gyro_y_dps * STABILIZER_DEG_TO_RAD;
           attitude.gyro_z_rad_s = msg.imu.gyro_z_dps * STABILIZER_DEG_TO_RAD;
@@ -845,7 +996,7 @@ void StabilizerTask(void *argument)
                           STABILIZER_XY_REF_RANGE_M;
           reference.y_m = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_ROLL]) *
                           STABILIZER_XY_REF_RANGE_M;
-          reference.z_m = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_THROTTLE_Z]) *
+          reference.z_m = stabilizer_rc_throttle_01(ch[STABILIZER_RC_CH_THROTTLE_Z]) *
                           STABILIZER_Z_REF_RANGE_M;
           reference.yaw_rad = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_YAW]) *
                               STABILIZER_YAW_REF_LIMIT_RAD;
@@ -858,8 +1009,8 @@ void StabilizerTask(void *argument)
 #endif
         } else if (has_imu_sample == 0U) {
           /* 上电尚无有效姿态时才使用中位；运行中 IMU 异常保持上一目标。 */
-          moves[0].pulse_us = DRV_COAX_CTRL_SERVO_CENTER_US;
-          moves[1].pulse_us = DRV_COAX_CTRL_SERVO_CENTER_US;
+          moves[0].pulse_us = DRV_COAX_CTRL_SERVO_ALPHA_CENTER_US;
+          moves[1].pulse_us = DRV_COAX_CTRL_SERVO_BETA_CENTER_US;
         }
 
         stabilizer_servo_record_target(moves);
@@ -873,14 +1024,36 @@ void StabilizerTask(void *argument)
         }
 
 #if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
-        if ((rc_armed != 0U) && (imu_control_valid != 0U)) {
-          BSP_PWM_SetEscPulse(1, DRV_COAX_CTRL_OmegaToMotorPulse(ctrl_out.omega_upper));
-          BSP_PWM_SetEscPulse(2, DRV_COAX_CTRL_OmegaToMotorPulse(ctrl_out.omega_lower));
+        if ((rc_link_ok != 0U) && (rc_armed != 0U)) {
+          if ((rc_use_stabilized_motor_mix != 0U) &&
+              (imu_control_valid != 0U)) {
+            uint16_t ctrl_upper_us =
+              DRV_COAX_CTRL_OmegaToMotorPulse(ctrl_out.omega_upper);
+            uint16_t ctrl_lower_us =
+              DRV_COAX_CTRL_OmegaToMotorPulse(ctrl_out.omega_lower);
+            uint16_t ctrl_avg_us =
+              (uint16_t)(((uint32_t)ctrl_upper_us + (uint32_t)ctrl_lower_us) / 2U);
+
+            BSP_PWM_SetEscPulse(1,
+                                stabilizer_mix_rc_base_with_ctrl(rc_throttle_motor_us,
+                                                                 ctrl_upper_us,
+                                                                 ctrl_avg_us));
+            BSP_PWM_SetEscPulse(2,
+                                stabilizer_mix_rc_base_with_ctrl(rc_throttle_motor_us,
+                                                                 ctrl_lower_us,
+                                                                 ctrl_avg_us));
+          } else {
+            BSP_PWM_SetEscPulse(1, rc_throttle_motor_us);
+            BSP_PWM_SetEscPulse(2, rc_throttle_motor_us);
+          }
+        } else if ((rc_link_ok != 0U) || (rc_link_seen == 0U)) {
+          BSP_PWM_SetEscPulse(1, BSP_PWM_ESC_MIN_US);
+          BSP_PWM_SetEscPulse(2, BSP_PWM_ESC_MIN_US);
         } else
 #endif
         {
-          BSP_PWM_SetEscPulse(1, BSP_PWM_ESC_MIN_US);
-          BSP_PWM_SetEscPulse(2, BSP_PWM_ESC_MIN_US);
+          BSP_PWM_DisableEsc(1);
+          BSP_PWM_DisableEsc(2);
         }
       }
     }
@@ -941,6 +1114,8 @@ void Sensor_Task(void *argument)
   /* 陀螺仪零偏校准状态 */
   APP_Sensor_GyroBias gyro_bias = {0};
   APP_Sensor_RateMeter imu_rate_meter = {0}; /* IMU 实际采样率统计              */
+  APP_Sensor_RateMeter imu_irq_rate_meter = {0};
+  APP_Sensor_RateMeter imu_poll_rate_meter = {0};
 
   /*
    * 低通滤波器：陀螺 80Hz，加速度 30Hz
@@ -1102,6 +1277,14 @@ void Sensor_Task(void *argument)
     msg.imu_sample_rate_hz   = APP_SensorRateMeter_Update(&imu_rate_meter,
                                                           msg.base.timestamp_us,
                                                           sample_count);
+    msg.imu_irq_sample_rate_hz  = APP_SensorRateMeter_Update(&imu_irq_rate_meter,
+                                                              msg.base.timestamp_us,
+                                                              imu_irq_ready_count);
+    msg.imu_poll_sample_rate_hz = APP_SensorRateMeter_Update(&imu_poll_rate_meter,
+                                                              msg.base.timestamp_us,
+                                                              imu_poll_ready_count);
+    msg.imu_age_ms = 0.0f;
+    memset(&msg.attitude_debug, 0, sizeof(msg.attitude_debug));
     msg.imu_data_ready_count = imu_irq_ready_count;
     msg.imu_poll_ready_count = imu_poll_ready_count;
 
@@ -1237,7 +1420,7 @@ void BackgroundTask(void *argument)
   *   从 vofaLogQueue 取出姿态/传感器数据，按固定格式打包后
   *   通过 WiFi 透传发送到 VOFA 上位机进行实时可视化。
   *
-  * 发送数据帧（11 个 float，44 字节）：
+  * 发送数据帧（22 个 float，88 字节）：
   *   [0]  roll      横滚角 [°]
   *   [1]  pitch     俯仰角 [°]
   *   [2]  yaw       偏航角 [°]
@@ -1249,6 +1432,17 @@ void BackgroundTask(void *argument)
   *   [8]  gy        陀螺仪 Y [dps]
   *   [9]  gz        陀螺仪 Z [dps]
   *   [10] time      时间戳 [s]
+  *   [11] imu_irq_hz  IMU 中断触发采样 Hz
+  *   [12] imu_poll_hz IMU ready 轮询兜底 Hz
+  *   [13] imu_age_ms  当前 VOFA 帧使用的 IMU 样本年龄 [ms]
+  *   [14] roll_acc    加速度瞬时 roll [deg]
+  *   [15] pitch_acc   加速度瞬时 pitch [deg]
+  *   [16] roll_gyro   本帧陀螺积分预测 roll [deg]
+  *   [17] pitch_gyro  本帧陀螺积分预测 pitch [deg]
+  *   [18] roll_res    roll_acc - roll_gyro [deg]
+  *   [19] pitch_res   pitch_acc - pitch_gyro [deg]
+  *   [20] cf_alpha    互补滤波陀螺权重
+  *   [21] att_dt_ms   姿态更新 dt [ms]
   *
   * 高度计算：
   *   开机后前 50 帧（≈1 秒 @ 50Hz）累积气压计数据求均值
@@ -1266,7 +1460,7 @@ void VOFA_task(void *argument)
   /* USER CODE BEGIN VOFA_task */
 
   APP_Sensor_SampleMessage msg;
-  #define VOFA_DATA_SIZE 11U
+  #define VOFA_DATA_SIZE 22U
   float vofa_data[VOFA_DATA_SIZE];
 
   /* 地面气压平均 */
@@ -1325,9 +1519,22 @@ void VOFA_task(void *argument)
       vofa_data[9] = msg.imu.gyro_z_dps;
 
       /* 时间戳 [s]（微秒硬件计数器 → 秒） */
-      vofa_data[10] = (float)(SVC_Timestamp_Us() / 1000ULL) * 0.001f;
+      uint64_t now_us = SVC_Timestamp_Us();
+      msg.imu_age_ms = (float)(now_us - msg.base.timestamp_us) * 0.001f;
+      vofa_data[10] = (float)(now_us / 1000ULL) * 0.001f;
+      vofa_data[11] = msg.imu_irq_sample_rate_hz;
+      vofa_data[12] = msg.imu_poll_sample_rate_hz;
+      vofa_data[13] = msg.imu_age_ms;
+      vofa_data[14] = msg.attitude_debug.roll_acc_deg;
+      vofa_data[15] = msg.attitude_debug.pitch_acc_deg;
+      vofa_data[16] = msg.attitude_debug.roll_gyro_deg;
+      vofa_data[17] = msg.attitude_debug.pitch_gyro_deg;
+      vofa_data[18] = msg.attitude_debug.roll_residual_deg;
+      vofa_data[19] = msg.attitude_debug.pitch_residual_deg;
+      vofa_data[20] = msg.attitude_debug.alpha;
+      vofa_data[21] = msg.attitude_debug.dt_ms;
 
-      /* 发送：11 个 float → 44 字节二进制帧 → WiFi 透传 → 上位机 */
+      /* 发送：22 个 float -> 88 字节二进制帧 -> WiFi 透传 -> 上位机 */
       APP_VOFA_SendFloats(vofa_data, VOFA_DATA_SIZE);
     }
   }

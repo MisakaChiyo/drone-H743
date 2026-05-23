@@ -17,10 +17,10 @@ def test_stabilizer_uses_nonblocking_servo_dma_path() -> None:
     assert "stabilizer_servo_record_target(moves);" in freertos
     assert "STABILIZER_SERVO_REFRESH_MS" in freertos
     assert "STABILIZER_SERVO_DELTA_US" in freertos
-    assert "#define STABILIZER_CONTROL_PERIOD_MS   20U" in freertos
+    assert "#define STABILIZER_CONTROL_PERIOD_MS   2U" in freertos
     assert "#define STABILIZER_SERVO_MOVE_TIME_MS  0U" in freertos
     assert "#define STABILIZER_SERVO_REFRESH_MS    500U" in freertos
-    assert "#define VOFA_SEND_PERIOD_MS            200U" in freertos
+    assert "#define VOFA_SEND_PERIOD_MS            20U" in freertos
     assert "stabilizer_servo_commit_sent(moves, now);" in freertos
     assert "== DRV_SERVO_OK" in freertos
 
@@ -32,8 +32,8 @@ def test_stabilizer_keeps_direct_servo_debug_switch_with_controller_path() -> No
     assert "static void stabilizer_map_angle_direct_to_servo" in freertos
     assert "float direct_alpha_rad = pitch_deg * STABILIZER_DEG_TO_RAD *" in freertos
     assert "float direct_beta_rad = roll_deg * STABILIZER_DEG_TO_RAD *" in freertos
-    assert "moves[0].pulse_us = DRV_COAX_CTRL_TiltRadToServoPulse(direct_alpha_rad);" in freertos
-    assert "moves[1].pulse_us = DRV_COAX_CTRL_TiltRadToServoPulse(direct_beta_rad);" in freertos
+    assert "moves[0].pulse_us = DRV_COAX_CTRL_AlphaTiltRadToServoPulse(direct_alpha_rad);" in freertos
+    assert "moves[1].pulse_us = DRV_COAX_CTRL_BetaTiltRadToServoPulse(direct_beta_rad);" in freertos
     assert "DRV_COAX_CTRL_Run(&attitude, &reference, &ctrl_out);" in freertos
     assert "moves[0].pulse_us = ctrl_out.servo_alpha_us;" in freertos
     assert "moves[1].pulse_us = ctrl_out.servo_beta_us;" in freertos
@@ -82,11 +82,14 @@ def test_uart_callbacks_route_uart7_to_servo_dma_diagnostics() -> None:
 def test_vofa_stream_sends_only_runtime_flight_channels() -> None:
     freertos = read("Core/Src/freertos.c")
 
-    assert "#define VOFA_DATA_SIZE 11U" in freertos
+    assert "#define VOFA_DATA_SIZE 22U" in freertos
     assert "DRV_SERVO_Diag servo_diag;" not in freertos
     assert "BSP_BusServo_GetDiag(&servo_diag);" not in freertos
-    assert "vofa_data[10] = (float)(SVC_Timestamp_Us() / 1000ULL) * 0.001f;" in freertos
-    assert "vofa_data[11]" not in freertos
+    assert "vofa_data[10] = (float)(now_us / 1000ULL) * 0.001f;" in freertos
+    assert "vofa_data[11] = msg.imu_irq_sample_rate_hz;" in freertos
+    assert "vofa_data[12] = msg.imu_poll_sample_rate_hz;" in freertos
+    assert "vofa_data[13] = msg.imu_age_ms;" in freertos
+    assert "vofa_data[21] = msg.attitude_debug.dt_ms;" in freertos
     assert "osDelay(VOFA_SEND_PERIOD_MS);" in freertos
 
 

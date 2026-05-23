@@ -142,7 +142,9 @@ void APP_ELRS_Step(void)
     uint16_t write_pos = DmaWritePos();
 
     while (dma_rx_pos != write_pos) {
-        DRV_ELRS_ProcessByte(dma_rx_buf[dma_rx_pos]);
+        if (DRV_ELRS_ProcessByte(dma_rx_buf[dma_rx_pos]) != 0U) {
+            DRV_ELRS_MarkRcFrameTime(HAL_GetTick());
+        }
         dma_rx_pos++;
         if (dma_rx_pos >= APP_ELRS_DMA_RX_SIZE)
             dma_rx_pos = 0U;
@@ -165,6 +167,16 @@ void APP_ELRS_Step(void)
 void APP_ELRS_GetChannels(uint16_t us_out[CRSF_CHANNEL_COUNT])
 {
     DRV_ELRS_GetChannels(NULL, us_out);
+}
+
+uint32_t APP_ELRS_GetLastRcMs(void)
+{
+    return DRV_ELRS_GetLastRcMs();
+}
+
+uint8_t APP_ELRS_IsRcFresh(uint32_t now_ms, uint32_t timeout_ms)
+{
+    return DRV_ELRS_IsRcFresh(now_ms, timeout_ms);
 }
 
 /* ---- telemetry ---- */

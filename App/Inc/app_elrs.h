@@ -20,6 +20,8 @@ void APP_ELRS_Step(void);
 
 /* RC 通道值，us 范围 [800, 2200] */
 void APP_ELRS_GetChannels(uint16_t us_out[CRSF_CHANNEL_COUNT]);
+uint32_t APP_ELRS_GetLastRcMs(void);
+uint8_t APP_ELRS_IsRcFresh(uint32_t now_ms, uint32_t timeout_ms);
 
 /* ---- 遥测发送（非阻塞 DMA）---- */
 
