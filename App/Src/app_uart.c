@@ -35,11 +35,20 @@
 #define APP_UART_EVENT_KICK   0x00000004U
 #define APP_UART_EVENT_ERROR  0x00000008U
 #define APP_UART_WAIT_MS      20U
+#define APP_UART_SOCKET_SEND_PROMPT_TIMEOUT_MS 200U
+#define APP_UART_SOCKET_SEND_RESULT_TIMEOUT_MS 1000U
 
 __attribute__((section(".dma_buffer"), aligned(32)))
 static uint8_t app_uart_dma_rx_buffer[APP_UART_DMA_RX_SIZE];
 __attribute__((section(".dma_buffer"), aligned(32)))
 static uint8_t app_uart_tx_frame_buffer[APP_UART_TX_TEXT_SIZE + 16U];
+
+typedef enum {
+    APP_UART_SOCKET_TX_IDLE = 0,
+    APP_UART_SOCKET_TX_WAIT_PROMPT,
+    APP_UART_SOCKET_TX_WAIT_PAYLOAD_DMA,
+    APP_UART_SOCKET_TX_WAIT_RESULT
+} APP_UART_SocketTxState;
 
 static char app_uart_rx_line[APP_UART_RX_LINE_SIZE];
 static APP_UART_TxMessage app_uart_tx_pending_message;
@@ -65,11 +74,15 @@ static volatile uint8_t app_uart_it_rx_ready;
 static volatile uint16_t app_uart_it_rx_size;
 static volatile uint8_t app_uart_tx_busy;
 static uint8_t app_uart_tx_pending_valid;
+static APP_UART_SocketTxState app_uart_socket_tx_state;
+static uint16_t app_uart_socket_payload_length;
+static uint32_t app_uart_socket_deadline_ms;
 
 static char *app_uart_normalize_line(char *line, uint16_t length);
 static void app_uart_ensure_control_ready(void);
 static uint8_t app_uart_rx_dma_needs_restart(void);
 static void app_uart_sync_tx_state(void);
+static void app_uart_socket_tx_reset(void);
 
 static void app_uart_invalidate_rx_dma_buffer(void)
 {
@@ -92,6 +105,16 @@ static void app_uart_signal(uint32_t flags)
 static uint8_t app_uart_time_reached(uint32_t now_ms, uint32_t deadline_ms)
 {
     return ((int32_t)(now_ms - deadline_ms) >= 0) ? 1U : 0U;
+}
+
+static void app_uart_socket_tx_reset(void)
+{
+    app_uart_socket_tx_state = APP_UART_SOCKET_TX_IDLE;
+    app_uart_socket_payload_length = 0U;
+    app_uart_socket_deadline_ms = 0U;
+    app_uart_tx_busy = 0U;
+    (void)APP_AiWB2_TakeSocketSendPrompt();
+    (void)APP_AiWB2_TakeSocketSendResult();
 }
 
 static void app_uart_prepare_tx_dma(void)
@@ -338,6 +361,7 @@ void APP_UART_Task_Init(void)
     app_uart_it_rx_size = 0U;
     app_uart_tx_busy = 0U;
     app_uart_tx_pending_valid = 0U;
+    app_uart_socket_tx_reset();
 #if (APP_UART_BOOT_DIAG_ENABLED != 0U)
     (void)BSP_UART_Transmit_USART1((const uint8_t *)boot_text,
                                    (uint16_t)(sizeof(boot_text) - 1U),
@@ -362,11 +386,13 @@ static void app_uart_ensure_control_ready(void)
     }
 
 #if (APP_UART_DIRECT_CONTROL_ENABLED == 0U)
-    if (APP_AiWB2_IsTransparent() == 0U) {
+    if ((APP_AiWB2_IsTransparent() == 0U) &&
+        (APP_AiWB2_GetState() != APP_AIWB2_STATE_SOCKET_READY)) {
         return;
     }
 #elif (APP_UART_TX_WAIT_FOR_TRANSPARENT != 0U)
-    if (APP_AiWB2_IsTransparent() == 0U) {
+    if ((APP_AiWB2_IsTransparent() == 0U) &&
+        (APP_AiWB2_GetState() != APP_AIWB2_STATE_SOCKET_READY)) {
         return;
     }
 #endif
@@ -434,6 +460,12 @@ static void app_uart_process_rx_byte(uint8_t byte)
 {
     app_uart_last_rx_byte_ms = HAL_GetTick();
     ++app_uart_rx_bytes;
+
+    if ((byte == (uint8_t)'>') && (app_uart_rx_used == 0U)) {
+        APP_AiWB2_ProcessLine(">");
+        ++app_uart_rx_lines;
+        return;
+    }
 
     if ((byte == '\n') || (byte == '\r')) {
         if (app_uart_rx_used > 0U) {
@@ -542,6 +574,7 @@ static void app_uart_poll_tx(void)
 #else
     uint16_t frame_length = 0U;
     HAL_StatusTypeDef status;
+    uint32_t now_ms = HAL_GetTick();
 
     app_uart_sync_tx_state();
 
@@ -552,15 +585,73 @@ static void app_uart_poll_tx(void)
     if (app_uart_control_initialized == 0U) {
         return;
     }
-#if (APP_UART_DIRECT_CONTROL_ENABLED == 0U)
-    if (APP_AiWB2_IsTransparent() == 0U) {
+
+    if (app_uart_socket_tx_state == APP_UART_SOCKET_TX_WAIT_PROMPT) {
+        if (APP_AiWB2_TakeSocketSendPrompt() != 0U) {
+            if (huart1.hdmatx == 0) {
+                status = BSP_UART_Transmit_USART1(app_uart_tx_frame_buffer,
+                                                  app_uart_socket_payload_length,
+                                                  100U);
+                if (status == HAL_OK) {
+                    app_uart_socket_tx_state = APP_UART_SOCKET_TX_WAIT_RESULT;
+                    app_uart_socket_deadline_ms =
+                        now_ms + APP_UART_SOCKET_SEND_RESULT_TIMEOUT_MS;
+                    ++app_uart_tx_count;
+                } else {
+                    ++app_uart_rx_errors;
+                    app_uart_socket_tx_reset();
+                }
+                return;
+            }
+
+            app_uart_clean_tx_dma_buffer(app_uart_socket_payload_length);
+            status = HAL_UART_Transmit_DMA(&huart1,
+                                           app_uart_tx_frame_buffer,
+                                           app_uart_socket_payload_length);
+            if (status == HAL_OK) {
+                app_uart_tx_busy = 1U;
+                app_uart_socket_tx_state = APP_UART_SOCKET_TX_WAIT_PAYLOAD_DMA;
+                app_uart_socket_deadline_ms =
+                    now_ms + APP_UART_SOCKET_SEND_RESULT_TIMEOUT_MS;
+                ++app_uart_tx_count;
+            } else if (status != HAL_BUSY) {
+                ++app_uart_rx_errors;
+                app_uart_socket_tx_reset();
+            }
+        } else if (app_uart_time_reached(now_ms, app_uart_socket_deadline_ms) != 0U) {
+            ++app_uart_rx_errors;
+            app_uart_socket_tx_reset();
+        }
         return;
     }
-#elif (APP_UART_TX_WAIT_FOR_TRANSPARENT != 0U)
-    if (APP_AiWB2_IsTransparent() == 0U) {
+
+    if (app_uart_socket_tx_state == APP_UART_SOCKET_TX_WAIT_PAYLOAD_DMA) {
+        if (app_uart_tx_busy == 0U) {
+            app_uart_socket_tx_state = APP_UART_SOCKET_TX_WAIT_RESULT;
+            app_uart_socket_deadline_ms =
+                now_ms + APP_UART_SOCKET_SEND_RESULT_TIMEOUT_MS;
+        } else if (app_uart_time_reached(now_ms, app_uart_socket_deadline_ms) != 0U) {
+            ++app_uart_rx_errors;
+            app_uart_socket_tx_reset();
+        }
         return;
     }
-#endif
+
+    if (app_uart_socket_tx_state == APP_UART_SOCKET_TX_WAIT_RESULT) {
+        int8_t result = APP_AiWB2_TakeSocketSendResult();
+
+        if (result > 0) {
+            app_uart_socket_tx_reset();
+        } else if (result < 0) {
+            ++app_uart_rx_errors;
+            app_uart_socket_tx_reset();
+        } else if (app_uart_time_reached(now_ms, app_uart_socket_deadline_ms) != 0U) {
+            ++app_uart_rx_errors;
+            app_uart_socket_tx_reset();
+        }
+        return;
+    }
+
     if (app_uart_tx_busy != 0U) {
         return;
     }
@@ -570,6 +661,16 @@ static void app_uart_poll_tx(void)
             return;
         }
         app_uart_tx_pending_valid = 1U;
+    }
+
+    if (app_uart_tx_pending_message.function != APP_UART_TX_FUNCTION_VOFA_SOCKET) {
+        app_uart_tx_pending_valid = 0U;
+        return;
+    }
+
+    if (APP_AiWB2_IsSocketReady() == 0U) {
+        app_uart_tx_pending_valid = 0U;
+        return;
     }
 
     if (app_uart_tx_pending_message.length == 0U) {
@@ -589,36 +690,40 @@ static void app_uart_poll_tx(void)
            app_uart_tx_pending_message.text,
            frame_length);
 
-    if (huart1.hdmatx == 0) {
-        status = BSP_UART_Transmit_USART1(app_uart_tx_frame_buffer,
-                                          frame_length,
-                                          100U);
-        if (status == HAL_OK) {
+    {
+        char command[40];
+        int written = snprintf(command,
+                               sizeof(command),
+                               "AT+SOCKETSEND=%lu,%u\r\n",
+                               (unsigned long)APP_AiWB2_GetSocketConId(),
+                               (unsigned int)frame_length);
+
+        if ((written <= 0) || ((uint32_t)written >= sizeof(command))) {
             app_uart_tx_pending_valid = 0U;
-            ++app_uart_tx_count;
-#if (APP_UART_TX_LED_ENABLED != 0U)
-            BSP_LED_On(LED_1);
-#endif
-            app_uart_tx_led_until_ms = HAL_GetTick() + APP_UART_TX_LED_PULSE_MS;
+            ++app_uart_rx_errors;
+            return;
         }
-        return;
+
+        (void)APP_AiWB2_TakeSocketSendPrompt();
+        (void)APP_AiWB2_TakeSocketSendResult();
+        status = BSP_UART_Transmit_USART1((const uint8_t *)command,
+                                          (uint16_t)written,
+                                          100U);
+        if (status != HAL_OK) {
+            app_uart_tx_pending_valid = 0U;
+            ++app_uart_rx_errors;
+            return;
+        }
     }
 
-    app_uart_clean_tx_dma_buffer(frame_length);
-    status = HAL_UART_Transmit_DMA(&huart1,
-                                   app_uart_tx_frame_buffer,
-                                   frame_length);
-    if (status == HAL_OK) {
-        app_uart_tx_busy = 1U;
-        app_uart_tx_pending_valid = 0U;
-        ++app_uart_tx_count;
+    app_uart_socket_payload_length = frame_length;
+    app_uart_socket_tx_state = APP_UART_SOCKET_TX_WAIT_PROMPT;
+    app_uart_socket_deadline_ms = now_ms + APP_UART_SOCKET_SEND_PROMPT_TIMEOUT_MS;
+    app_uart_tx_pending_valid = 0U;
 #if (APP_UART_TX_LED_ENABLED != 0U)
-        BSP_LED_On(LED_1);
+    BSP_LED_On(LED_1);
 #endif
-        app_uart_tx_led_until_ms = HAL_GetTick() + APP_UART_TX_LED_PULSE_MS;
-    } else if (status != HAL_BUSY) {
-        ++app_uart_rx_errors;
-    }
+    app_uart_tx_led_until_ms = HAL_GetTick() + APP_UART_TX_LED_PULSE_MS;
 #endif
 }
 
@@ -695,7 +800,8 @@ void APP_UART_Task_Step(void)
     /* PC13 LED: 初始慢闪 → 透传快闪 */
     {
         static uint32_t led_toggle_ms;
-        uint32_t period_ms = APP_AiWB2_IsTransparent() ? 120U : 500U;
+        uint32_t period_ms = ((APP_AiWB2_IsTransparent() != 0U) ||
+                              (APP_AiWB2_IsSocketReady() != 0U)) ? 120U : 500U;
 
         if ((now_ms - led_toggle_ms) >= period_ms) {
             led_toggle_ms = now_ms;
@@ -706,7 +812,8 @@ void APP_UART_Task_Step(void)
     app_uart_ensure_control_ready();
     if ((app_uart_control_initialized != 0U)
 #if (APP_UART_DIRECT_CONTROL_ENABLED == 0U)
-        && (APP_AiWB2_IsTransparent() != 0U)
+        && ((APP_AiWB2_IsTransparent() != 0U) ||
+            (APP_AiWB2_GetState() == APP_AIWB2_STATE_SOCKET_READY))
 #endif
        ) {
         APP_Control_Tick();

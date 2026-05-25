@@ -1460,7 +1460,7 @@ void VOFA_task(void *argument)
   /* USER CODE BEGIN VOFA_task */
 
   APP_Sensor_SampleMessage msg;
-  #define VOFA_DATA_SIZE 22U
+  #define VOFA_DATA_SIZE 28U
   float vofa_data[VOFA_DATA_SIZE];
 
   /* 地面气压平均 */
@@ -1533,8 +1533,13 @@ void VOFA_task(void *argument)
       vofa_data[19] = msg.attitude_debug.pitch_residual_deg;
       vofa_data[20] = msg.attitude_debug.alpha;
       vofa_data[21] = msg.attitude_debug.dt_ms;
-
-      /* 发送：22 个 float -> 88 字节二进制帧 -> WiFi 透传 -> 上位机 */
+      (void)DRV_COAX_CTRL_GetParam("coax.roll_angle_kp", &vofa_data[22]);
+      (void)DRV_COAX_CTRL_GetParam("coax.roll_rate_kd", &vofa_data[23]);
+      (void)DRV_COAX_CTRL_GetParam("coax.pitch_angle_kp", &vofa_data[24]);
+      (void)DRV_COAX_CTRL_GetParam("coax.pitch_rate_kd", &vofa_data[25]);
+      (void)DRV_COAX_CTRL_GetParam("coax.yaw_angle_kp", &vofa_data[26]);
+      (void)DRV_COAX_CTRL_GetParam("coax.yaw_rate_kd", &vofa_data[27]);
+      /* 28 floats + VOFA tail, sent by AT+SOCKETSEND with the actual frame length. */
       APP_VOFA_SendFloats(vofa_data, VOFA_DATA_SIZE);
     }
   }

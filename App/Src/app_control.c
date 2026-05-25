@@ -56,6 +56,7 @@
 #define APP_CONTROL_ALLOW_RAW_PWM_COMMANDS 0U
 #define APP_CONTROL_ALLOW_RAW_MOTOR_COMMANDS 0U
 #define APP_CONTROL_ALLOW_IDENT_MOTOR_TEST 0U
+#define APP_CONTROL_FLASH_AUTOSAVE_DELAY_MS 1500U
 
 typedef struct {
     uint8_t loaded_from_flash;
@@ -117,6 +118,8 @@ static uint32_t control_wifi_reset_deadline_ms;
 static uint8_t control_initialized;
 static uint8_t control_maint_output_active;
 static uint8_t control_dwt_ready;
+static uint8_t control_flash_autosave_pending;
+static uint32_t control_flash_autosave_deadline_ms;
 static uint8_t ident_active;
 static uint8_t ident_motor;
 static uint32_t ident_min_percent;
@@ -133,6 +136,7 @@ static uint8_t control_flash_buf_b[APP_CONTROL_FLASH_BENCH_MAX_LEN];
 
 static void app_control_handle_param(char **tokens, uint32_t count);
 static void app_control_report_pid_legacy(void);
+static uint8_t app_control_handle_pid_slider_line(const char *line);
 static void app_control_report_wifi(void);
 void APP_Control_QueueText(const char *format, ...);
 static void app_control_queue_proto_text(uint16_t function, const char *format, ...);
@@ -147,6 +151,8 @@ static void app_control_handle_motor(char **tokens, uint32_t count);
 static void app_control_handle_ident(char **tokens, uint32_t count);
 static void app_control_ident_step(void);
 static void app_control_service_wifi_reset(void);
+static void app_control_schedule_flash_autosave(void);
+static void app_control_service_flash_autosave(void);
 static void app_control_tick_common(uint8_t emit_heartbeat);
 static void app_control_report_rtos(void);
 static void app_control_handle_flash(char **tokens, uint32_t count);
@@ -417,6 +423,8 @@ static const char *app_control_aiwb2_state_name(APP_AiWB2_State state)
         return "wait_transparent_ok";
     case APP_AIWB2_STATE_TRANSPARENT:
         return "transparent";
+    case APP_AIWB2_STATE_SOCKET_READY:
+        return "socket_ready";
     case APP_AIWB2_STATE_RETRY_DELAY:
         return "retry_delay";
     default:
@@ -2326,6 +2334,34 @@ static void app_control_service_wifi_reset(void)
                            (unsigned int)BSP_AiWB2_IsEnabled());
 }
 
+static void app_control_schedule_flash_autosave(void)
+{
+    control_flash_autosave_pending = 1U;
+    control_flash_autosave_deadline_ms =
+        HAL_GetTick() + APP_CONTROL_FLASH_AUTOSAVE_DELAY_MS;
+}
+
+static void app_control_service_flash_autosave(void)
+{
+    APP_FlashService_Status save_status;
+
+    if (control_flash_autosave_pending == 0U) {
+        return;
+    }
+
+    if ((int32_t)(HAL_GetTick() - control_flash_autosave_deadline_ms) < 0) {
+        return;
+    }
+
+    control_flash_autosave_pending = 0U;
+    save_status = app_control_save_config();
+    control_config.last_flash_status = (uint8_t)save_status;
+    if (save_status == APP_FLASH_SERVICE_OK) {
+        control_config.loaded_from_flash = 1U;
+        control_config.flash_valid = 1U;
+    }
+}
+
 static void app_control_handle_baro(char **tokens, uint32_t count)
 {
     if ((count == 1U) || ((count >= 2U) && (strcmp(tokens[1], "?") == 0))) {
@@ -2387,6 +2423,7 @@ static void app_control_handle_pid(char **tokens, uint32_t count)
             APP_Control_QueueText("ERR pid target %s\r\n", tokens[2]);
             return;
         }
+        app_control_schedule_flash_autosave();
     }
 
     if (kd_text != NULL) {
@@ -2394,10 +2431,82 @@ static void app_control_handle_pid(char **tokens, uint32_t count)
             APP_Control_QueueText("ERR usage PID SET roll|pitch|yaw [kp=<float>] [kd=<float>]\r\n");
             return;
         }
-        (void)DRV_COAX_CTRL_SetParam(kd_name, kd);
+        if (DRV_COAX_CTRL_SetParam(kd_name, kd) != 0U) {
+            app_control_schedule_flash_autosave();
+        }
     }
 
     APP_Control_QueueText("OK pid axis=%s target=coax\r\n", tokens[2]);
+}
+
+static uint8_t app_control_handle_pid_slider_line(const char *line)
+{
+    typedef struct {
+        const char *slider_name;
+        const char *param_name;
+    } APP_ControlPidSliderMap;
+
+    static const APP_ControlPidSliderMap map[] = {
+        { "roll_angle_kp",  "coax.roll_angle_kp"  },
+        { "roll_rate_kd",   "coax.roll_rate_kd"   },
+        { "pitch_angle_kp", "coax.pitch_angle_kp" },
+        { "pitch_rate_kd",  "coax.pitch_rate_kd"  },
+        { "yaw_angle_kp",   "coax.yaw_angle_kp"   },
+        { "yaw_rate_kd",    "coax.yaw_rate_kd"    },
+        { "aw_angle_kp",    "coax.yaw_angle_kp"   },
+        { "aw_rate_kd",     "coax.yaw_rate_kd"    },
+    };
+
+    char value_text[24];
+
+    if ((line == NULL) || (*line == '\0')) {
+        return 0U;
+    }
+
+    for (uint32_t map_index = 0U; map_index < (sizeof(map) / sizeof(map[0])); ++map_index) {
+        const char *name = strstr(line, map[map_index].slider_name);
+        const char *value_start;
+        uint32_t value_len = 0U;
+        float value;
+
+        if (name == NULL) {
+            continue;
+        }
+
+        value_start = name + strlen(map[map_index].slider_name);
+        while (*value_start == ' ') {
+            ++value_start;
+        }
+        if (*value_start != ':') {
+            continue;
+        }
+        ++value_start;
+        while (*value_start == ' ') {
+            ++value_start;
+        }
+
+        while ((value_start[value_len] > ' ') &&
+               (value_start[value_len] != ',') &&
+               (value_len < (sizeof(value_text) - 1U))) {
+            value_text[value_len] = value_start[value_len];
+            ++value_len;
+        }
+        value_text[value_len] = '\0';
+
+        if ((value_len == 0U) ||
+            (app_control_parse_f32(value_text, &value) == 0U)) {
+            return 0U;
+        }
+
+        if (DRV_COAX_CTRL_SetParam(map[map_index].param_name, value) == 0U) {
+            APP_Control_QueueText("ERR pid slider %s\r\n", map[map_index].slider_name);
+        } else {
+            app_control_schedule_flash_autosave();
+        }
+        return 1U;
+    }
+
+    return 0U;
 }
 
 
@@ -2480,6 +2589,7 @@ static void app_control_handle_param(char **tokens, uint32_t count)
         APP_Control_QueueText("ERR param target %s\r\n", name);
         return;
     }
+    app_control_schedule_flash_autosave();
 
     app_control_format_float(value, formatted, (uint32_t)sizeof(formatted));
     APP_Control_QueueText("OK param name=%s value=%s\r\n", name, formatted);
@@ -2528,6 +2638,7 @@ void APP_Control_MaintTick(void)
 static void app_control_tick_common(uint8_t emit_heartbeat)
 {
     app_control_service_wifi_reset();
+    app_control_service_flash_autosave();
     app_control_ident_step();
 
     if (emit_heartbeat == 0U) {
@@ -2736,6 +2847,10 @@ void APP_Control_ProcessLine(const char *line)
     uint32_t count;
 
     if ((line == NULL) || (*line == '\0')) {
+        return;
+    }
+
+    if (app_control_handle_pid_slider_line(line) != 0U) {
         return;
     }
 

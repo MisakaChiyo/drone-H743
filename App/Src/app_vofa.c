@@ -1,5 +1,6 @@
 #include "app_vofa.h"
 
+#include "app_aiwb2.h"
 #include "app_messages.h"
 #include "app_tasks.h"
 #include "app_uart.h"
@@ -28,6 +29,10 @@ void APP_VOFA_SendFloats(const float *data, uint8_t count)
         return;
     }
 
+    if (APP_AiWB2_IsSocketReady() == 0U) {
+        return;
+    }
+
     payload_bytes = (uint16_t)count * 4U;
     total_bytes   = payload_bytes + 4U;
 
@@ -38,7 +43,7 @@ void APP_VOFA_SendFloats(const float *data, uint8_t count)
     memcpy(tx_msg.text, data, payload_bytes);
     memcpy(tx_msg.text + payload_bytes, app_vofa_tail, 4U);
     tx_msg.length   = total_bytes;
-    tx_msg.function = 0U;   /* not used in direct mode */
+    tx_msg.function = APP_UART_TX_FUNCTION_VOFA_SOCKET;
 
     if (uartTxQueueHandle == 0) {
         return;

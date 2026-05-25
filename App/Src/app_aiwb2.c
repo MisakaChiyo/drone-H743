@@ -1,5 +1,6 @@
 #include "app_aiwb2.h"
 
+#include "app_control.h"
 #include "app_maint_uart.h"
 #include "bsp_aiwb2_power.h"
 #include "bsp_uart.h"
@@ -24,10 +25,7 @@
 #define APP_AIWB2_UDP_SERVER_PORT "7777"
 #endif
 
-/* Keep AT provisioning passive by default so firmware does not collide with
-   the module's persisted auto-transparent flow. PC6 now controls Ai-WB2 EN,
-   so passive mode may power-cycle the module to make it retry TCP connect. */
-#define APP_AIWB2_PASSIVE_ONLY        1U
+#define APP_AIWB2_PASSIVE_ONLY        0U
 #define APP_AIWB2_START_DELAY_MS     8000U
 #define APP_AIWB2_PROBE_TIMEOUT_MS   8000U
 #define APP_AIWB2_ESCAPE_GUARD_MS    1200U
@@ -52,12 +50,10 @@ typedef struct {
 
 static const APP_AiWB2Command aiwb2_commands[] = {
     { "ATE0", 1500U, 0U, 0U },
-    { "AT+WMODE=1,1", 1500U, 0U, 0U },
-    { "AT+WJAP=\"" APP_AIWB2_WIFI_SSID "\",\"" APP_AIWB2_WIFI_PASSWORD "\"", 25000U, 0U, 0U },
-    { "AT+WAUTOCONN=1", 1500U, 0U, 0U },
+    { "AT+SOCKETAUTOTT=0", 1500U, 0U, 0U },
     { "AT+SOCKETDEL=1", 2000U, 1U, 0U },
-    { "AT+SOCKETAUTOTT=1," APP_AIWB2_UDP_SERVER_PORT, 2500U, 0U, 0U },
-    { "AT+RST", 8000U, 0U, 1U },
+    { "AT+SOCKETRECVCFG=1", 1500U, 0U, 0U },
+    { "AT+SOCKET=1," APP_AIWB2_UDP_SERVER_PORT, 2500U, 0U, 0U },
 };
 
 static APP_AiWB2_State aiwb2_state;
@@ -72,6 +68,14 @@ static char aiwb2_provision_text[7][128];
 static uint32_t aiwb2_provision_command_count;
 static uint8_t aiwb2_provision_active;
 static uint32_t aiwb2_manual_at_deadline_ms;
+static uint32_t aiwb2_socket_con_id;
+static uint8_t aiwb2_socket_ready;
+static uint8_t aiwb2_socket_peer_ready;
+static volatile uint8_t aiwb2_socket_send_prompt;
+static volatile int8_t aiwb2_socket_send_result;
+
+static uint8_t aiwb2_parse_connect_conid(const char *line, uint32_t *con_id);
+static void aiwb2_process_socket_down(const char *line);
 
 static uint8_t aiwb2_starts_with(const char *line, const char *prefix)
 {
@@ -168,6 +172,11 @@ static void aiwb2_enter_retry_delay(void)
 {
     uint32_t now_ms = HAL_GetTick();
 
+    aiwb2_socket_ready = 0U;
+    aiwb2_socket_peer_ready = 0U;
+    aiwb2_socket_send_prompt = 0U;
+    aiwb2_socket_send_result = 0;
+
 #if (APP_AIWB2_PASSIVE_ONLY != 0U)
     aiwb2_state = APP_AIWB2_STATE_WAIT_BOOT_CONNECT;
     aiwb2_deadline_ms = now_ms + APP_AIWB2_PASSIVE_ERROR_RETRY_MS;
@@ -195,6 +204,8 @@ static void aiwb2_begin_config(void)
 {
     aiwb2_command_index = 0U;
     aiwb2_probe_escape_used = 0U;
+    aiwb2_socket_ready = 0U;
+    aiwb2_socket_peer_ready = 0U;
     aiwb2_state = APP_AIWB2_STATE_SEND_COMMAND;
 }
 
@@ -229,6 +240,14 @@ static void aiwb2_enter_transparent(void)
     aiwb2_state = APP_AIWB2_STATE_TRANSPARENT;
     aiwb2_retry_count = 0U;
     aiwb2_provision_active = 0U;
+}
+
+static void aiwb2_enter_socket_ready(void)
+{
+    aiwb2_state = APP_AIWB2_STATE_SOCKET_READY;
+    aiwb2_retry_count = 0U;
+    aiwb2_provision_active = 0U;
+    aiwb2_socket_ready = 1U;
 }
 
 static void aiwb2_wait_transparent_ok(void)
@@ -279,6 +298,11 @@ void APP_AiWB2_Init(void)
     aiwb2_provision_active = 0U;
     aiwb2_provision_command_count = 0U;
     aiwb2_manual_at_deadline_ms = 0U;
+    aiwb2_socket_con_id = 0U;
+    aiwb2_socket_ready = 0U;
+    aiwb2_socket_peer_ready = 0U;
+    aiwb2_socket_send_prompt = 0U;
+    aiwb2_socket_send_result = 0;
 }
 
 void APP_AiWB2_Tick(void)
@@ -362,8 +386,12 @@ void APP_AiWB2_Tick(void)
     case APP_AIWB2_STATE_SEND_COMMAND:
         commands = aiwb2_active_commands(&command_count);
         if (aiwb2_command_index >= command_count) {
-            aiwb2_state = APP_AIWB2_STATE_WAIT_BOOT_CONNECT;
-            aiwb2_deadline_ms = now_ms + APP_AIWB2_BOOT_TIMEOUT_MS;
+            if (aiwb2_socket_ready != 0U) {
+                aiwb2_enter_socket_ready();
+            } else {
+                aiwb2_state = APP_AIWB2_STATE_WAIT_BOOT_CONNECT;
+                aiwb2_deadline_ms = now_ms + APP_AIWB2_BOOT_TIMEOUT_MS;
+            }
             aiwb2_provision_active = 0U;
             break;
         }
@@ -406,6 +434,7 @@ void APP_AiWB2_Tick(void)
         break;
 
     case APP_AIWB2_STATE_TRANSPARENT:
+    case APP_AIWB2_STATE_SOCKET_READY:
     default:
         break;
     }
@@ -423,6 +452,24 @@ void APP_AiWB2_ProcessLine(const char *line)
 
     if (aiwb2_contains(line, "+SOCKET:") != 0U) {
         aiwb2_parse_socket_error(line);
+    }
+
+    if (aiwb2_starts_with(line, "+EVENT:SocketDown,") != 0U) {
+        aiwb2_process_socket_down(line);
+        return;
+    }
+
+    if (aiwb2_is_transparent_prompt(line) != 0U) {
+        APP_AiWB2_OnSocketSendPrompt();
+        if (aiwb2_state != APP_AIWB2_STATE_WAIT_TRANSPARENT_OK) {
+            return;
+        }
+    }
+
+    if (strcmp(line, "OK") == 0) {
+        APP_AiWB2_OnSocketSendOkOrError(1U);
+    } else if (strcmp(line, "ERROR") == 0) {
+        APP_AiWB2_OnSocketSendOkOrError(0U);
     }
 
     if ((aiwb2_manual_at_active() != 0U) &&
@@ -447,7 +494,18 @@ void APP_AiWB2_ProcessLine(const char *line)
     }
 
     if (aiwb2_contains(line, "connect success") != 0U) {
-        aiwb2_wait_transparent_ok();
+        uint32_t con_id;
+        if (aiwb2_parse_connect_conid(line, &con_id) != 0U) {
+            aiwb2_socket_con_id = con_id;
+            aiwb2_socket_ready = 1U;
+            if (aiwb2_state == APP_AIWB2_STATE_WAIT_COMMAND) {
+                aiwb2_command_done();
+            } else {
+                aiwb2_enter_socket_ready();
+            }
+        } else {
+            aiwb2_wait_transparent_ok();
+        }
         return;
     }
 
@@ -533,6 +591,44 @@ void APP_AiWB2_ProcessLine(const char *line)
 uint8_t APP_AiWB2_IsTransparent(void)
 {
     return (aiwb2_state == APP_AIWB2_STATE_TRANSPARENT) ? 1U : 0U;
+}
+
+uint8_t APP_AiWB2_IsSocketReady(void)
+{
+    return ((aiwb2_state == APP_AIWB2_STATE_SOCKET_READY) &&
+            (aiwb2_socket_ready != 0U) &&
+            (aiwb2_socket_peer_ready != 0U)) ? 1U : 0U;
+}
+
+uint32_t APP_AiWB2_GetSocketConId(void)
+{
+    return aiwb2_socket_con_id;
+}
+
+void APP_AiWB2_OnSocketSendPrompt(void)
+{
+    aiwb2_socket_send_prompt = 1U;
+}
+
+void APP_AiWB2_OnSocketSendOkOrError(uint8_t ok)
+{
+    aiwb2_socket_send_result = (ok != 0U) ? 1 : -1;
+}
+
+uint8_t APP_AiWB2_TakeSocketSendPrompt(void)
+{
+    uint8_t prompt = aiwb2_socket_send_prompt;
+
+    aiwb2_socket_send_prompt = 0U;
+    return prompt;
+}
+
+int8_t APP_AiWB2_TakeSocketSendResult(void)
+{
+    int8_t result = aiwb2_socket_send_result;
+
+    aiwb2_socket_send_result = 0;
+    return result;
 }
 
 uint8_t APP_AiWB2_IsControlPayload(const char *line)
@@ -781,6 +877,104 @@ void APP_AiWB2_SendDiagCommands(void)
         aiwb2_deadline_ms = now_ms + APP_AIWB2_ESCAPE_GUARD_MS;
     } else {
         aiwb2_begin_probe();
+    }
+}
+
+static uint8_t aiwb2_parse_connect_conid(const char *line, uint32_t *con_id)
+{
+    const char *cursor;
+    uint32_t value = 0U;
+    uint8_t have_digit = 0U;
+
+    if ((line == 0) || (con_id == 0)) {
+        return 0U;
+    }
+
+    cursor = strstr(line, "ConID=");
+    if (cursor == 0) {
+        return 0U;
+    }
+
+    cursor += strlen("ConID=");
+    while ((*cursor >= '0') && (*cursor <= '9')) {
+        have_digit = 1U;
+        value = (value * 10U) + (uint32_t)(*cursor - '0');
+        ++cursor;
+    }
+
+    if (have_digit == 0U) {
+        return 0U;
+    }
+
+    *con_id = value;
+    return 1U;
+}
+
+static void aiwb2_process_socket_down(const char *line)
+{
+    const char *cursor = line;
+    const char *payload;
+    uint32_t con_id = 0U;
+    uint32_t length = 0U;
+    uint8_t have_digit = 0U;
+    char command[96];
+    uint32_t copy_len;
+
+    if (line == 0) {
+        return;
+    }
+
+    if (strncmp(cursor, "+EVENT:SocketDown,", strlen("+EVENT:SocketDown,")) != 0) {
+        return;
+    }
+    cursor += strlen("+EVENT:SocketDown,");
+
+    while ((*cursor >= '0') && (*cursor <= '9')) {
+        have_digit = 1U;
+        con_id = (con_id * 10U) + (uint32_t)(*cursor - '0');
+        ++cursor;
+    }
+    if ((have_digit == 0U) || (*cursor != ',')) {
+        return;
+    }
+    ++cursor;
+
+    have_digit = 0U;
+    while ((*cursor >= '0') && (*cursor <= '9')) {
+        have_digit = 1U;
+        length = (length * 10U) + (uint32_t)(*cursor - '0');
+        ++cursor;
+    }
+    if (have_digit == 0U) {
+        return;
+    }
+
+    aiwb2_socket_con_id = con_id;
+    aiwb2_socket_peer_ready = 1U;
+
+    if (*cursor != ',') {
+        return;
+    }
+    ++cursor;
+    payload = cursor;
+
+    copy_len = length;
+    if (copy_len >= sizeof(command)) {
+        copy_len = sizeof(command) - 1U;
+    }
+    for (uint32_t index = 0U; index < copy_len; ++index) {
+        char ch = payload[index];
+        if ((ch == '\0') || (ch == '\r') || (ch == '\n')) {
+            copy_len = index;
+            break;
+        }
+        command[index] = ch;
+    }
+    command[copy_len] = '\0';
+
+    if (copy_len != 0U) {
+        APP_Control_Init();
+        APP_Control_ProcessLine(command);
     }
 }
 

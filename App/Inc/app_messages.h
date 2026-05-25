@@ -7,6 +7,8 @@
 #include "app_sensor.h"
 
 #define APP_UART_TX_TEXT_SIZE 256U
+#define APP_UART_TX_FUNCTION_TEXT 0U
+#define APP_UART_TX_FUNCTION_VOFA_SOCKET 1U
 
 typedef struct APP_IMU_SampleMessage {
     uint32_t sample_count;
