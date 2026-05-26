@@ -5,6 +5,7 @@
 #include "app_flash.h"
 #include "app_diag.h"
 #include "app_gps.h"
+#include "app_ident.h"
 #include "app_sensor.h"
 #include "app_mag.h"
 #include "app_maint_uart.h"
@@ -507,6 +508,24 @@ static uint8_t app_control_parse_u32(const char *text, uint32_t *value)
     return 1U;
 }
 
+static uint8_t app_control_parse_i32(const char *text, int32_t *value)
+{
+    char *end_ptr;
+    long parsed;
+
+    if ((text == NULL) || (value == NULL) || (*text == '\0')) {
+        return 0U;
+    }
+
+    parsed = strtol(text, &end_ptr, 10);
+    if ((end_ptr == text) || (*end_ptr != '\0')) {
+        return 0U;
+    }
+
+    *value = (int32_t)parsed;
+    return 1U;
+}
+
 static uint8_t app_control_parse_u32_auto(const char *text, uint32_t *value)
 {
     char *end_ptr;
@@ -568,17 +587,7 @@ static void app_control_report_motor(void)
 
 static void app_control_report_ident(void)
 {
-    APP_Control_QueueText("IDENT active=%u seq=%lu motor=%u pct=%lu min=%lu max=%lu step=%lu dwell_ms=%lu next_ms=%lu now_ms=%lu\r\n",
-                          (unsigned int)ident_active,
-                          (unsigned long)ident_seq,
-                          (unsigned int)ident_motor,
-                          (unsigned long)ident_current_percent,
-                          (unsigned long)ident_min_percent,
-                          (unsigned long)ident_max_percent,
-                          (unsigned long)ident_step_percent,
-                          (unsigned long)ident_dwell_ms,
-                          (unsigned long)ident_next_ms,
-                          (unsigned long)HAL_GetTick());
+    APP_Ident_ReportStatus();
 }
 
 static uint32_t app_control_crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
@@ -2264,7 +2273,143 @@ static void app_control_handle_motor(char **tokens, uint32_t count)
 static void app_control_handle_ident(char **tokens, uint32_t count)
 {
     if (count < 2U) {
-        APP_Control_QueueText("ERR usage IDENT START 0|1|2 [min max step dwell_ms] | IDENT STOP | IDENT?\r\n");
+        APP_Control_QueueText("ERR usage IDENT ARM|DISARM|STOP|STEP|DOUBLET|PRBS|CENTER|APPLY|?\r\n");
+        return;
+    }
+
+    if ((strcmp(tokens[1], "?") == 0) || (strcmp(tokens[1], "STATUS") == 0)) {
+        APP_Ident_ReportStatus();
+        return;
+    }
+
+    if (strcmp(tokens[1], "ARM") == 0) {
+        (void)APP_Ident_Arm();
+        return;
+    }
+
+    if (strcmp(tokens[1], "DISARM") == 0) {
+        APP_Ident_Disarm();
+        return;
+    }
+
+    if (strcmp(tokens[1], "STOP") == 0) {
+        APP_Ident_Stop("command");
+        return;
+    }
+
+    if (strcmp(tokens[1], "CENTER") == 0) {
+        uint32_t alpha_us;
+        uint32_t beta_us;
+        const char *alpha_text = app_control_token_value(tokens, count, "alpha_us");
+        const char *beta_text = app_control_token_value(tokens, count, "beta_us");
+
+        if ((alpha_text == NULL) || (beta_text == NULL) ||
+            (app_control_parse_u32(alpha_text, &alpha_us) == 0U) ||
+            (app_control_parse_u32(beta_text, &beta_us) == 0U) ||
+            (alpha_us > 65535U) || (beta_us > 65535U)) {
+            APP_Control_QueueText("ERR usage IDENT CENTER alpha_us=<v> beta_us=<v>\r\n");
+            return;
+        }
+        (void)APP_Ident_SetCenter((uint16_t)alpha_us, (uint16_t)beta_us);
+        return;
+    }
+
+    if (strcmp(tokens[1], "APPLY") == 0) {
+        const char *kp_text;
+        const char *kd_text;
+
+        if (count < 3U) {
+            APP_Control_QueueText("ERR usage IDENT APPLY roll|pitch [kp=<v>] [kd=<v>]\r\n");
+            return;
+        }
+        kp_text = app_control_token_value(tokens, count, "kp");
+        kd_text = app_control_token_value(tokens, count, "kd");
+        if ((kp_text == NULL) && (kd_text == NULL)) {
+            APP_Control_QueueText("ERR usage IDENT APPLY roll|pitch [kp=<v>] [kd=<v>]\r\n");
+            return;
+        }
+        (void)APP_Ident_ApplyPid(tokens[2], kp_text, kd_text);
+        return;
+    }
+
+    if (strcmp(tokens[1], "STEP") == 0) {
+        uint32_t duration_ms;
+        int32_t pulse_us;
+        const char *pulse_text;
+        const char *duration_text;
+
+        if (count < 3U) {
+            APP_Control_QueueText("ERR usage IDENT STEP roll|pitch pulse_us=<v> duration_ms=<v>\r\n");
+            return;
+        }
+        pulse_text = app_control_token_value(tokens, count, "pulse_us");
+        duration_text = app_control_token_value(tokens, count, "duration_ms");
+        if ((pulse_text == NULL) || (duration_text == NULL) ||
+            (app_control_parse_i32(pulse_text, &pulse_us) == 0U) ||
+            (app_control_parse_u32(duration_text, &duration_ms) == 0U)) {
+            APP_Control_QueueText("ERR usage IDENT STEP roll|pitch pulse_us=<v> duration_ms=<v>\r\n");
+            return;
+        }
+        (void)APP_Ident_StartStep(tokens[2], pulse_us, duration_ms);
+        return;
+    }
+
+    if (strcmp(tokens[1], "DOUBLET") == 0) {
+        uint32_t hold_ms;
+        uint32_t repeat;
+        int32_t pulse_us;
+        const char *pulse_text;
+        const char *hold_text;
+        const char *repeat_text;
+
+        if (count < 3U) {
+            APP_Control_QueueText("ERR usage IDENT DOUBLET roll|pitch pulse_us=<v> hold_ms=<v> repeat=<v>\r\n");
+            return;
+        }
+        pulse_text = app_control_token_value(tokens, count, "pulse_us");
+        hold_text = app_control_token_value(tokens, count, "hold_ms");
+        repeat_text = app_control_token_value(tokens, count, "repeat");
+        if ((pulse_text == NULL) || (hold_text == NULL) || (repeat_text == NULL) ||
+            (app_control_parse_i32(pulse_text, &pulse_us) == 0U) ||
+            (app_control_parse_u32(hold_text, &hold_ms) == 0U) ||
+            (app_control_parse_u32(repeat_text, &repeat) == 0U)) {
+            APP_Control_QueueText("ERR usage IDENT DOUBLET roll|pitch pulse_us=<v> hold_ms=<v> repeat=<v>\r\n");
+            return;
+        }
+        (void)APP_Ident_StartDoublet(tokens[2], pulse_us, hold_ms, repeat);
+        return;
+    }
+
+    if (strcmp(tokens[1], "PRBS") == 0) {
+        uint32_t bit_ms;
+        uint32_t duration_ms;
+        uint32_t seed = 1U;
+        int32_t pulse_us;
+        const char *pulse_text;
+        const char *bit_text;
+        const char *duration_text;
+        const char *seed_text;
+
+        if (count < 3U) {
+            APP_Control_QueueText("ERR usage IDENT PRBS roll|pitch pulse_us=<v> bit_ms=<v> duration_ms=<v> [seed=<v>]\r\n");
+            return;
+        }
+        pulse_text = app_control_token_value(tokens, count, "pulse_us");
+        bit_text = app_control_token_value(tokens, count, "bit_ms");
+        duration_text = app_control_token_value(tokens, count, "duration_ms");
+        seed_text = app_control_token_value(tokens, count, "seed");
+        if ((seed_text != NULL) && (app_control_parse_u32(seed_text, &seed) == 0U)) {
+            APP_Control_QueueText("ERR ident seed\r\n");
+            return;
+        }
+        if ((pulse_text == NULL) || (bit_text == NULL) || (duration_text == NULL) ||
+            (app_control_parse_i32(pulse_text, &pulse_us) == 0U) ||
+            (app_control_parse_u32(bit_text, &bit_ms) == 0U) ||
+            (app_control_parse_u32(duration_text, &duration_ms) == 0U)) {
+            APP_Control_QueueText("ERR usage IDENT PRBS roll|pitch pulse_us=<v> bit_ms=<v> duration_ms=<v> [seed=<v>]\r\n");
+            return;
+        }
+        (void)APP_Ident_StartPrbs(tokens[2], pulse_us, bit_ms, duration_ms, seed);
         return;
     }
 
@@ -2333,8 +2478,6 @@ static void app_control_handle_ident(char **tokens, uint32_t count)
                               (unsigned long)ident_dwell_ms,
                               (unsigned long)HAL_GetTick());
         app_control_ident_step();
-    } else if (strcmp(tokens[1], "STOP") == 0) {
-        app_control_ident_stop("command");
     } else {
         APP_Control_QueueText("ERR unknown ident subcmd %s\r\n", tokens[1]);
     }
@@ -2629,6 +2772,7 @@ void APP_Control_Init(void)
     app_control_defaults(&control_config);
     control_wifi_reset_pending = 0U;
     control_wifi_reset_deadline_ms = 0U;
+    APP_Ident_Init();
     load_status = app_control_load_config();
     control_config.last_flash_status = (uint8_t)load_status;
     if (load_status != APP_FLASH_SERVICE_OK) {

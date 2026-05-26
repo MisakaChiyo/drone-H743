@@ -123,6 +123,7 @@
 #include "app_sensor.h"
 #include "app_messages.h"
 #include "app_tasks.h"
+#include "app_ident.h"
 #include <math.h>
 #include <string.h>
 
@@ -934,6 +935,7 @@ void StabilizerTask(void *argument)
 #endif
         DRV_SERVO_MoveCmd moves[2];     /* [0]=舵机1(α/pitch), [1]=舵机2(β/roll) */
         uint8_t imu_control_valid = 0U;
+        uint8_t ident_running = 0U;
 
         last_out_ms = now;
 
@@ -961,7 +963,17 @@ void StabilizerTask(void *argument)
           imu_control_valid = 1U;
         }
 
-        if (imu_control_valid != 0U) {
+        APP_Ident_Update(now);
+        ident_running = APP_Ident_IsRunning();
+
+        if (ident_running != 0U) {
+          uint16_t ident_alpha_us;
+          uint16_t ident_beta_us;
+
+          APP_Ident_GetServoTargets(&ident_alpha_us, &ident_beta_us);
+          moves[0].pulse_us = ident_alpha_us;
+          moves[1].pulse_us = ident_beta_us;
+        } else if (imu_control_valid != 0U) {
 #if (STABILIZER_USE_DIRECT_ANGLE_SERVO != 0U)
           /*
            * 模式 A：角度直驱
@@ -1013,6 +1025,21 @@ void StabilizerTask(void *argument)
           moves[1].pulse_us = DRV_COAX_CTRL_SERVO_BETA_CENTER_US;
         }
 
+        if (ident_running != 0U) {
+          APP_IdentObserve ident_obs = {
+            .now_ms = now,
+            .roll_deg = roll_control,
+            .pitch_deg = pitch_control,
+            .gyro_x_dps = msg.imu.gyro_x_dps,
+            .gyro_y_dps = msg.imu.gyro_y_dps,
+            .rc_link_ok = rc_link_ok,
+            .rc_armed = rc_armed,
+            .imu_valid = imu_control_valid,
+            .throttle_us = rc_throttle_motor_us,
+          };
+          APP_Ident_Observe(&ident_obs);
+        }
+
         stabilizer_servo_record_target(moves);
 
         /* 有变化才发（带 500ms 强制刷新），避免占用舵机总线 */
@@ -1025,7 +1052,8 @@ void StabilizerTask(void *argument)
 
 #if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
         if ((rc_link_ok != 0U) && (rc_armed != 0U)) {
-          if ((rc_use_stabilized_motor_mix != 0U) &&
+          if ((ident_running == 0U) &&
+              (rc_use_stabilized_motor_mix != 0U) &&
               (imu_control_valid != 0U)) {
             uint16_t ctrl_upper_us =
               DRV_COAX_CTRL_OmegaToMotorPulse(ctrl_out.omega_upper);

@@ -23,6 +23,7 @@ DEFAULT_UDP_LOCAL_PORT = 6668
 DEFAULT_UDP_MODULE_PORT = 7777
 MAX_BARO_SAMPLES = 2000
 MAX_GPS_TRACK_POINTS = 5000
+MAX_IDENT_SAMPLES = 5000
 BARO_STREAM_PERIOD_MS = 50
 IMU_POLL_PERIOD_MS = 100
 CMD_REPLY_TIMEOUT_MS = 2500
@@ -60,6 +61,7 @@ PROTO_REQ_SERVO_RAW = 0x1017
 PROTO_REQ_WIFI = 0x1018
 PROTO_REQ_GPS = 0x1019
 PROTO_REQ_MAG = 0x101A
+PROTO_REQ_IDENT = 0x101B
 PROTO_MSG_CMD_LINE = 0x2000
 PROTO_MSG_TEXT_LINE = 0x2001
 PROTO_MSG_CMD_RX = 0x2100
@@ -185,6 +187,89 @@ def first_float(values: dict[str, str], *names: str) -> float | None:
         except ValueError:
             return None
     return None
+
+
+def ident_record_from_line(line: str) -> dict[str, str | float | int] | None:
+    if not line.startswith("IDENT sample "):
+        return None
+    values = parse_kv(line)
+    record: dict[str, str | float | int] = {"line": line}
+    for key, value in values.items():
+        record[key] = value
+    for key in ("id", "seq", "t_ms", "alpha_us", "beta_us", "rc_arm", "throttle_us"):
+        if key in values:
+            record[key] = safe_int(values[key])
+    if "roll_mdeg" in values:
+        record["roll"] = safe_int(values["roll_mdeg"]) / 1000.0
+    elif "roll" in values:
+        parsed = first_float(values, "roll")
+        if parsed is not None:
+            record["roll"] = parsed
+    if "pitch_mdeg" in values:
+        record["pitch"] = safe_int(values["pitch_mdeg"]) / 1000.0
+    elif "pitch" in values:
+        parsed = first_float(values, "pitch")
+        if parsed is not None:
+            record["pitch"] = parsed
+    if "gx_cdps" in values:
+        record["gx"] = safe_int(values["gx_cdps"]) / 100.0
+    elif "gx" in values:
+        parsed = first_float(values, "gx")
+        if parsed is not None:
+            record["gx"] = parsed
+    if "gy_cdps" in values:
+        record["gy"] = safe_int(values["gy_cdps"]) / 100.0
+    elif "gy" in values:
+        parsed = first_float(values, "gy")
+        if parsed is not None:
+            record["gy"] = parsed
+    return record
+
+
+def fit_ident_step(samples: list[dict[str, str | float | int]], axis: str) -> dict[str, float] | None:
+    if len(samples) < 8:
+        return None
+    value_key = "roll" if axis == "roll" else "pitch"
+    input_key = "beta_us" if axis == "roll" else "alpha_us"
+    rows = [
+        row for row in samples
+        if isinstance(row.get("t_ms"), int)
+        and isinstance(row.get(value_key), float)
+        and isinstance(row.get(input_key), int)
+    ]
+    if len(rows) < 8:
+        return None
+    t0 = float(rows[0]["t_ms"]) / 1000.0
+    times = [(float(row["t_ms"]) / 1000.0) - t0 for row in rows]
+    outputs = [float(row[value_key]) for row in rows]
+    inputs = [float(row[input_key]) for row in rows]
+    baseline_n = max(1, min(5, len(outputs) // 5))
+    baseline_y = sum(outputs[:baseline_n]) / baseline_n
+    baseline_u = sum(inputs[:baseline_n]) / baseline_n
+    final_n = max(1, min(8, len(outputs) // 4))
+    final_y = sum(outputs[-final_n:]) / final_n
+    final_u = sum(inputs[-final_n:]) / final_n
+    du = final_u - baseline_u
+    dy = final_y - baseline_y
+    if abs(du) < 1.0 or abs(dy) < 0.01:
+        return None
+    target_10 = baseline_y + (0.10 * dy)
+    target_63 = baseline_y + (0.632 * dy)
+
+    def crossing(target: float) -> float | None:
+        for t, y in zip(times, outputs):
+            if (dy >= 0.0 and y >= target) or (dy < 0.0 and y <= target):
+                return t
+        return None
+
+    t10 = crossing(target_10)
+    t63 = crossing(target_63)
+    delay = t10 if t10 is not None else 0.0
+    tau = max(0.02, (t63 - delay) if t63 is not None else (times[-1] / 3.0))
+    gain = dy / du
+    kp = max(0.0, min(10.0, 0.35 / max(abs(gain), 0.001)))
+    kd = max(0.0, min(5.0, kp * tau * 0.25))
+    return {"K": gain, "tau": tau, "L": delay, "kp": kp, "kd": kd}
 
 
 def normalize_module_key(key: str) -> str | None:
@@ -677,6 +762,11 @@ class DronePanel(tk.Tk):
         self.param_names_by_iid: dict[str, str] = {}
         self.servo_widgets: list[dict[str, tk.Variable]] = []
         self.structured_protocol_supported: bool | None = None
+        self.ident_samples: list[dict[str, str | float | int]] = []
+        self.ident_csv_file = None
+        self.ident_csv_writer: csv.DictWriter | None = None
+        self.ident_current_path: Path | None = None
+        self.ident_last_fit: dict[str, float] | None = None
 
         self.link_var = tk.StringVar(value="未连接")
         self.last_cmd_var = tk.StringVar(value="-")
@@ -693,6 +783,21 @@ class DronePanel(tk.Tk):
         self._serial_port_map: dict[str, str] = {}
         self.serial_port_var = tk.StringVar(value=self._default_serial_port())
         self.serial_baud_var = tk.IntVar(value=115200)
+        self.ident_axis_var = tk.StringVar(value="roll")
+        self.ident_mode_var = tk.StringVar(value="STEP")
+        self.ident_pulse_var = tk.IntVar(value=40)
+        self.ident_duration_var = tk.IntVar(value=3000)
+        self.ident_hold_var = tk.IntVar(value=800)
+        self.ident_repeat_var = tk.IntVar(value=2)
+        self.ident_bit_var = tk.IntVar(value=250)
+        self.ident_seed_var = tk.IntVar(value=1)
+        self.ident_alpha_center_var = tk.IntVar(value=1412)
+        self.ident_beta_center_var = tk.IntVar(value=1851)
+        self.ident_status_var = tk.StringVar(value="idle")
+        self.ident_sample_count_var = tk.StringVar(value="samples=0")
+        self.ident_reason_var = tk.StringVar(value="-")
+        self.ident_current_var = tk.StringVar(value="-")
+        self.ident_fit_var = tk.StringVar(value="no fit")
 
         self.module_state: dict[str, dict[str, tk.StringVar]] = {}
         self.baro_vars: dict[str, tk.StringVar] = {}
@@ -794,12 +899,14 @@ class DronePanel(tk.Tk):
         baro = ttk.Frame(self.notebook, padding=10)
         imu = ttk.Frame(self.notebook, padding=10)
         gps = ttk.Frame(self.notebook, padding=10)
+        ident = ttk.Frame(self.notebook, padding=10)
         params = ttk.Frame(self.notebook, padding=10)
         servos = ttk.Frame(self.notebook, padding=10)
         commands = ttk.Frame(self.notebook, padding=10)
         self.baro_tab = baro
         self.imu_tab = imu
         self.gps_tab = gps
+        self.ident_tab = ident
 
         self.notebook.add(overview, text="模块总览")
         self.notebook.add(baro, text="SPL06 气压计")
@@ -810,10 +917,13 @@ class DronePanel(tk.Tk):
 
         self.notebook.add(gps, text="GPS 轨迹")
 
+        self.notebook.add(ident, text="系统辨识")
+
         self._build_overview_page(overview)
         self._build_baro_page(baro)
         self._build_imu_page(imu)
         self._build_gps_page(gps)
+        self._build_ident_page(ident)
         self._build_params_page(params)
         self._build_servo_page(servos)
         self._build_command_page(commands)
@@ -1178,6 +1288,77 @@ class DronePanel(tk.Tk):
 
         info.columnconfigure(1, weight=1)
 
+    def _build_ident_page(self, parent: ttk.Frame) -> None:
+        top = ttk.Frame(parent)
+        top.pack(fill=tk.X)
+        ttk.Button(top, text="ARM", command=lambda: self._send_proto(PROTO_REQ_IDENT, "IDENT ARM")).pack(side=tk.LEFT)
+        ttk.Button(top, text="DISARM", command=lambda: self._send_proto(PROTO_REQ_IDENT, "IDENT DISARM")).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="STOP", command=lambda: self._send_proto(PROTO_REQ_IDENT, "IDENT STOP")).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="STATUS", command=lambda: self._send_proto(PROTO_REQ_IDENT, "IDENT?")).pack(side=tk.LEFT, padx=4)
+        ttk.Label(top, textvariable=self.ident_status_var).pack(side=tk.LEFT, padx=(18, 4))
+        ttk.Label(top, textvariable=self.ident_sample_count_var).pack(side=tk.LEFT, padx=4)
+        ttk.Label(top, textvariable=self.ident_reason_var).pack(side=tk.LEFT, padx=4)
+
+        panes = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
+        panes.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        left = ttk.Frame(panes)
+        right = ttk.Frame(panes)
+        panes.add(left, weight=2)
+        panes.add(right, weight=3)
+
+        cfg = ttk.LabelFrame(left, text="Experiment", padding=10)
+        cfg.pack(fill=tk.X)
+        ttk.Label(cfg, text="Axis").grid(row=0, column=0, sticky=tk.W, pady=3)
+        ttk.Combobox(cfg, textvariable=self.ident_axis_var, values=("roll", "pitch"), width=10, state="readonly").grid(row=0, column=1, sticky=tk.W, pady=3)
+        ttk.Label(cfg, text="Mode").grid(row=1, column=0, sticky=tk.W, pady=3)
+        ttk.Combobox(cfg, textvariable=self.ident_mode_var, values=("STEP", "DOUBLET", "PRBS"), width=10, state="readonly").grid(row=1, column=1, sticky=tk.W, pady=3)
+        numeric = [
+            ("pulse_us", self.ident_pulse_var),
+            ("duration_ms", self.ident_duration_var),
+            ("hold_ms", self.ident_hold_var),
+            ("repeat", self.ident_repeat_var),
+            ("bit_ms", self.ident_bit_var),
+            ("seed", self.ident_seed_var),
+            ("alpha_center", self.ident_alpha_center_var),
+            ("beta_center", self.ident_beta_center_var),
+        ]
+        for index, (label, var) in enumerate(numeric, start=2):
+            ttk.Label(cfg, text=label).grid(row=index, column=0, sticky=tk.W, pady=3)
+            ttk.Entry(cfg, textvariable=var, width=12).grid(row=index, column=1, sticky=tk.W, pady=3)
+        ttk.Button(cfg, text="Set Center", command=self._ident_send_center).grid(row=10, column=0, sticky=tk.EW, pady=(8, 0))
+        ttk.Button(cfg, text="Run", command=self._ident_run).grid(row=10, column=1, sticky=tk.EW, pady=(8, 0))
+
+        fit = ttk.LabelFrame(left, text="Fit / PID", padding=10)
+        fit.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(fit, textvariable=self.ident_fit_var, wraplength=320).pack(fill=tk.X)
+        actions = ttk.Frame(fit)
+        actions.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(actions, text="Fit", command=self._ident_fit).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Apply", command=self._ident_apply_fit).pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions, text="Save", command=lambda: self._send_proto_once(PROTO_REQ_SAVE, "SAVE")).pack(side=tk.LEFT)
+
+        live = ttk.LabelFrame(left, text="Live", padding=10)
+        live.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(live, textvariable=self.ident_current_var, wraplength=320).pack(fill=tk.X)
+        ttk.Button(live, text="Open CSV Folder", command=self._ident_open_folder).pack(anchor=tk.W, pady=(8, 0))
+
+        plot_box = ttk.LabelFrame(right, text="Input / Response", padding=8)
+        plot_box.pack(fill=tk.BOTH, expand=True)
+        if HAS_MATPLOTLIB and Figure is not None and FigureCanvasTkAgg is not None:
+            self.ident_figure = Figure(figsize=(6, 4), dpi=100)
+            self.ident_axis_plot = self.ident_figure.add_subplot(111)
+            self.ident_canvas = FigureCanvasTkAgg(self.ident_figure, master=plot_box)
+            self.ident_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        else:
+            ttk.Label(
+                plot_box,
+                text=f"matplotlib unavailable; CSV logging still works.\npython -m pip install matplotlib\n{MATPLOTLIB_ERROR}",
+                wraplength=560,
+            ).pack(fill=tk.X, pady=(12, 0))
+            self.ident_figure = None
+            self.ident_axis_plot = None
+            self.ident_canvas = None
+
     def _build_params_page(self, parent: ttk.Frame) -> None:
         top = ttk.Frame(parent)
         top.pack(fill=tk.X)
@@ -1420,6 +1601,7 @@ class DronePanel(tk.Tk):
                 return
             self.transport.start(self.udp_bind_var.get(), local_port, module_ip, module_port)
             self.structured_protocol_supported = False
+            self.after(250, lambda: self.transport.send_line("PING") if self.transport is self.udp_transport else None)
             return
 
         try:
@@ -1891,6 +2073,8 @@ class DronePanel(tk.Tk):
             self._update_imu_line("IMU " + line)
         elif line.startswith("WIFI "):
             self._update_wifi_line(line)
+        elif line.startswith("IDENT "):
+            self._ident_handle_line(line)
         elif line.startswith("RSP "):
             self._handle_rsp_line(line)
         elif line.startswith("OK servo"):
@@ -2766,6 +2950,140 @@ class DronePanel(tk.Tk):
                 writer.writerow(point)
         self._append(f"[上位机] 已导出 GPS 轨迹: {filename}")
 
+    def _ident_csv_fields(self) -> list[str]:
+        return [
+            "host_time", "id", "seq", "t_ms", "axis", "mode",
+            "alpha_us", "beta_us", "roll", "pitch", "gx", "gy",
+            "rc_arm", "throttle_us", "line",
+        ]
+
+    def _ident_begin_recording(self) -> None:
+        self._ident_close_csv()
+        path = Path(__file__).resolve().parent / "ident_runs"
+        path.mkdir(parents=True, exist_ok=True)
+        self.ident_current_path = path / f"ident_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        self.ident_csv_file = self.ident_current_path.open("w", newline="", encoding="utf-8")
+        self.ident_csv_writer = csv.DictWriter(self.ident_csv_file, fieldnames=self._ident_csv_fields(), extrasaction="ignore")
+        self.ident_csv_writer.writeheader()
+        self.ident_samples.clear()
+        self.ident_last_fit = None
+        self.ident_fit_var.set("no fit")
+
+    def _ident_close_csv(self) -> None:
+        if self.ident_csv_file is not None:
+            self.ident_csv_file.close()
+        self.ident_csv_file = None
+        self.ident_csv_writer = None
+
+    def _ident_run(self) -> None:
+        axis = self.ident_axis_var.get()
+        mode = self.ident_mode_var.get().upper()
+        pulse = int(self.ident_pulse_var.get())
+        if mode == "STEP":
+            payload = f"IDENT STEP {axis} pulse_us={pulse} duration_ms={int(self.ident_duration_var.get())}"
+        elif mode == "DOUBLET":
+            payload = f"IDENT DOUBLET {axis} pulse_us={pulse} hold_ms={int(self.ident_hold_var.get())} repeat={int(self.ident_repeat_var.get())}"
+        else:
+            payload = f"IDENT PRBS {axis} pulse_us={pulse} bit_ms={int(self.ident_bit_var.get())} duration_ms={int(self.ident_duration_var.get())} seed={int(self.ident_seed_var.get())}"
+        self._ident_begin_recording()
+        self._send_proto(PROTO_REQ_IDENT, payload)
+
+    def _ident_send_center(self) -> None:
+        payload = f"IDENT CENTER alpha_us={int(self.ident_alpha_center_var.get())} beta_us={int(self.ident_beta_center_var.get())}"
+        self._send_proto(PROTO_REQ_IDENT, payload)
+
+    def _ident_handle_line(self, line: str) -> None:
+        values = parse_kv(line)
+        if line.startswith("IDENT start "):
+            self.ident_status_var.set("running")
+            self.ident_reason_var.set("running")
+            return
+        if line.startswith("IDENT done "):
+            self.ident_status_var.set("done")
+            self.ident_reason_var.set(values.get("reason", "complete"))
+            self._ident_close_csv()
+            return
+        if line.startswith("IDENT abort "):
+            self.ident_status_var.set("aborted")
+            self.ident_reason_var.set(values.get("reason", "abort"))
+            self._ident_close_csv()
+            return
+        if line.startswith("IDENT state="):
+            self.ident_status_var.set(values.get("state", "-"))
+            self.ident_reason_var.set(values.get("reason", "-"))
+            return
+        record = ident_record_from_line(line)
+        if record is None:
+            return
+        record["host_time"] = f"{time.time():.6f}"
+        self.ident_samples.append(record)
+        if len(self.ident_samples) > MAX_IDENT_SAMPLES:
+            del self.ident_samples[: len(self.ident_samples) - MAX_IDENT_SAMPLES]
+        if self.ident_csv_writer is None:
+            self._ident_begin_recording()
+        if self.ident_csv_writer is not None:
+            self.ident_csv_writer.writerow(record)
+            if self.ident_csv_file is not None:
+                self.ident_csv_file.flush()
+        self.ident_sample_count_var.set(f"samples={len(self.ident_samples)}")
+        self.ident_current_var.set(
+            f"seq={record.get('seq', '-')} alpha={record.get('alpha_us', '-')} beta={record.get('beta_us', '-')} "
+            f"roll={record.get('roll', '-')} pitch={record.get('pitch', '-')} gx={record.get('gx', '-')} gy={record.get('gy', '-')}"
+        )
+        self._ident_update_plot()
+
+    def _ident_update_plot(self) -> None:
+        if not HAS_MATPLOTLIB or getattr(self, "ident_axis_plot", None) is None or getattr(self, "ident_canvas", None) is None:
+            return
+        if not self.ident_samples:
+            return
+        axis_name = self.ident_axis_var.get()
+        value_key = "roll" if axis_name == "roll" else "pitch"
+        input_key = "beta_us" if axis_name == "roll" else "alpha_us"
+        rows = [row for row in self.ident_samples if isinstance(row.get("t_ms"), int)]
+        if not rows:
+            return
+        t0 = float(rows[0]["t_ms"]) / 1000.0
+        xs = [(float(row["t_ms"]) / 1000.0) - t0 for row in rows]
+        ys = [float(row.get(value_key, 0.0)) for row in rows]
+        us = [float(row.get(input_key, 0.0)) for row in rows]
+        axis = self.ident_axis_plot
+        axis.clear()
+        axis.plot(xs, ys, label=value_key)
+        if us:
+            base = us[0]
+            axis.plot(xs, [(u - base) / 10.0 for u in us], label=f"{input_key} delta/10")
+        axis.set_xlabel("s")
+        axis.legend(loc="best")
+        axis.grid(True, alpha=0.3)
+        self.ident_canvas.draw_idle()
+
+    def _ident_fit(self) -> None:
+        fit = fit_ident_step(self.ident_samples, self.ident_axis_var.get())
+        self.ident_last_fit = fit
+        if fit is None:
+            self.ident_fit_var.set("fit failed: need a clean step/doublet response")
+            return
+        self.ident_fit_var.set(
+            f"K={fit['K']:.5f} tau={fit['tau']:.3f}s L={fit['L']:.3f}s "
+            f"kp={fit['kp']:.5f} kd={fit['kd']:.5f}"
+        )
+
+    def _ident_apply_fit(self) -> None:
+        if self.ident_last_fit is None:
+            self._ident_fit()
+        if self.ident_last_fit is None:
+            return
+        axis = self.ident_axis_var.get()
+        fit = self.ident_last_fit
+        payload = f"IDENT APPLY {axis} kp={fit['kp']:.6f} kd={fit['kd']:.6f}"
+        self._send_proto(PROTO_REQ_IDENT, payload)
+
+    def _ident_open_folder(self) -> None:
+        path = Path(__file__).resolve().parent / "ident_runs"
+        path.mkdir(parents=True, exist_ok=True)
+        messagebox.showinfo("IDENT", f"CSV folder:\n{path}")
+
     def _update_config_line(self, line: str) -> None:
         values = parse_kv(line)
         if "loaded" in values or "valid" in values:
@@ -3026,6 +3344,7 @@ class DronePanel(tk.Tk):
 
     def _on_close(self) -> None:
         self._stop()
+        self._ident_close_csv()
         self.destroy()
 
 

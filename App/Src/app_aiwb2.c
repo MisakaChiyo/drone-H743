@@ -686,6 +686,7 @@ uint8_t APP_AiWB2_IsControlPayload(const char *line)
         (strcmp(line, "PARAM?") == 0) ||
         (strcmp(line, "PID?") == 0) ||
         (strcmp(line, "WIFI?") == 0) ||
+        (strcmp(line, "IDENT?") == 0) ||
         (strcmp(line, "WIFI_EN?") == 0) ||
         (strcmp(line, "SAVE") == 0) ||
         (strcmp(line, "LOAD") == 0) ||
@@ -693,6 +694,7 @@ uint8_t APP_AiWB2_IsControlPayload(const char *line)
         (aiwb2_starts_with(line, "REQ ") != 0U) ||
         (aiwb2_starts_with(line, "BARO ") != 0U) ||
         (aiwb2_starts_with(line, "WIFI ") != 0U) ||
+        (aiwb2_starts_with(line, "IDENT ") != 0U) ||
         (aiwb2_starts_with(line, "WIFI_EN ") != 0U) ||
         (aiwb2_starts_with(line, "PARAM ") != 0U) ||
         (aiwb2_starts_with(line, "PID ") != 0U) ||

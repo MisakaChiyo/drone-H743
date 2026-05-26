@@ -92,6 +92,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     App/Src/app_flash.c
     App/Src/app_flash_service.c
     App/Src/app_gps.c
+    App/Src/app_ident.c
     App/Src/app_sensor.c
     App/Src/app_led.c
     App/Src/app_mag.c
