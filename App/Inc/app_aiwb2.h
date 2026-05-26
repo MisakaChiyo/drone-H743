@@ -40,6 +40,10 @@ uint8_t APP_AiWB2_StartProvision(const char *ssid,
                                  APP_AiWB2_LinkMode mode,
                                  const char *host,
                                  const char *port);
+uint8_t APP_AiWB2_StartSoftAp(const char *ssid,
+                              const char *password,
+                              const char *channel,
+                              const char *port);
 uint8_t APP_AiWB2_StartSocketConfig(APP_AiWB2_LinkMode mode,
                                     const char *host,
                                     const char *port);

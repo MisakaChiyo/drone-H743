@@ -3,6 +3,31 @@
 This folder contains PC-side helpers for testing the Ai-WB2-12F module before
 the STM32 firmware owns the link.
 
+## Direct SoftAP UDP mode
+
+Current firmware starts the Ai-WB2-12F as a SoftAP by default:
+
+- SSID: `DroneH743`
+- Password: `12345678`
+- Module IP/gateway: `192.168.43.1`
+- DHCP clients: `192.168.43.100` to `192.168.43.200`
+- UDP server port: `7777`
+
+Connect the PC to `DroneH743`, then send one UDP packet to the module so the
+UDP server learns your PC as the peer:
+
+```bash
+python3 tools/aiwb2_net_tool.py udp-send --module-ip 192.168.43.1 --module-port 7777 --message PING
+```
+
+After that, VOFA or the Python UDP tools can receive telemetry from the module.
+If you need to change the AP without rebuilding, send through the maintenance
+UART:
+
+```text
+WIFI AP MyDrone 12345678 7777 6
+```
+
 Print the PC IP used to reach the module:
 
 ```bash
@@ -28,13 +53,13 @@ uses it for replies.
 Send one UDP packet to the module:
 
 ```bash
-python3 tools/aiwb2_net_tool.py udp-send --module-ip 192.168.223.181 --module-port 7777 --message PING1234
+python3 tools/aiwb2_net_tool.py udp-send --module-ip 192.168.43.1 --module-port 7777 --message PING1234
 ```
 
 Run a two-way UDP console:
 
 ```bash
-python3 tools/aiwb2_net_tool.py udp-bridge --local-port 6666 --module-ip 192.168.223.181 --module-port 7777
+python3 tools/aiwb2_net_tool.py udp-bridge --local-port 6666 --module-ip 192.168.43.1 --module-port 7777
 ```
 
 Run a TCP server for the module to connect:
@@ -123,6 +148,6 @@ The Ai-WB2 is configured as an auto-transparent UDP server on module port
 Suggested VOFA settings:
 
 - `数据接口`: `UDP`
-- `远程IP`: the Ai-WB2 module IP shown by the router or `WIFI?`
+- `远程IP`: `192.168.43.1` in default SoftAP mode, or the IP shown by `WIFI?`
 - `远程端口`: `7777`
 - `本地端口`: any free local UDP port, for example `6668`

@@ -22,9 +22,24 @@ def test_wifi_diag_escapes_transparent_mode_before_at_queries() -> None:
     app_aiwb2 = read("App/Src/app_aiwb2.c")
 
     assert 'aiwb2_provision_commands[2] = (APP_AiWB2Command){ "AT+WJAP?"' in app_aiwb2
-    assert 'aiwb2_provision_commands[6] = (APP_AiWB2Command){ "AT+SOCKETTT"' in app_aiwb2
+    assert 'aiwb2_provision_commands[4] = (APP_AiWB2Command){ "AT+WAP?"' in app_aiwb2
+    assert 'aiwb2_provision_commands[5] = (APP_AiWB2Command){ "AT+WAPDHCP?"' in app_aiwb2
+    assert 'aiwb2_provision_commands[8] = (APP_AiWB2Command){ "AT+SOCKETTT"' in app_aiwb2
     assert "aiwb2_state = APP_AIWB2_STATE_ESCAPE_BEFORE;" in app_aiwb2
     assert 'APP_AiWB2_SendRawCommand(commands[i])' not in app_aiwb2
+
+
+def test_aiwb2_default_wifi_mode_is_softap_udp_server() -> None:
+    app_aiwb2 = read("App/Src/app_aiwb2.c")
+    app_control = read("App/Src/app_control.c")
+
+    assert '#define APP_AIWB2_SOFTAP_SSID "DroneH743"' in app_aiwb2
+    assert '{ "AT+WMODE=2,1", 2500U, 0U, 0U }' in app_aiwb2
+    assert '"AT+WAP=" APP_AIWB2_SOFTAP_SSID' in app_aiwb2
+    assert '"AT+WAPDHCP=1," APP_AIWB2_SOFTAP_DHCP_START' in app_aiwb2
+    assert '{ "AT+SOCKET=1," APP_AIWB2_UDP_SERVER_PORT, 2500U, 0U, 0U }' in app_aiwb2
+    assert 'aiwb2_starts_with(command->text, "AT+SOCKET=1,")' in app_aiwb2
+    assert 'APP_AiWB2_StartSoftAp(tokens[2], tokens[3], channel, local_port)' in app_control
 
 
 def test_usart1_wifi_udp_pid_tuning_path_is_text_line_based() -> None:

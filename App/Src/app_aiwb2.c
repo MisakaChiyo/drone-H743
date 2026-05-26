@@ -25,6 +25,34 @@
 #define APP_AIWB2_UDP_SERVER_PORT "7777"
 #endif
 
+#ifndef APP_AIWB2_SOFTAP_SSID
+#define APP_AIWB2_SOFTAP_SSID "DroneH743"
+#endif
+
+#ifndef APP_AIWB2_SOFTAP_PASSWORD
+#define APP_AIWB2_SOFTAP_PASSWORD "12345678"
+#endif
+
+#ifndef APP_AIWB2_SOFTAP_CHANNEL
+#define APP_AIWB2_SOFTAP_CHANNEL "6"
+#endif
+
+#ifndef APP_AIWB2_SOFTAP_MAX_CONN
+#define APP_AIWB2_SOFTAP_MAX_CONN "1"
+#endif
+
+#ifndef APP_AIWB2_SOFTAP_DHCP_START
+#define APP_AIWB2_SOFTAP_DHCP_START "192.168.43.100"
+#endif
+
+#ifndef APP_AIWB2_SOFTAP_DHCP_END
+#define APP_AIWB2_SOFTAP_DHCP_END "192.168.43.200"
+#endif
+
+#ifndef APP_AIWB2_SOFTAP_GATEWAY
+#define APP_AIWB2_SOFTAP_GATEWAY "192.168.43.1"
+#endif
+
 #define APP_AIWB2_PASSIVE_ONLY        0U
 #define APP_AIWB2_START_DELAY_MS     8000U
 #define APP_AIWB2_PROBE_TIMEOUT_MS   8000U
@@ -51,6 +79,10 @@ typedef struct {
 static const APP_AiWB2Command aiwb2_commands[] = {
     { "ATE0", 1500U, 0U, 0U },
     { "AT+SOCKETAUTOTT=0", 1500U, 0U, 0U },
+    { "AT+WAUTOCONN=0", 1500U, 1U, 0U },
+    { "AT+WMODE=2,1", 2500U, 0U, 0U },
+    { "AT+WAP=" APP_AIWB2_SOFTAP_SSID "," APP_AIWB2_SOFTAP_PASSWORD "," APP_AIWB2_SOFTAP_CHANNEL "," APP_AIWB2_SOFTAP_MAX_CONN ",0", 2500U, 0U, 0U },
+    { "AT+WAPDHCP=1," APP_AIWB2_SOFTAP_DHCP_START "," APP_AIWB2_SOFTAP_DHCP_END "," APP_AIWB2_SOFTAP_GATEWAY, 2500U, 0U, 0U },
     { "AT+SOCKETDEL=1", 2000U, 1U, 0U },
     { "AT+SOCKETRECVCFG=1", 1500U, 0U, 0U },
     { "AT+SOCKET=1," APP_AIWB2_UDP_SERVER_PORT, 2500U, 0U, 0U },
@@ -63,8 +95,8 @@ static uint32_t aiwb2_command_index;
 static uint8_t aiwb2_probe_escape_used;
 static uint8_t aiwb2_power_recycle_active;
 static int32_t aiwb2_last_socket_error;
-static APP_AiWB2Command aiwb2_provision_commands[7];
-static char aiwb2_provision_text[7][128];
+static APP_AiWB2Command aiwb2_provision_commands[10];
+static char aiwb2_provision_text[10][128];
 static uint32_t aiwb2_provision_command_count;
 static uint8_t aiwb2_provision_active;
 static uint32_t aiwb2_manual_at_deadline_ms;
@@ -526,6 +558,10 @@ void APP_AiWB2_ProcessLine(const char *line)
         }
         command = &commands[aiwb2_command_index];
         if (strcmp(line, "OK") == 0) {
+            if (aiwb2_starts_with(command->text, "AT+SOCKET=1,") != 0U) {
+                aiwb2_socket_con_id = 1U;
+                aiwb2_socket_ready = 1U;
+            }
             aiwb2_command_done();
             return;
         }
@@ -796,6 +832,71 @@ uint8_t APP_AiWB2_StartProvision(const char *ssid,
     return 1U;
 }
 
+uint8_t APP_AiWB2_StartSoftAp(const char *ssid,
+                              const char *password,
+                              const char *channel,
+                              const char *port)
+{
+    int written;
+
+    if ((ssid == 0) || (password == 0) || (channel == 0) || (port == 0) ||
+        (*ssid == '\0') || (*channel == '\0') || (*port == '\0')) {
+        return 0U;
+    }
+
+    (void)snprintf(aiwb2_provision_text[0], sizeof(aiwb2_provision_text[0]), "ATE0");
+    (void)snprintf(aiwb2_provision_text[1], sizeof(aiwb2_provision_text[1]), "AT+SOCKETAUTOTT=0");
+    (void)snprintf(aiwb2_provision_text[2], sizeof(aiwb2_provision_text[2]), "AT+WAUTOCONN=0");
+    (void)snprintf(aiwb2_provision_text[3], sizeof(aiwb2_provision_text[3]), "AT+WMODE=2,1");
+    written = snprintf(aiwb2_provision_text[4],
+                       sizeof(aiwb2_provision_text[4]),
+                       "AT+WAP=%s,%s,%s," APP_AIWB2_SOFTAP_MAX_CONN ",0",
+                       ssid,
+                       password,
+                       channel);
+    if ((written < 0) || ((uint32_t)written >= sizeof(aiwb2_provision_text[4]))) {
+        return 0U;
+    }
+    (void)snprintf(aiwb2_provision_text[5],
+                   sizeof(aiwb2_provision_text[5]),
+                   "AT+WAPDHCP=1," APP_AIWB2_SOFTAP_DHCP_START ","
+                   APP_AIWB2_SOFTAP_DHCP_END "," APP_AIWB2_SOFTAP_GATEWAY);
+    (void)snprintf(aiwb2_provision_text[6], sizeof(aiwb2_provision_text[6]), "AT+SOCKETDEL=1");
+    (void)snprintf(aiwb2_provision_text[7], sizeof(aiwb2_provision_text[7]), "AT+SOCKETRECVCFG=1");
+    written = snprintf(aiwb2_provision_text[8],
+                       sizeof(aiwb2_provision_text[8]),
+                       "AT+SOCKET=1,%s",
+                       port);
+    if ((written < 0) || ((uint32_t)written >= sizeof(aiwb2_provision_text[8]))) {
+        return 0U;
+    }
+
+    aiwb2_provision_commands[0] = (APP_AiWB2Command){ aiwb2_provision_text[0], 1500U, 0U, 0U };
+    aiwb2_provision_commands[1] = (APP_AiWB2Command){ aiwb2_provision_text[1], 1500U, 0U, 0U };
+    aiwb2_provision_commands[2] = (APP_AiWB2Command){ aiwb2_provision_text[2], 1500U, 1U, 0U };
+    aiwb2_provision_commands[3] = (APP_AiWB2Command){ aiwb2_provision_text[3], 2500U, 0U, 0U };
+    aiwb2_provision_commands[4] = (APP_AiWB2Command){ aiwb2_provision_text[4], 2500U, 0U, 0U };
+    aiwb2_provision_commands[5] = (APP_AiWB2Command){ aiwb2_provision_text[5], 2500U, 0U, 0U };
+    aiwb2_provision_commands[6] = (APP_AiWB2Command){ aiwb2_provision_text[6], 2000U, 1U, 0U };
+    aiwb2_provision_commands[7] = (APP_AiWB2Command){ aiwb2_provision_text[7], 1500U, 0U, 0U };
+    aiwb2_provision_commands[8] = (APP_AiWB2Command){ aiwb2_provision_text[8], 2500U, 0U, 0U };
+    aiwb2_provision_command_count = 9U;
+
+    if (BSP_AiWB2_IsEnabled() == 0U) {
+        BSP_AiWB2_SetEnabled(1U);
+    }
+
+    aiwb2_provision_active = 1U;
+    aiwb2_power_recycle_active = 0U;
+    aiwb2_command_index = 0U;
+    aiwb2_probe_escape_used = 0U;
+    aiwb2_socket_ready = 0U;
+    aiwb2_socket_peer_ready = 0U;
+    aiwb2_begin_probe();
+
+    return 1U;
+}
+
 uint8_t APP_AiWB2_StartSocketConfig(APP_AiWB2_LinkMode mode,
                                     const char *host,
                                     const char *port)
@@ -858,10 +959,12 @@ void APP_AiWB2_SendDiagCommands(void)
     aiwb2_provision_commands[1] = (APP_AiWB2Command){ "AT+WMODE?", 1500U, 1U, 0U };
     aiwb2_provision_commands[2] = (APP_AiWB2Command){ "AT+WJAP?", 2500U, 1U, 0U };
     aiwb2_provision_commands[3] = (APP_AiWB2Command){ "AT+WAUTOCONN?", 1500U, 1U, 0U };
-    aiwb2_provision_commands[4] = (APP_AiWB2Command){ "AT+SOCKETAUTOTT?", 1500U, 1U, 0U };
-    aiwb2_provision_commands[5] = (APP_AiWB2Command){ "AT+SOCKET?", 1500U, 1U, 0U };
-    aiwb2_provision_commands[6] = (APP_AiWB2Command){ "AT+SOCKETTT", 3000U, 1U, 0U };
-    aiwb2_provision_command_count = 7U;
+    aiwb2_provision_commands[4] = (APP_AiWB2Command){ "AT+WAP?", 1500U, 1U, 0U };
+    aiwb2_provision_commands[5] = (APP_AiWB2Command){ "AT+WAPDHCP?", 1500U, 1U, 0U };
+    aiwb2_provision_commands[6] = (APP_AiWB2Command){ "AT+SOCKETAUTOTT?", 1500U, 1U, 0U };
+    aiwb2_provision_commands[7] = (APP_AiWB2Command){ "AT+SOCKET?", 1500U, 1U, 0U };
+    aiwb2_provision_commands[8] = (APP_AiWB2Command){ "AT+SOCKETTT", 3000U, 1U, 0U };
+    aiwb2_provision_command_count = 9U;
 
     if (BSP_AiWB2_IsEnabled() == 0U) {
         BSP_AiWB2_SetEnabled(1U);

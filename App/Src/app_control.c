@@ -2124,6 +2124,29 @@ static void app_control_handle_wifi(char **tokens, uint32_t count)
         return;
     }
 
+    if (strcmp(tokens[1], "AP") == 0) {
+        const char *local_port;
+        const char *channel;
+
+        if (count < 4U) {
+            APP_Control_QueueText("ERR usage WIFI AP ssid password [local_port] [channel]\r\n");
+            return;
+        }
+
+        local_port = (count >= 5U) ? tokens[4] : "7777";
+        channel = (count >= 6U) ? tokens[5] : "6";
+        if (APP_AiWB2_StartSoftAp(tokens[2], tokens[3], channel, local_port) == 0U) {
+            APP_Control_QueueText("ERR wifi ap bad args\r\n");
+            return;
+        }
+
+        APP_Control_QueueText("OK wifi ap queued ssid=%s ip=192.168.43.1 udp_server_port=%s channel=%s\r\n",
+                              tokens[2],
+                              local_port,
+                              channel);
+        return;
+    }
+
     APP_Control_QueueText("ERR unknown wifi subcmd %s\r\n", tokens[1]);
 }
 
