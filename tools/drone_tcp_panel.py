@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import queue
 import re
 import socket
@@ -159,6 +160,21 @@ MODULE_ALIASES = {
     "WIFI": "WIFI",
     "AIWB2": "WIFI",
 }
+
+
+def udp_payload_is_probably_text(data: bytes) -> bool:
+    if not data:
+        return False
+    if data.startswith(PROTO_HEADER):
+        return True
+    if b"\x00" in data:
+        return False
+
+    allowed = 0
+    for byte in data:
+        if byte in (9, 10, 13) or 32 <= byte <= 126:
+            allowed += 1
+    return (allowed / len(data)) >= 0.95
 
 
 def parse_kv(line: str) -> dict[str, str]:
@@ -595,7 +611,9 @@ class UdpTransport(TransportBase):
                 continue
             except OSError:
                 break
-            self.rx_queue.put(f"[host] UDP RX {addr[0]}:{addr[1]} {len(data)}B")
+            if not udp_payload_is_probably_text(data):
+                self.rx_queue.put(("udp_raw", addr[0], addr[1], len(data)))
+                continue
             buffer = bytearray(data)
             self._consume_buffer(buffer)
             if buffer:
@@ -783,9 +801,12 @@ class DronePanel(tk.Tk):
         self.ident_csv_file = None
         self.ident_csv_writer: csv.DictWriter | None = None
         self.ident_current_path: Path | None = None
+        self.ident_current_meta_path: Path | None = None
         self.ident_last_fit: dict[str, float] | None = None
         self.ident_current_command = ""
         self.airframe_info: dict[str, str | float] = {}
+        self.udp_raw_hidden_count = 0
+        self.udp_raw_last_note = ""
 
         self.link_var = tk.StringVar(value="未连接")
         self.last_cmd_var = tk.StringVar(value="-")
@@ -818,6 +839,10 @@ class DronePanel(tk.Tk):
         self.ident_current_var = tk.StringVar(value="-")
         self.ident_fit_var = tk.StringVar(value="no fit")
         self.ident_airframe_var = tk.StringVar(value="AIRFRAME: not loaded")
+        self.ident_save_dir = Path(__file__).resolve().parent / "ident_runs"
+        self.ident_output_dir_var = tk.StringVar(value=f"save dir: {self.ident_save_dir}")
+        self.ident_last_file_var = tk.StringVar(value="last file: none")
+        self.ident_link_var = tk.StringVar(value="UDP text: waiting")
 
         self.module_state: dict[str, dict[str, tk.StringVar]] = {}
         self.baro_vars: dict[str, tk.StringVar] = {}
@@ -1360,9 +1385,16 @@ class DronePanel(tk.Tk):
 
         live = ttk.LabelFrame(left, text="Live", padding=10)
         live.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(live, textvariable=self.ident_link_var, wraplength=520).pack(fill=tk.X, pady=(0, 4))
         ttk.Label(live, textvariable=self.ident_airframe_var, wraplength=320).pack(fill=tk.X, pady=(0, 8))
         ttk.Label(live, textvariable=self.ident_current_var, wraplength=320).pack(fill=tk.X)
-        ttk.Button(live, text="Open CSV Folder", command=self._ident_open_folder).pack(anchor=tk.W, pady=(8, 0))
+        ttk.Label(live, textvariable=self.ident_output_dir_var, wraplength=520).pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(live, textvariable=self.ident_last_file_var, wraplength=520).pack(fill=tk.X, pady=(2, 0))
+        actions_live = ttk.Frame(live)
+        actions_live.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(actions_live, text="Open CSV Folder", command=self._ident_open_folder).pack(side=tk.LEFT)
+        ttk.Button(actions_live, text="Pause VOFA", command=lambda: self._send("Sensor_Data:0")).pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions_live, text="Resume VOFA", command=lambda: self._send("Sensor_Data:1")).pack(side=tk.LEFT)
 
         plot_box = ttk.LabelFrame(right, text="Input / Response", padding=8)
         plot_box.pack(fill=tk.BOTH, expand=True)
@@ -1663,6 +1695,8 @@ class DronePanel(tk.Tk):
             self._append("[上位机] 发送失败")
             return
         sent_at = time.monotonic()
+        if self.transport is self.udp_transport and label in {"PING", "AIRFRAME?", "IDENT?", "STATUS?"}:
+            self.ident_link_var.set(f"sent {label}; waiting for text reply")
         if self.transport is self.udp_transport:
             pass
         elif self.structured_protocol_supported is False and not (self.transport is self.serial_transport and SERIAL_ASCII_COMPAT_MODE):
@@ -1734,6 +1768,8 @@ class DronePanel(tk.Tk):
         line = self.cmd_var.get().strip()
         if line:
             self._send(line)
+            if self.transport is self.udp_transport and line in {"PING", "AIRFRAME?", "IDENT?", "STATUS?"}:
+                self.ident_link_var.set(f"sent {line}; waiting for text reply")
             self.cmd_var.set("")
 
     def _read_all_params(self) -> None:
@@ -1795,6 +1831,10 @@ class DronePanel(tk.Tk):
         if line.startswith(("GPS_USART2 ", "MAG_I2C1 ")):
             return False
         if line.startswith("BARO ok="):
+            return False
+        if line.startswith("[host] UDP RX "):
+            return False
+        if line.startswith("RXRAW "):
             return False
         if re.search(r"(^|[ ,])ax=", line) and re.search(r"(^|[ ,])az=", line):
             return False
@@ -2068,8 +2108,10 @@ class DronePanel(tk.Tk):
 
         if not (line.startswith("[上位机]") or line.startswith("[host]")):
             self.last_board_rx = time.monotonic()
-            mode = "TCP" if self.transport is self.tcp_transport else "串口"
+            mode = self._transport_label()
             self.link_var.set(f"已收到 STM32 数据，{mode} 链路正常")
+            if line.startswith(("AIRFRAME ", "IDENT ", "OK ", "ERR ", "PONG", "READY")):
+                self.ident_link_var.set(f"{mode} text OK: {line[:96]}")
 
         if line.startswith("READY"):
             self.last_board_rx = time.monotonic()
@@ -3014,22 +3056,34 @@ class DronePanel(tk.Tk):
         if self.ident_current_path is None:
             return
         meta_path = self.ident_current_path.with_name(f"{self.ident_current_path.stem}_meta.json")
+        self.ident_current_meta_path = meta_path
         meta_path.write_text(
             json.dumps(self._ident_meta_payload(), ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+        if hasattr(self, "_ident_update_file_label"):
+            self._ident_update_file_label()
+
+    def _ident_update_file_label(self) -> None:
+        csv_text = str(self.ident_current_path) if self.ident_current_path is not None else "none"
+        meta_text = str(self.ident_current_meta_path) if self.ident_current_meta_path is not None else "none"
+        self.ident_last_file_var.set(f"last csv: {csv_text}\nlast meta: {meta_text}")
 
     def _ident_begin_recording(self) -> None:
         self._ident_close_csv()
-        path = Path(__file__).resolve().parent / "ident_runs"
+        path = self.ident_save_dir
         path.mkdir(parents=True, exist_ok=True)
         self.ident_current_path = path / f"ident_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        self.ident_current_meta_path = self.ident_current_path.with_name(f"{self.ident_current_path.stem}_meta.json")
         self.ident_csv_file = self.ident_current_path.open("w", newline="", encoding="utf-8")
         self.ident_csv_writer = csv.DictWriter(self.ident_csv_file, fieldnames=self._ident_csv_fields(), extrasaction="ignore")
         self.ident_csv_writer.writeheader()
         self.ident_samples.clear()
         self.ident_last_fit = None
+        self.ident_sample_count_var.set("samples=0")
         self.ident_fit_var.set("no fit")
+        self.ident_output_dir_var.set(f"save dir: {path}")
+        self._ident_update_file_label()
         self._ident_write_meta()
 
     def _ident_close_csv(self) -> None:
@@ -3061,6 +3115,7 @@ class DronePanel(tk.Tk):
         if record is None:
             return
         self.airframe_info = record
+        self.ident_link_var.set("AIRFRAME received")
         self.ident_airframe_var.set(
             f"AIRFRAME m={record.get('mass_kg', '-')}kg cg_z={record.get('cg_z_m', '-')}m "
             f"attach_cg={record.get('tether_attach_to_cg_m', '-')}m rope={record.get('rope_m', '-')}m "
@@ -3072,21 +3127,25 @@ class DronePanel(tk.Tk):
         if line.startswith("IDENT start "):
             self.ident_status_var.set("running")
             self.ident_reason_var.set("running")
+            self.ident_link_var.set(f"IDENT running: {line}")
             self._ident_write_meta()
             return
         if line.startswith("IDENT done "):
             self.ident_status_var.set("done")
             self.ident_reason_var.set(values.get("reason", "complete"))
+            self.ident_link_var.set(f"IDENT done: {line}")
             self._ident_close_csv()
             return
         if line.startswith("IDENT abort "):
             self.ident_status_var.set("aborted")
             self.ident_reason_var.set(values.get("reason", "abort"))
+            self.ident_link_var.set(f"IDENT aborted: {line}")
             self._ident_close_csv()
             return
         if line.startswith("IDENT state="):
             self.ident_status_var.set(values.get("state", "-"))
             self.ident_reason_var.set(values.get("reason", "-"))
+            self.ident_link_var.set(f"IDENT status: {line}")
             return
         record = ident_record_from_line(line)
         if record is None:
@@ -3101,6 +3160,7 @@ class DronePanel(tk.Tk):
             self.ident_csv_writer.writerow(record)
             if self.ident_csv_file is not None:
                 self.ident_csv_file.flush()
+            self._ident_update_file_label()
         self.ident_sample_count_var.set(f"samples={len(self.ident_samples)}")
         self.ident_current_var.set(
             f"seq={record.get('seq', '-')} alpha={record.get('alpha_us', '-')} beta={record.get('beta_us', '-')} "
@@ -3156,9 +3216,12 @@ class DronePanel(tk.Tk):
         self._send_proto(PROTO_REQ_IDENT, payload)
 
     def _ident_open_folder(self) -> None:
-        path = Path(__file__).resolve().parent / "ident_runs"
+        path = self.ident_save_dir
         path.mkdir(parents=True, exist_ok=True)
-        messagebox.showinfo("IDENT", f"CSV folder:\n{path}")
+        try:
+            os.startfile(path)  # type: ignore[attr-defined]
+        except Exception:
+            messagebox.showinfo("IDENT", f"CSV folder:\n{path}")
 
     def _update_config_line(self, line: str) -> None:
         values = parse_kv(line)
@@ -3396,6 +3459,8 @@ class DronePanel(tk.Tk):
         elif self.last_board_rx == 0.0:
             if self.transport is self.tcp_transport:
                 self.link_var.set("TCP 已连接，等待 STM32 数据")
+            elif self.transport is self.udp_transport:
+                self.link_var.set("UDP 已打开，等待 STM32 文本回复")
             else:
                 self.link_var.set("串口已打开，等待 STM32 数据")
         elif (time.monotonic() - self.last_board_rx) > 5.0:
@@ -3409,6 +3474,12 @@ class DronePanel(tk.Tk):
                 if isinstance(item, tuple) and len(item) == 3 and item[0] == "proto":
                     _tag, function, text = item
                     self._handle_proto_frame(int(function), str(text))
+                    continue
+                if isinstance(item, tuple) and len(item) == 4 and item[0] == "udp_raw":
+                    _tag, host, port, size = item
+                    self.udp_raw_hidden_count += 1
+                    self.udp_raw_last_note = f"hidden UDP binary frames={self.udp_raw_hidden_count} last={host}:{port} {size}B"
+                    self.ident_link_var.set(self.udp_raw_last_note)
                     continue
 
                 line = str(item)

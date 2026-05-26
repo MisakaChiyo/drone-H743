@@ -9,6 +9,7 @@
 
 #define APP_IDENT_MAX_OFFSET_US       80
 #define APP_IDENT_MAX_DURATION_MS     10000U
+#define APP_IDENT_SAMPLE_PERIOD_MS    20U
 #define APP_IDENT_DEFAULT_ALPHA_US    DRV_COAX_CTRL_SERVO_ALPHA_CENTER_US
 #define APP_IDENT_DEFAULT_BETA_US     DRV_COAX_CTRL_SERVO_BETA_CENTER_US
 #define APP_IDENT_ATTITUDE_LIMIT_DEG  25.0f
@@ -32,6 +33,7 @@ typedef struct {
     uint32_t id;
     uint32_t seq;
     uint32_t start_ms;
+    uint32_t last_sample_ms;
     uint32_t duration_ms;
     uint32_t hold_ms;
     uint32_t bit_ms;
@@ -246,6 +248,7 @@ static uint8_t ident_start(APP_IdentAxis axis,
     ident_ctx.seq = 0U;
     ++ident_ctx.id;
     ident_ctx.start_ms = 0U;
+    ident_ctx.last_sample_ms = 0U;
     ident_ctx.alpha_target_us = alpha;
     ident_ctx.beta_target_us = beta;
     ident_ctx.state = APP_IDENT_STATE_RUNNING;
@@ -537,6 +540,12 @@ void APP_Ident_Observe(const APP_IdentObserve *obs)
     }
 
     t_ms = obs->now_ms - ident_ctx.start_ms;
+    if ((ident_ctx.last_sample_ms != 0U) &&
+        ((obs->now_ms - ident_ctx.last_sample_ms) < APP_IDENT_SAMPLE_PERIOD_MS)) {
+        return;
+    }
+    ident_ctx.last_sample_ms = obs->now_ms;
+
     ident_format_mdeg(roll_text, sizeof(roll_text), obs->roll_deg);
     ident_format_mdeg(pitch_text, sizeof(pitch_text), obs->pitch_deg);
     ident_format_cdps(gx_text, sizeof(gx_text), obs->gyro_x_dps);

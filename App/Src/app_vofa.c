@@ -50,9 +50,7 @@ void APP_VOFA_SendFloats(const float *data, uint8_t count)
     }
 
     if (osMessageQueuePut(uartTxQueueHandle, &tx_msg, 0U, 0U) != osOK) {
-        APP_UART_TxMessage dropped;
-        (void)osMessageQueueGet(uartTxQueueHandle, &dropped, 0U, 0U);
-        (void)osMessageQueuePut(uartTxQueueHandle, &tx_msg, 0U, 0U);
+        return;
     }
 
     APP_UART_NotifyTxPending();

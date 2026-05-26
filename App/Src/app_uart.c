@@ -663,11 +663,6 @@ static void app_uart_poll_tx(void)
         app_uart_tx_pending_valid = 1U;
     }
 
-    if (app_uart_tx_pending_message.function != APP_UART_TX_FUNCTION_VOFA_SOCKET) {
-        app_uart_tx_pending_valid = 0U;
-        return;
-    }
-
     if (APP_AiWB2_IsSocketReady() == 0U) {
         app_uart_tx_pending_valid = 0U;
         return;
@@ -686,6 +681,11 @@ static void app_uart_poll_tx(void)
     if (frame_length > (uint16_t)sizeof(app_uart_tx_frame_buffer)) {
         frame_length = (uint16_t)sizeof(app_uart_tx_frame_buffer);
     }
+    /*
+     * Text control replies and VOFA binary frames share the Ai-WB2 socket.
+     * The message function tags are metadata; routing here is by socket
+     * readiness, so IDENT/AIRFRAME text must not be dropped.
+     */
     memcpy(app_uart_tx_frame_buffer,
            app_uart_tx_pending_message.text,
            frame_length);
