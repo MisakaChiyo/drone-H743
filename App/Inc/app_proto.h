@@ -36,6 +36,8 @@
 #define APP_PROTO_REQ_GPS            0x1019U
 #define APP_PROTO_REQ_MAG            0x101AU
 #define APP_PROTO_REQ_RTOS           0x101BU
+#define APP_PROTO_REQ_AIRFRAME       0x101CU
+#define APP_PROTO_REQ_IDENT          0x101DU
 
 #define APP_PROTO_MSG_CMD_LINE  0x2000U
 #define APP_PROTO_MSG_TEXT_LINE 0x2001U
@@ -74,6 +76,7 @@
 #define APP_PROTO_MSG_MAG_RECORD        0x221CU
 #define APP_PROTO_MSG_RTOS_RECORD       0x221DU
 #define APP_PROTO_MSG_FLASH_BENCH       0x221EU
+#define APP_PROTO_MSG_AIRFRAME_RECORD   0x221FU
 
 /* Temporarily disabled for VOFA migration
 typedef struct {

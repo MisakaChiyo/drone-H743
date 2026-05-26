@@ -684,6 +684,7 @@ uint8_t APP_AiWB2_IsControlPayload(const char *line)
         (strcmp(line, "BARO?") == 0) ||
         (strcmp(line, "IMU?") == 0) ||
         (strcmp(line, "PARAM?") == 0) ||
+        (strcmp(line, "AIRFRAME?") == 0) ||
         (strcmp(line, "PID?") == 0) ||
         (strcmp(line, "WIFI?") == 0) ||
         (strcmp(line, "IDENT?") == 0) ||

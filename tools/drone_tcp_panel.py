@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import queue
 import re
@@ -61,7 +62,9 @@ PROTO_REQ_SERVO_RAW = 0x1017
 PROTO_REQ_WIFI = 0x1018
 PROTO_REQ_GPS = 0x1019
 PROTO_REQ_MAG = 0x101A
-PROTO_REQ_IDENT = 0x101B
+PROTO_REQ_RTOS = 0x101B
+PROTO_REQ_AIRFRAME = 0x101C
+PROTO_REQ_IDENT = 0x101D
 PROTO_MSG_CMD_LINE = 0x2000
 PROTO_MSG_TEXT_LINE = 0x2001
 PROTO_MSG_CMD_RX = 0x2100
@@ -97,6 +100,9 @@ PROTO_MSG_SERVO_RESULT = 0x2219
 PROTO_MSG_WIFI_RECORD = 0x221A
 PROTO_MSG_GPS_RECORD = 0x221B
 PROTO_MSG_MAG_RECORD = 0x221C
+PROTO_MSG_RTOS_RECORD = 0x221D
+PROTO_MSG_FLASH_BENCH = 0x221E
+PROTO_MSG_AIRFRAME_RECORD = 0x221F
 
 try:
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -187,6 +193,17 @@ def first_float(values: dict[str, str], *names: str) -> float | None:
         except ValueError:
             return None
     return None
+
+
+def airframe_record_from_line(line: str) -> dict[str, str | float] | None:
+    if not line.startswith("AIRFRAME "):
+        return None
+    values = parse_kv(line)
+    record: dict[str, str | float] = {"line": line}
+    for key, value in values.items():
+        parsed = first_float(values, key)
+        record[key] = parsed if parsed is not None else value
+    return record
 
 
 def ident_record_from_line(line: str) -> dict[str, str | float | int] | None:
@@ -767,6 +784,8 @@ class DronePanel(tk.Tk):
         self.ident_csv_writer: csv.DictWriter | None = None
         self.ident_current_path: Path | None = None
         self.ident_last_fit: dict[str, float] | None = None
+        self.ident_current_command = ""
+        self.airframe_info: dict[str, str | float] = {}
 
         self.link_var = tk.StringVar(value="未连接")
         self.last_cmd_var = tk.StringVar(value="-")
@@ -798,6 +817,7 @@ class DronePanel(tk.Tk):
         self.ident_reason_var = tk.StringVar(value="-")
         self.ident_current_var = tk.StringVar(value="-")
         self.ident_fit_var = tk.StringVar(value="no fit")
+        self.ident_airframe_var = tk.StringVar(value="AIRFRAME: not loaded")
 
         self.module_state: dict[str, dict[str, tk.StringVar]] = {}
         self.baro_vars: dict[str, tk.StringVar] = {}
@@ -1295,6 +1315,7 @@ class DronePanel(tk.Tk):
         ttk.Button(top, text="DISARM", command=lambda: self._send_proto(PROTO_REQ_IDENT, "IDENT DISARM")).pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text="STOP", command=lambda: self._send_proto(PROTO_REQ_IDENT, "IDENT STOP")).pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text="STATUS", command=lambda: self._send_proto(PROTO_REQ_IDENT, "IDENT?")).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="AIRFRAME", command=self._request_airframe).pack(side=tk.LEFT, padx=4)
         ttk.Label(top, textvariable=self.ident_status_var).pack(side=tk.LEFT, padx=(18, 4))
         ttk.Label(top, textvariable=self.ident_sample_count_var).pack(side=tk.LEFT, padx=4)
         ttk.Label(top, textvariable=self.ident_reason_var).pack(side=tk.LEFT, padx=4)
@@ -1339,6 +1360,7 @@ class DronePanel(tk.Tk):
 
         live = ttk.LabelFrame(left, text="Live", padding=10)
         live.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(live, textvariable=self.ident_airframe_var, wraplength=320).pack(fill=tk.X, pady=(0, 8))
         ttk.Label(live, textvariable=self.ident_current_var, wraplength=320).pack(fill=tk.X)
         ttk.Button(live, text="Open CSV Folder", command=self._ident_open_folder).pack(anchor=tk.W, pady=(8, 0))
 
@@ -1438,6 +1460,7 @@ class DronePanel(tk.Tk):
             ("STATUS?", "STATUS?"),
             ("CONFIG?", "CONFIG?"),
             ("PARAM?", "PARAM?"),
+            ("AIRFRAME?", "AIRFRAME?"),
             ("PID?", "PID?"),
             ("BARO?", "BARO?"),
             ("GPS?", "GPS?"),
@@ -1602,6 +1625,7 @@ class DronePanel(tk.Tk):
             self.transport.start(self.udp_bind_var.get(), local_port, module_ip, module_port)
             self.structured_protocol_supported = False
             self.after(250, lambda: self.transport.send_line("PING") if self.transport is self.udp_transport else None)
+            self.after(450, lambda: self.transport.send_line("AIRFRAME?") if self.transport is self.udp_transport else None)
             return
 
         try:
@@ -1627,7 +1651,7 @@ class DronePanel(tk.Tk):
         self._append(f"> {line}")
         if not self.transport.send_line(line):
             self._append("[上位机] 发送失败")
-        elif line in {"PING", "STATUS?", "CONFIG?", "PARAM?", "PID?", "BARO?", "GPS?", "MAG?"}:
+        elif line in {"PING", "STATUS?", "CONFIG?", "PARAM?", "PID?", "BARO?", "GPS?", "MAG?", "AIRFRAME?"}:
             sent_at = time.monotonic()
             self.after(CMD_REPLY_TIMEOUT_MS, lambda sent=line, start=sent_at: self._warn_if_no_reply(sent, start))
 
@@ -1716,6 +1740,10 @@ class DronePanel(tk.Tk):
         self._send_proto(PROTO_REQ_CONFIG, "CONFIG?")
         self._send_proto(PROTO_REQ_PARAMS, "PARAM?")
         self._send_proto(PROTO_REQ_PID, "PID?")
+        self._request_airframe()
+
+    def _request_airframe(self) -> None:
+        self._send_proto(PROTO_REQ_AIRFRAME, "AIRFRAME?")
 
     def _send_raw(self) -> None:
         payload = f"SERVO RAW {self.raw_var.get().strip()}"
@@ -1843,6 +1871,7 @@ class DronePanel(tk.Tk):
             PROTO_MSG_WIFI_RECORD: self._update_wifi_line,
             PROTO_MSG_GPS_RECORD: self._handle_board_line,
             PROTO_MSG_MAG_RECORD: self._handle_board_line,
+            PROTO_MSG_AIRFRAME_RECORD: self._handle_board_line,
             PROTO_MSG_TEXT_LINE: self._handle_board_line,
         }
 
@@ -1898,6 +1927,9 @@ class DronePanel(tk.Tk):
             PROTO_MSG_BARO_DIAG: "BARO",
             PROTO_MSG_BARO_RAW: "BARO",
             PROTO_MSG_BARO_STREAM: "BARO",
+            PROTO_MSG_RTOS_RECORD: "RTOS",
+            PROTO_MSG_FLASH_BENCH: "FLASH",
+            PROTO_MSG_AIRFRAME_RECORD: "AIRFRAME",
         }
         prefix = prefix_map.get(function)
         if prefix is None:
@@ -2053,6 +2085,8 @@ class DronePanel(tk.Tk):
             self._update_config_line(line)
         elif line.startswith("PARAM "):
             self._update_param_line(line)
+        elif line.startswith("AIRFRAME "):
+            self._update_airframe_line(line)
         elif line.startswith("PID "):
             self._update_pid_line(line)
         elif line.startswith("FLASH "):
@@ -2957,6 +2991,34 @@ class DronePanel(tk.Tk):
             "rc_arm", "throttle_us", "line",
         ]
 
+    def _ident_meta_payload(self) -> dict[str, object]:
+        return {
+            "host_time": time.time(),
+            "command": self.ident_current_command,
+            "axis": self.ident_axis_var.get(),
+            "mode": self.ident_mode_var.get(),
+            "pulse_us": int(self.ident_pulse_var.get()),
+            "duration_ms": int(self.ident_duration_var.get()),
+            "hold_ms": int(self.ident_hold_var.get()),
+            "repeat": int(self.ident_repeat_var.get()),
+            "bit_ms": int(self.ident_bit_var.get()),
+            "seed": int(self.ident_seed_var.get()),
+            "center": {
+                "alpha_us": int(self.ident_alpha_center_var.get()),
+                "beta_us": int(self.ident_beta_center_var.get()),
+            },
+            "airframe": self.airframe_info,
+        }
+
+    def _ident_write_meta(self) -> None:
+        if self.ident_current_path is None:
+            return
+        meta_path = self.ident_current_path.with_name(f"{self.ident_current_path.stem}_meta.json")
+        meta_path.write_text(
+            json.dumps(self._ident_meta_payload(), ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
     def _ident_begin_recording(self) -> None:
         self._ident_close_csv()
         path = Path(__file__).resolve().parent / "ident_runs"
@@ -2968,6 +3030,7 @@ class DronePanel(tk.Tk):
         self.ident_samples.clear()
         self.ident_last_fit = None
         self.ident_fit_var.set("no fit")
+        self._ident_write_meta()
 
     def _ident_close_csv(self) -> None:
         if self.ident_csv_file is not None:
@@ -2985,6 +3048,7 @@ class DronePanel(tk.Tk):
             payload = f"IDENT DOUBLET {axis} pulse_us={pulse} hold_ms={int(self.ident_hold_var.get())} repeat={int(self.ident_repeat_var.get())}"
         else:
             payload = f"IDENT PRBS {axis} pulse_us={pulse} bit_ms={int(self.ident_bit_var.get())} duration_ms={int(self.ident_duration_var.get())} seed={int(self.ident_seed_var.get())}"
+        self.ident_current_command = payload
         self._ident_begin_recording()
         self._send_proto(PROTO_REQ_IDENT, payload)
 
@@ -2992,11 +3056,23 @@ class DronePanel(tk.Tk):
         payload = f"IDENT CENTER alpha_us={int(self.ident_alpha_center_var.get())} beta_us={int(self.ident_beta_center_var.get())}"
         self._send_proto(PROTO_REQ_IDENT, payload)
 
+    def _update_airframe_line(self, line: str) -> None:
+        record = airframe_record_from_line(line)
+        if record is None:
+            return
+        self.airframe_info = record
+        self.ident_airframe_var.set(
+            f"AIRFRAME m={record.get('mass_kg', '-')}kg cg_z={record.get('cg_z_m', '-')}m "
+            f"attach_cg={record.get('tether_attach_to_cg_m', '-')}m rope={record.get('rope_m', '-')}m "
+            f"maxF={record.get('max_total_force_n', '-')}N hover={record.get('hover_thrust_pct', '-')}%"
+        )
+
     def _ident_handle_line(self, line: str) -> None:
         values = parse_kv(line)
         if line.startswith("IDENT start "):
             self.ident_status_var.set("running")
             self.ident_reason_var.set("running")
+            self._ident_write_meta()
             return
         if line.startswith("IDENT done "):
             self.ident_status_var.set("done")

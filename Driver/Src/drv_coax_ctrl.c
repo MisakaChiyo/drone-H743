@@ -3,6 +3,7 @@
 #include "bsp_pwm.h"
 #include "coax_tiltrotor_controller_codegen.h"
 #include "coax_tiltrotor_controller_codegen_initialize.h"
+#include "drv_airframe_model.h"
 
 #include <math.h>
 #include <stddef.h>
@@ -189,10 +190,10 @@ void DRV_COAX_CTRL_GetDefaultParams(DRV_COAX_CTRL_Params *params)
     params->rotation_error_gain = 0.5f;
     params->accel_xy_limit_m_s2 = 3.0f;
     params->accel_z_limit_m_s2 = 2.5f;
-    params->mass_kg = 2.2f;
-    params->gravity_m_s2 = 9.81f;
-    params->min_total_force_n = 7.5537014f;
-    params->max_total_force_n = 38.8476f;
+    params->mass_kg = DRV_AIRFRAME_MASS_KG;
+    params->gravity_m_s2 = DRV_AIRFRAME_GRAVITY_M_S2;
+    params->min_total_force_n = DRV_AIRFRAME_WEIGHT_N;
+    params->max_total_force_n = DRV_AIRFRAME_MAX_TOTAL_FORCE_N;
     params->tilt_lever_arm_m = 0.18f;
     params->roll_angle_kp = 0.10f;//6.5
     params->roll_rate_kd = 0.0f;//0.7

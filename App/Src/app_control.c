@@ -20,6 +20,7 @@
 #include "bsp_imu.h"
 #include "bsp_pwm.h"
 #include "bsp_uart.h"
+#include "drv_airframe_model.h"
 #include "drv_coax_ctrl.h"
 #include "drv_motor.h"
 
@@ -36,7 +37,7 @@
 #include <string.h>
 
 #define APP_CONTROL_CFG_MAGIC       0x44524346UL
-#define APP_CONTROL_CFG_VERSION     3U
+#define APP_CONTROL_CFG_VERSION     4U
 #define APP_CONTROL_CFG_ADDRESS     (APP_FLASH_SERVICE_SIZE_BYTES - 4096UL)
 #define APP_CONTROL_MAX_LINE        128U
 #define APP_CONTROL_HEARTBEAT_ENABLED 0U
@@ -58,6 +59,8 @@
 #define APP_CONTROL_ALLOW_RAW_MOTOR_COMMANDS 0U
 #define APP_CONTROL_ALLOW_IDENT_MOTOR_TEST 0U
 #define APP_CONTROL_FLASH_AUTOSAVE_DELAY_MS 1500U
+#define APP_CONTROL_DEG_TO_RAD 0.017453292519943295f
+#define APP_CONTROL_SERVO_ANGLE_MAX_DEG 90.0f
 
 typedef struct {
     uint8_t loaded_from_flash;
@@ -108,6 +111,8 @@ typedef struct {
     DRV_COAX_CTRL_Params coax_params;
     uint32_t checksum;
 } APP_ControlFlashRecordV3;
+
+typedef APP_ControlFlashRecordV3 APP_ControlFlashRecordV4;
 
 static APP_ControlConfig control_config;
 #if (APP_CONTROL_HEARTBEAT_ENABLED != 0U)
@@ -733,6 +738,59 @@ static void app_control_report_params(void)
             app_control_report_coax_param(name, value);
         }
     }
+}
+
+static void app_control_force_airframe_params(DRV_COAX_CTRL_Params *params)
+{
+    if (params == NULL) {
+        return;
+    }
+
+    params->mass_kg = DRV_AIRFRAME_MASS_KG;
+    params->min_total_force_n = DRV_AIRFRAME_WEIGHT_N;
+    params->max_total_force_n = DRV_AIRFRAME_MAX_TOTAL_FORCE_N;
+}
+
+static void app_control_report_airframe(void)
+{
+    char mass_kg[24];
+    char cg_z_m[24];
+    char imu_z_m[24];
+    char attach_z_m[24];
+    char attach_to_cg_m[24];
+    char rope_m[24];
+    char rod_to_cg_m[24];
+    char servo_deg_per_us[24];
+    char servo_us_per_deg[24];
+    char max_force_n[24];
+    char hover_pct[24];
+
+    app_control_format_float(DRV_AIRFRAME_MASS_KG, mass_kg, (uint32_t)sizeof(mass_kg));
+    app_control_format_float(DRV_AIRFRAME_CG_Z_M, cg_z_m, (uint32_t)sizeof(cg_z_m));
+    app_control_format_float(DRV_AIRFRAME_IMU_Z_M, imu_z_m, (uint32_t)sizeof(imu_z_m));
+    app_control_format_float(DRV_AIRFRAME_TETHER_ATTACH_Z_M, attach_z_m, (uint32_t)sizeof(attach_z_m));
+    app_control_format_float(DRV_AIRFRAME_TETHER_ATTACH_TO_CG_M, attach_to_cg_m, (uint32_t)sizeof(attach_to_cg_m));
+    app_control_format_float(DRV_AIRFRAME_TETHER_ROPE_M, rope_m, (uint32_t)sizeof(rope_m));
+    app_control_format_float(DRV_AIRFRAME_TETHER_ROD_TO_CG_M, rod_to_cg_m, (uint32_t)sizeof(rod_to_cg_m));
+    app_control_format_float(DRV_AIRFRAME_SERVO_DEG_PER_US, servo_deg_per_us, (uint32_t)sizeof(servo_deg_per_us));
+    app_control_format_float(DRV_AIRFRAME_SERVO_US_PER_DEG, servo_us_per_deg, (uint32_t)sizeof(servo_us_per_deg));
+    app_control_format_float(DRV_AIRFRAME_MAX_TOTAL_FORCE_N, max_force_n, (uint32_t)sizeof(max_force_n));
+    app_control_format_float(DRV_AIRFRAME_HOVER_THRUST_PERCENT, hover_pct, (uint32_t)sizeof(hover_pct));
+
+    app_control_queue_proto_text(APP_PROTO_MSG_AIRFRAME_RECORD,
+                                 "AIRFRAME mass_kg=%s cg_z_m=%s imu_z_m=%s tether_attach_z_m=%s tether_attach_to_cg_m=%s rope_m=%s rod_to_cg_m=%s servo_deg_per_us=%s servo_us_per_deg=%s thrust_scope=%s max_total_force_n=%s hover_thrust_pct=%s\r\n",
+                                 mass_kg,
+                                 cg_z_m,
+                                 imu_z_m,
+                                 attach_z_m,
+                                 attach_to_cg_m,
+                                 rope_m,
+                                 rod_to_cg_m,
+                                 servo_deg_per_us,
+                                 servo_us_per_deg,
+                                 DRV_AIRFRAME_THRUST_TABLE_SCOPE,
+                                 max_force_n,
+                                 hover_pct);
 }
 
 static void app_control_report_caps(void)
@@ -1657,7 +1715,7 @@ static void app_control_report_uart_stats(uint32_t rx_bytes,
 
 static APP_FlashService_Status app_control_load_config(void)
 {
-    APP_ControlFlashRecordV3 record;
+    APP_ControlFlashRecordV4 record;
     APP_FlashService_Status status;
     uint32_t checksum;
 
@@ -1681,6 +1739,19 @@ static APP_FlashService_Status app_control_load_config(void)
         }
         control_config = record.config;
         DRV_COAX_CTRL_SetParams(&record.coax_params);
+    } else if ((record.version == 3U) &&
+               (record.size == (sizeof(record.config) + sizeof(record.coax_params)))) {
+        DRV_COAX_CTRL_Params migrated_params;
+
+        checksum = app_control_checksum((const uint8_t *)&record.config,
+                                        record.size);
+        if (checksum != record.checksum) {
+            return APP_FLASH_SERVICE_ERROR;
+        }
+        control_config = record.config;
+        migrated_params = record.coax_params;
+        app_control_force_airframe_params(&migrated_params);
+        DRV_COAX_CTRL_SetParams(&migrated_params);
     } else if ((record.version == 2U) &&
                (record.size == sizeof(APP_ControlConfigV2))) {
         const APP_ControlFlashRecordV2 *legacy =
@@ -1729,7 +1800,7 @@ static APP_FlashService_Status app_control_load_config(void)
 
 static APP_FlashService_Status app_control_save_config(void)
 {
-    APP_ControlFlashRecordV3 record;
+    APP_ControlFlashRecordV4 record;
     APP_FlashService_Status status;
 
     memset(&record, 0xFF, sizeof(record));
@@ -2621,6 +2692,8 @@ static uint8_t app_control_handle_pid_slider_line(const char *line)
         { "yaw_rate_kd",    "coax.yaw_rate_kd"    },
         { "aw_angle_kp",    "coax.yaw_angle_kp"   },
         { "aw_rate_kd",     "coax.yaw_rate_kd"    },
+        { "Angle",          "coax.tilt_limit_rad" },
+        { "angle",          "coax.tilt_limit_rad" },
     };
 
     char value_text[24];
@@ -2662,6 +2735,14 @@ static uint8_t app_control_handle_pid_slider_line(const char *line)
         if ((value_len == 0U) ||
             (app_control_parse_f32(value_text, &value) == 0U)) {
             return 0U;
+        }
+
+        if (strcmp(map[map_index].param_name, "coax.tilt_limit_rad") == 0) {
+            if ((value <= 0.0f) || (value > APP_CONTROL_SERVO_ANGLE_MAX_DEG)) {
+                APP_Control_QueueText("ERR angle range\r\n");
+                return 1U;
+            }
+            value *= APP_CONTROL_DEG_TO_RAD;
         }
 
         if (DRV_COAX_CTRL_SetParam(map[map_index].param_name, value) == 0U) {
@@ -2898,6 +2979,8 @@ static void app_control_dispatch_tokens(char **tokens, uint32_t count, uint8_t e
         APP_MAG_Report();
     } else if (strcmp(tokens[0], "PARAM?") == 0) {
         app_control_report_params();
+    } else if (strcmp(tokens[0], "AIRFRAME?") == 0) {
+        app_control_report_airframe();
     } else if (strcmp(tokens[0], "PID?") == 0) {
         app_control_report_pid_legacy();
     } else if (strcmp(tokens[0], "CONFIG?") == 0) {
