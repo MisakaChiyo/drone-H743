@@ -36,6 +36,8 @@ def test_airframe_constants_capture_measured_tether_geometry() -> None:
     assert "#define DRV_AIRFRAME_TETHER_ROPE_M                 0.6400f" in header
     assert "#define DRV_AIRFRAME_TETHER_ROD_TO_CG_M            0.8909f" in header
     assert "#define DRV_AIRFRAME_THRUST_TABLE_SCOPE            \"dual_motor_total\"" in header
+    assert "#define DRV_AIRFRAME_SERVO_DEG_PER_US              0.135f" in header
+    assert "#define DRV_AIRFRAME_SERVO_US_PER_DEG              7.407407f" in header
     assert "#define DRV_AIRFRAME_MAX_TOTAL_FORCE_N            13.375052f" in header
     assert "#define DRV_AIRFRAME_HOVER_THRUST_PERCENT         56.079367f" in header
 
@@ -55,10 +57,12 @@ def test_coax_defaults_use_airframe_model_not_old_placeholder_mass() -> None:
 def test_flash_v3_migration_forces_new_physical_model() -> None:
     source = read("App/Src/app_control.c")
 
-    assert "#define APP_CONTROL_CFG_VERSION     4U" in source
+    assert "#define APP_CONTROL_CFG_VERSION     5U" in source
     assert "typedef APP_ControlFlashRecordV3 APP_ControlFlashRecordV4;" in source
-    assert "record.version == 3U" in source
-    assert "app_control_force_airframe_params(&migrated_params);" in source
+    assert "} APP_ControlFlashRecordV5;" in source
+    assert "(record.version == 3U) || (record.version == 4U)" in source
+    assert "app_control_migrate_coax_params_v4(&legacy->coax_params, &migrated_params);" in source
+    assert "app_control_apply_new_coax_param_defaults(params);" in source
     assert "params->mass_kg = DRV_AIRFRAME_MASS_KG;" in source
     assert "params->min_total_force_n = DRV_AIRFRAME_WEIGHT_N;" in source
     assert "params->max_total_force_n = DRV_AIRFRAME_MAX_TOTAL_FORCE_N;" in source
@@ -81,8 +85,8 @@ def test_gui_airframe_parser_and_ident_meta_payload(tmp_path: Path) -> None:
     line = (
         "AIRFRAME mass_kg=0.754600 cg_z_m=-0.094600 imu_z_m=0.000000 "
         "tether_attach_z_m=0.156300 tether_attach_to_cg_m=0.250900 "
-        "rope_m=0.640000 rod_to_cg_m=0.890900 servo_deg_per_us=0.090000 "
-        "servo_us_per_deg=11.111111 thrust_scope=dual_motor_total "
+        "rope_m=0.640000 rod_to_cg_m=0.890900 servo_deg_per_us=0.135000 "
+        "servo_us_per_deg=7.407407 thrust_scope=dual_motor_total "
         "max_total_force_n=13.375052 hover_thrust_pct=56.079367"
     )
     record = panel.airframe_record_from_line(line)
@@ -112,8 +116,8 @@ def test_gui_airframe_parser_and_ident_meta_payload(tmp_path: Path) -> None:
         ident_repeat_var = Var(2)
         ident_bit_var = Var(250)
         ident_seed_var = Var(1)
-        ident_alpha_center_var = Var(1412)
-        ident_beta_center_var = Var(1851)
+        ident_alpha_center_var = Var(1441)
+        ident_beta_center_var = Var(1877)
 
     dummy = Dummy()
     dummy._ident_meta_payload = panel.DronePanel._ident_meta_payload.__get__(dummy, Dummy)
@@ -121,5 +125,5 @@ def test_gui_airframe_parser_and_ident_meta_payload(tmp_path: Path) -> None:
     meta = json.loads((tmp_path / "ident_20260526_120000_meta.json").read_text(encoding="utf-8"))
 
     assert meta["command"] == "IDENT STEP roll pulse_us=20 duration_ms=3000"
-    assert meta["center"] == {"alpha_us": 1412, "beta_us": 1851}
+    assert meta["center"] == {"alpha_us": 1441, "beta_us": 1877}
     assert meta["airframe"]["max_total_force_n"] == 13.375052

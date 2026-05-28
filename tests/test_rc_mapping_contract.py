@@ -33,9 +33,12 @@ def test_controller_uses_named_rc_channels_for_references() -> None:
     assert "#define STABILIZER_RC_THROTTLE_INPUT_HIGH_US 2000U" in freertos
     assert "#define STABILIZER_RC_THROTTLE_ARM_LOW_US    1100U" in freertos
     assert "#define STABILIZER_RC_LOSS_TIMEOUT_MS  150U" in freertos
-    assert "#define STABILIZER_XY_REF_RANGE_M      1.20f" in freertos
-    assert "reference.x_m = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_PITCH])" in freertos
-    assert "reference.y_m = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_ROLL])" in freertos
+    assert "#define STABILIZER_XY_VEL_REF_MAX_M_S  0.80f" in freertos
+    assert "#define STABILIZER_XY_ACCEL_LIMIT_M_S2 1.20f" in freertos
+    assert "reference.vx_m_s = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_PITCH])" in freertos
+    assert "reference.vy_m_s = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_ROLL])" in freertos
+    assert "reference.x_m = position_ref_x_m;" in freertos
+    assert "reference.y_m = position_ref_y_m;" in freertos
     assert "reference.z_m = stabilizer_rc_throttle_01(ch[STABILIZER_RC_CH_THROTTLE_Z])" in freertos
     assert "reference.yaw_rad = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_YAW])" in freertos
 
@@ -99,6 +102,8 @@ def test_disarmed_pwm_disables_output_without_changing_throttle_limits() -> None
     assert "#define BSP_PWM_ESC_MIN_US      1100U" in header
     assert "#define BSP_PWM_ESC_MAX_US      1940U" in header
     assert "#define BSP_PWM_ESC_NEUTRAL_US  1100U" in header
+    assert "#define BSP_PWM_ESC_CHANNEL_COUNT 2U" in header
+    assert "#define BSP_PWM_SERVO_CHANNEL_COUNT 2U" in header
     assert "BSP_PWM_Status BSP_PWM_DisableEsc(uint32_t channel);" in header
     assert "pulse_us < BSP_PWM_ESC_MIN_US" in source
     assert "BSP_PWM_Status BSP_PWM_DisableEsc(uint32_t channel)" in source

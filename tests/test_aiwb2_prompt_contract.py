@@ -67,3 +67,17 @@ def test_usart1_wifi_udp_pid_tuning_path_is_text_line_based() -> None:
     assert 'values=("tcp", "udp", "serial")' in panel
     assert "return self.send_line(text)" in panel
     assert "self.structured_protocol_supported = False" in panel
+
+
+def test_vofa_pid_slider_colon_lines_are_control_payloads() -> None:
+    app_aiwb2 = read("App/Src/app_aiwb2.c")
+    app_control = read("App/Src/app_control.c")
+
+    assert "aiwb2_is_pid_slider_payload" in app_aiwb2
+    assert '"roll_rate_kd"' in app_aiwb2
+    assert '"pitch_rate_kd"' in app_aiwb2
+    assert '"vel_loop_x_kp"' in app_aiwb2
+    assert "(aiwb2_is_pid_slider_payload(line) != 0U)" in app_aiwb2
+    assert '"roll_rate_kd",   "coax.roll_rate_kd"' in app_control
+    assert '"pitch_rate_kd",  "coax.pitch_rate_kd"' in app_control
+    assert "app_control_after_param_separator" in app_control

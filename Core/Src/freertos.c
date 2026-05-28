@@ -112,8 +112,7 @@
  * BSP 层（板级支持包——硬件抽象）：
  *   bsp_baro.h       — 气压计 SPL06-007 驱动
  *   bsp_imu.h        — IMU (ICM-42688-P) 驱动
- *   bsp_bus_servo.h  — 舵机总线（UART7 半双工串行舵机协议）
- *   bsp_pwm.h        — 电调 PWM 输出（TIM1/TIM8 → DShot 或标准 PWM）
+ *   bsp_pwm.h        — TIM2 PWM 输出（CH1/2 电调，CH3/4 普通舵机）
  *   bsp_aiwb2_power.h — Ai-WB2 WiFi 模块电源控制
  *
  * Driver 层（外设驱动——算法 / 协议）：
@@ -134,13 +133,18 @@
 #include "bsp_bus_servo.h"
 #include "bsp_pwm.h"
 #include "bsp_aiwb2_power.h"
+#include "drv_airframe_model.h"
 #include "drv_coax_ctrl.h"
+#include "drv_imu_nav.h"
+
+#define STABILIZER_SERVO_MOVE_TIME_MS 0U
+#define STABILIZER_NAV_ACCEL_LPF_ALPHA 0.94f
+#define STABILIZER_NAV_VEL_LEAK_HZ 0.25f
 
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -158,7 +162,7 @@
 #define SENSOR_IMU_DRDY_MISS_FAULT_LIMIT 50U    /* 连续 1s 无 DRDY/ready 才锁存故障    */
 #define SENSOR_IMU_READ_FAIL_LIMIT     25U      /* 连续读失败次数，超过后锁存故障      */
 #define SENSOR_MAG_PERIOD_US           50000ULL /* 磁力计步进间隔 50ms = 20Hz          */
-#define STABILIZER_USE_FIXED_IMU_DT    1U       /* 1=固定 1ms dt, 0=时间戳 dt          */
+#define STABILIZER_USE_FIXED_IMU_DT    0U       /* 1=固定 1ms dt, 0=时间戳 dt          */
 
 /*
  * ============================================================================
@@ -180,7 +184,9 @@
 #define STABILIZER_DIRECT_ALPHA_SIGN    (1.0f)   /* α 轴（俯仰→舵机1）方向符号         */
 #define STABILIZER_DIRECT_BETA_SIGN    (1.0f)   /* β 轴（横滚→舵机2）方向符号         */
 #define STABILIZER_YAW_REF_LIMIT_RAD   0.523599f /* 偏航参考限幅 ±30°               */
-#define STABILIZER_XY_REF_RANGE_M      1.20f     /* CH1/CH2 速度意图对应的虚拟 XY 参考 */
+#define STABILIZER_XY_VEL_REF_MAX_M_S  0.80f     /* CH1/CH2 水平速度目标最大值 [m/s]    */
+#define STABILIZER_XY_ACCEL_LIMIT_M_S2 1.20f     /* 水平速度目标斜率限制 [m/s^2]         */
+#define STABILIZER_XY_POS_ERR_MAX_M    0.35f     /* 速度意图积分后的虚拟位置误差限幅 [m] */
 #define STABILIZER_Z_REF_RANGE_M       0.25f     /* CH3 单向油门/升降参考范围 0..0.25m  */
 #define STABILIZER_RC_DEADBAND_US      20        /* RC 摇杆死区 [μs]，中位 1500±20      */
 
@@ -225,7 +231,6 @@
  * 舵机通过 UART7 半双工总线控制，每次移动命令指定目标脉宽和到位时间。
  * 为避免总线拥塞，只有脉宽变化超过阈值或超过强制刷新间隔才发送。
  */
-#define STABILIZER_SERVO_MOVE_TIME_MS  0U        /* 舵机到位时间 [ms]，0 表示尽快到位     */
 #define STABILIZER_SERVO_REFRESH_MS    500U      /* 强制刷新间隔 [ms]（即使脉宽未变）    */
 #define STABILIZER_SERVO_DELTA_US      3U        /* 脉宽变化死区 [μs]（小于此值不发送）  */
 #define VOFA_SEND_PERIOD_MS            20U       /* VOFA 姿态诊断输出周期 20ms = 50Hz */
@@ -352,6 +357,13 @@ static uint8_t stabilizer_rc_use_stabilized_motor_mix(uint16_t ch_us)
   return (ch_us >= STABILIZER_RC_STABILIZE_MIN_US) ? 1U : 0U;
 }
 
+static float stabilizer_clamp_f32(float value, float lo, float hi)
+{
+  if (value < lo) { return lo; }
+  if (value > hi) { return hi; }
+  return value;
+}
+
 static uint16_t stabilizer_mix_rc_base_with_ctrl(uint16_t rc_base_us,
                                                  uint16_t ctrl_us,
                                                  uint16_t ctrl_avg_us)
@@ -451,6 +463,116 @@ static volatile uint16_t stabilizer_last_sent_servo_pulse_us[2] = {
 };
 static uint32_t stabilizer_last_servo_send_ms;
 
+typedef struct {
+  float acc_nav_m_s2[3];
+  float vel_est_m_s[3];
+  float vel_ref_m_s[2];
+  float vel_err_m_s[2];
+  float vel_pid_out_m_s2[2];
+  float vel_pid_p_m_s2[2];
+  float vel_pid_i_m_s2[2];
+  float vel_pid_d_m_s2[2];
+  float servo_alpha_us;
+  float servo_beta_us;
+  float motor_upper_us;
+  float motor_lower_us;
+  float vel_loop_x_kp;
+  float vel_loop_x_ki;
+  float vel_loop_x_kd;
+  float vel_loop_y_kp;
+  float vel_loop_y_ki;
+  float vel_loop_y_kd;
+  float vel_loop_output_limit_m_s2;
+  float vel_loop_i_limit_m_s2;
+  float nav_accel_lpf_alpha;
+  float nav_velocity_leak_hz;
+  float vel_loop_active;
+} StabilizerVofaDebug;
+
+typedef struct {
+  float integrator_m_s2;
+  float prev_meas_m_s;
+  uint8_t prev_valid;
+} StabilizerVelocityPidState;
+
+static StabilizerVofaDebug stabilizer_vofa_debug;
+
+static void stabilizer_velocity_pid_reset(StabilizerVelocityPidState *state)
+{
+  if (state == NULL) {
+    return;
+  }
+
+  state->integrator_m_s2 = 0.0f;
+  state->prev_meas_m_s = 0.0f;
+  state->prev_valid = 0U;
+}
+
+static float stabilizer_velocity_pid_step(StabilizerVelocityPidState *state,
+                                          float err_m_s,
+                                          float meas_m_s,
+                                          float kp,
+                                          float ki,
+                                          float kd,
+                                          float i_limit_m_s2,
+                                          float output_limit_m_s2,
+                                          float dt_sec,
+                                          float *p_term,
+                                          float *i_term,
+                                          float *d_term)
+{
+  float p = kp * err_m_s;
+  float d = 0.0f;
+  float out;
+
+  if (state == NULL) {
+    return 0.0f;
+  }
+
+  if (dt_sec <= 0.0f) {
+    dt_sec = (float)STABILIZER_CONTROL_PERIOD_MS * 0.001f;
+  }
+
+  if (state->prev_valid != 0U) {
+    d = -kd * (meas_m_s - state->prev_meas_m_s) / dt_sec;
+  }
+
+  state->integrator_m_s2 =
+    stabilizer_clamp_f32(state->integrator_m_s2 + ki * err_m_s * dt_sec,
+                         -i_limit_m_s2,
+                          i_limit_m_s2);
+  state->prev_meas_m_s = meas_m_s;
+  state->prev_valid = 1U;
+
+  out = stabilizer_clamp_f32(p + state->integrator_m_s2 + d,
+                             -output_limit_m_s2,
+                              output_limit_m_s2);
+
+  if (p_term != NULL) { *p_term = p; }
+  if (i_term != NULL) { *i_term = state->integrator_m_s2; }
+  if (d_term != NULL) { *d_term = d; }
+
+  return out;
+}
+
+static void stabilizer_vofa_debug_publish(const StabilizerVofaDebug *debug)
+{
+  if (debug == NULL) {
+    return;
+  }
+
+  stabilizer_vofa_debug = *debug;
+}
+
+static void stabilizer_vofa_debug_read(StabilizerVofaDebug *debug)
+{
+  if (debug == NULL) {
+    return;
+  }
+
+  *debug = stabilizer_vofa_debug;
+}
+
 static uint8_t stabilizer_servo_should_send(const DRV_SERVO_MoveCmd moves[2],
                                             uint32_t now_ms)
 {
@@ -487,6 +609,7 @@ static void stabilizer_servo_record_target(const DRV_SERVO_MoveCmd moves[2])
   stabilizer_latest_servo_target_us[0] = moves[0].pulse_us;
   stabilizer_latest_servo_target_us[1] = moves[1].pulse_us;
 }
+
 /* USER CODE END Variables */
 /*
  * ============================================================================
@@ -821,6 +944,23 @@ void StabilizerTask(void *argument)
   uint32_t stabilizer_seq = 0U;       /* 姿态解算帧序号                         */
   uint32_t last_out_ms = 0U;          /* 上次控制输出时刻 [ms]                  */
   uint8_t has_imu_sample = 0U;        /* 是否已收到至少一帧 IMU 数据            */
+#if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
+  float velocity_state_x_m_s = 0.0f;
+  float velocity_state_y_m_s = 0.0f;
+  float position_ref_x_m = 0.0f;
+  float position_ref_y_m = 0.0f;
+  DRV_IMU_NAV_State nav_state;
+  StabilizerVelocityPidState vel_pid_x;
+  StabilizerVelocityPidState vel_pid_y;
+  StabilizerVofaDebug vofa_debug = {0};
+  uint32_t last_ctrl_model_ms = 0U;
+#endif
+
+#if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
+  DRV_IMU_NAV_Reset(&nav_state);
+  stabilizer_velocity_pid_reset(&vel_pid_x);
+  stabilizer_velocity_pid_reset(&vel_pid_y);
+#endif
 
   for(;;)
   {
@@ -896,6 +1036,42 @@ void StabilizerTask(void *argument)
         yaw_control = 0.0f;
       }
 
+#if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
+      {
+        DRV_IMU_NAV_Input nav_input;
+
+        nav_input.accel_x_g = msg.imu.accel_x_g;
+        nav_input.accel_y_g = msg.imu.accel_y_g;
+        nav_input.accel_z_g = msg.imu.accel_z_g;
+        nav_input.roll_rad = roll * STABILIZER_DEG_TO_RAD;
+        nav_input.pitch_rad = pitch * STABILIZER_DEG_TO_RAD;
+        nav_input.yaw_rad = yaw_control * STABILIZER_DEG_TO_RAD;
+        nav_input.dt_sec = dt_sec;
+        nav_input.gravity_m_s2 = DRV_AIRFRAME_GRAVITY_M_S2;
+        nav_input.accel_lpf_alpha = STABILIZER_NAV_ACCEL_LPF_ALPHA;
+        nav_input.velocity_leak_rate_hz = STABILIZER_NAV_VEL_LEAK_HZ;
+
+        if ((attitude_zero_ready != 0U) && (nav_state.bias_ready == 0U)) {
+          DRV_IMU_NAV_CaptureBias(&nav_state, &nav_input);
+        }
+        if (attitude_zero_ready != 0U) {
+          DRV_IMU_NAV_Update(&nav_state, &nav_input);
+        }
+
+        velocity_state_x_m_s = nav_state.vel_m_s[0];
+        velocity_state_y_m_s = nav_state.vel_m_s[1];
+        vofa_debug.acc_nav_m_s2[0] = nav_state.acc_nav_m_s2[0];
+        vofa_debug.acc_nav_m_s2[1] = nav_state.acc_nav_m_s2[1];
+        vofa_debug.acc_nav_m_s2[2] = nav_state.acc_nav_m_s2[2];
+        vofa_debug.vel_est_m_s[0] = nav_state.vel_m_s[0];
+        vofa_debug.vel_est_m_s[1] = nav_state.vel_m_s[1];
+        vofa_debug.vel_est_m_s[2] = nav_state.vel_m_s[2];
+        vofa_debug.nav_accel_lpf_alpha = nav_state.accel_lpf_alpha;
+        vofa_debug.nav_velocity_leak_hz = nav_state.velocity_leak_rate_hz;
+        stabilizer_vofa_debug_publish(&vofa_debug);
+      }
+#endif
+
       /*
        * ② 写入 VOFA 日志队列（覆盖模式）
        * vofaLogQueue 深度为 1，如果队列满则丢弃旧数据再写入新数据。
@@ -932,14 +1108,23 @@ void StabilizerTask(void *argument)
         uint8_t rc_link_seen = 0U;
         uint16_t rc_throttle_motor_us = BSP_PWM_ESC_MIN_US;
         uint8_t rc_use_stabilized_motor_mix = 0U;
+        float ctrl_dt_sec = (float)STABILIZER_CONTROL_PERIOD_MS * 0.001f;
 #endif
-        DRV_SERVO_MoveCmd moves[2];     /* [0]=舵机1(α/pitch), [1]=舵机2(β/roll) */
+        DRV_SERVO_MoveCmd moves[2];     /* [0]=servo 1 alpha/pitch, [1]=servo 2 beta/roll */
         uint8_t imu_control_valid = 0U;
         uint8_t ident_running = 0U;
 
         last_out_ms = now;
 
 #if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
+        if (last_ctrl_model_ms != 0U) {
+          uint32_t elapsed_ms = now - last_ctrl_model_ms;
+          if ((elapsed_ms > 0U) && (elapsed_ms <= STABILIZER_IMU_STALE_MS)) {
+            ctrl_dt_sec = (float)elapsed_ms * 0.001f;
+          }
+        }
+        last_ctrl_model_ms = now;
+
         APP_ELRS_GetChannels(ch);       /* 读取 ELRS 遥控器 16 通道             */
         rc_link_ok = APP_ELRS_IsRcFresh(now, STABILIZER_RC_LOSS_TIMEOUT_MS);
         rc_link_seen = (APP_ELRS_GetLastRcMs() != 0U) ? 1U : 0U;
@@ -973,6 +1158,26 @@ void StabilizerTask(void *argument)
           APP_Ident_GetServoTargets(&ident_alpha_us, &ident_beta_us);
           moves[0].pulse_us = ident_alpha_us;
           moves[1].pulse_us = ident_beta_us;
+#if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
+        } else if (rc_use_stabilized_motor_mix == 0U) {
+          /*
+           * Throttle below the 20% stabilization threshold is the low-power
+           * direct-throttle stage. Keep tilt servos centered there so stick
+           * motion cannot move the airframe before the test is intentionally
+           * brought into the active range.
+           */
+          velocity_state_x_m_s = 0.0f;
+          velocity_state_y_m_s = 0.0f;
+          position_ref_x_m = 0.0f;
+          position_ref_y_m = 0.0f;
+          DRV_IMU_NAV_Reset(&nav_state);
+          stabilizer_velocity_pid_reset(&vel_pid_x);
+          stabilizer_velocity_pid_reset(&vel_pid_y);
+          vofa_debug.vel_loop_active = 0.0f;
+          stabilizer_vofa_debug_publish(&vofa_debug);
+          moves[0].pulse_us = DRV_COAX_CTRL_SERVO_ALPHA_CENTER_US;
+          moves[1].pulse_us = DRV_COAX_CTRL_SERVO_BETA_CENTER_US;
+#endif
         } else if (imu_control_valid != 0U) {
 #if (STABILIZER_USE_DIRECT_ANGLE_SERVO != 0U)
           /*
@@ -1000,14 +1205,137 @@ void StabilizerTask(void *argument)
           attitude.roll_rad = roll_control * STABILIZER_DEG_TO_RAD;
           attitude.pitch_rad = pitch_control * STABILIZER_DEG_TO_RAD;
           attitude.yaw_rad = yaw_control * STABILIZER_DEG_TO_RAD;
+          attitude.x_m = 0.0f;
+          attitude.y_m = 0.0f;
+          attitude.z_m = 0.0f;
+          attitude.vx_m_s = velocity_state_x_m_s;
+          attitude.vy_m_s = velocity_state_y_m_s;
+          attitude.vz_m_s = 0.0f;
           attitude.gyro_x_rad_s = msg.imu.gyro_x_dps * STABILIZER_DEG_TO_RAD;
           attitude.gyro_y_rad_s = msg.imu.gyro_y_dps * STABILIZER_DEG_TO_RAD;
           attitude.gyro_z_rad_s = msg.imu.gyro_z_dps * STABILIZER_DEG_TO_RAD;
 
-          reference.x_m = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_PITCH]) *
-                          STABILIZER_XY_REF_RANGE_M;
-          reference.y_m = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_ROLL]) *
-                          STABILIZER_XY_REF_RANGE_M;
+          reference.vx_m_s = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_PITCH]) *
+                             STABILIZER_XY_VEL_REF_MAX_M_S;
+          reference.vy_m_s = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_ROLL]) *
+                             STABILIZER_XY_VEL_REF_MAX_M_S;
+          reference.vz_m_s = 0.0f;
+          {
+            float vel_ref_x_m_s = reference.vx_m_s;
+            float vel_ref_y_m_s = reference.vy_m_s;
+            float vel_loop_enable = 0.0f;
+            float vel_loop_x_kp = 0.0f;
+            float vel_loop_x_ki = 0.0f;
+            float vel_loop_x_kd = 0.0f;
+            float vel_loop_y_kp = 0.0f;
+            float vel_loop_y_ki = 0.0f;
+            float vel_loop_y_kd = 0.0f;
+            float vel_loop_output_limit_m_s2 = STABILIZER_XY_ACCEL_LIMIT_M_S2;
+            float vel_loop_i_limit_m_s2 = 0.0f;
+            float vel_err_x_m_s;
+            float vel_err_y_m_s;
+
+            (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_enable", &vel_loop_enable);
+            (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_x_kp", &vel_loop_x_kp);
+            (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_x_ki", &vel_loop_x_ki);
+            (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_x_kd", &vel_loop_x_kd);
+            (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_y_kp", &vel_loop_y_kp);
+            (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_y_ki", &vel_loop_y_ki);
+            (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_y_kd", &vel_loop_y_kd);
+            (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_output_limit_m_s2",
+                                         &vel_loop_output_limit_m_s2);
+            (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_i_limit_m_s2",
+                                         &vel_loop_i_limit_m_s2);
+
+            vel_err_x_m_s = vel_ref_x_m_s - velocity_state_x_m_s;
+            vel_err_y_m_s = vel_ref_y_m_s - velocity_state_y_m_s;
+            vofa_debug.vel_ref_m_s[0] = vel_ref_x_m_s;
+            vofa_debug.vel_ref_m_s[1] = vel_ref_y_m_s;
+            vofa_debug.vel_err_m_s[0] = vel_err_x_m_s;
+            vofa_debug.vel_err_m_s[1] = vel_err_y_m_s;
+            vofa_debug.vel_loop_x_kp = vel_loop_x_kp;
+            vofa_debug.vel_loop_x_ki = vel_loop_x_ki;
+            vofa_debug.vel_loop_x_kd = vel_loop_x_kd;
+            vofa_debug.vel_loop_y_kp = vel_loop_y_kp;
+            vofa_debug.vel_loop_y_ki = vel_loop_y_ki;
+            vofa_debug.vel_loop_y_kd = vel_loop_y_kd;
+            vofa_debug.vel_loop_output_limit_m_s2 = vel_loop_output_limit_m_s2;
+            vofa_debug.vel_loop_i_limit_m_s2 = vel_loop_i_limit_m_s2;
+
+            if (vel_loop_enable >= 0.5f) {
+              position_ref_x_m = 0.0f;
+              position_ref_y_m = 0.0f;
+              reference.ax_m_s2 =
+                stabilizer_velocity_pid_step(&vel_pid_x,
+                                             vel_err_x_m_s,
+                                             velocity_state_x_m_s,
+                                             vel_loop_x_kp,
+                                             vel_loop_x_ki,
+                                             vel_loop_x_kd,
+                                             vel_loop_i_limit_m_s2,
+                                             vel_loop_output_limit_m_s2,
+                                             ctrl_dt_sec,
+                                             &vofa_debug.vel_pid_p_m_s2[0],
+                                             &vofa_debug.vel_pid_i_m_s2[0],
+                                             &vofa_debug.vel_pid_d_m_s2[0]);
+              reference.ay_m_s2 =
+                stabilizer_velocity_pid_step(&vel_pid_y,
+                                             -vel_err_y_m_s,
+                                             velocity_state_y_m_s,
+                                             vel_loop_y_kp,
+                                             vel_loop_y_ki,
+                                             vel_loop_y_kd,
+                                             vel_loop_i_limit_m_s2,
+                                             vel_loop_output_limit_m_s2,
+                                             ctrl_dt_sec,
+                                             &vofa_debug.vel_pid_p_m_s2[1],
+                                             &vofa_debug.vel_pid_i_m_s2[1],
+                                             &vofa_debug.vel_pid_d_m_s2[1]);
+              reference.vx_m_s = attitude.vx_m_s;
+              reference.vy_m_s = attitude.vy_m_s;
+              vofa_debug.vel_loop_active = 1.0f;
+            } else {
+              stabilizer_velocity_pid_reset(&vel_pid_x);
+              stabilizer_velocity_pid_reset(&vel_pid_y);
+              reference.ax_m_s2 =
+                stabilizer_clamp_f32((vel_ref_x_m_s - velocity_state_x_m_s) / ctrl_dt_sec,
+                                     -STABILIZER_XY_ACCEL_LIMIT_M_S2,
+                                      STABILIZER_XY_ACCEL_LIMIT_M_S2);
+              reference.ay_m_s2 =
+                stabilizer_clamp_f32((vel_ref_y_m_s - velocity_state_y_m_s) / ctrl_dt_sec,
+                                     -STABILIZER_XY_ACCEL_LIMIT_M_S2,
+                                      STABILIZER_XY_ACCEL_LIMIT_M_S2);
+              vofa_debug.vel_pid_p_m_s2[0] = 0.0f;
+              vofa_debug.vel_pid_i_m_s2[0] = 0.0f;
+              vofa_debug.vel_pid_d_m_s2[0] = 0.0f;
+              vofa_debug.vel_pid_p_m_s2[1] = 0.0f;
+              vofa_debug.vel_pid_i_m_s2[1] = 0.0f;
+              vofa_debug.vel_pid_d_m_s2[1] = 0.0f;
+              vofa_debug.vel_loop_active = 0.0f;
+            }
+
+            vofa_debug.vel_pid_out_m_s2[0] = reference.ax_m_s2;
+            vofa_debug.vel_pid_out_m_s2[1] = reference.ay_m_s2;
+          }
+          reference.az_m_s2 = 0.0f;
+          if (vofa_debug.vel_loop_active >= 0.5f) {
+            reference.x_m = attitude.x_m;
+            reference.y_m = attitude.y_m;
+          } else {
+            position_ref_x_m =
+              stabilizer_clamp_f32(position_ref_x_m +
+                                   reference.vx_m_s * ctrl_dt_sec,
+                                   -STABILIZER_XY_POS_ERR_MAX_M,
+                                    STABILIZER_XY_POS_ERR_MAX_M);
+            position_ref_y_m =
+              stabilizer_clamp_f32(position_ref_y_m +
+                                   reference.vy_m_s * ctrl_dt_sec,
+                                   -STABILIZER_XY_POS_ERR_MAX_M,
+                                    STABILIZER_XY_POS_ERR_MAX_M);
+
+            reference.x_m = position_ref_x_m;
+            reference.y_m = position_ref_y_m;
+          }
           reference.z_m = stabilizer_rc_throttle_01(ch[STABILIZER_RC_CH_THROTTLE_Z]) *
                           STABILIZER_Z_REF_RANGE_M;
           reference.yaw_rad = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_YAW]) *
@@ -1017,9 +1345,23 @@ void StabilizerTask(void *argument)
 
           moves[0].pulse_us = ctrl_out.servo_alpha_us;
           moves[1].pulse_us = ctrl_out.servo_beta_us;
+          vofa_debug.servo_alpha_us = (float)moves[0].pulse_us;
+          vofa_debug.servo_beta_us = (float)moves[1].pulse_us;
+          vofa_debug.motor_upper_us =
+            (float)DRV_COAX_CTRL_OmegaToMotorPulse(ctrl_out.omega_upper);
+          vofa_debug.motor_lower_us =
+            (float)DRV_COAX_CTRL_OmegaToMotorPulse(ctrl_out.omega_lower);
+          stabilizer_vofa_debug_publish(&vofa_debug);
 #endif
 #endif
         } else if (has_imu_sample == 0U) {
+#if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
+          DRV_IMU_NAV_Reset(&nav_state);
+          stabilizer_velocity_pid_reset(&vel_pid_x);
+          stabilizer_velocity_pid_reset(&vel_pid_y);
+          vofa_debug.vel_loop_active = 0.0f;
+          stabilizer_vofa_debug_publish(&vofa_debug);
+#endif
           /* 上电尚无有效姿态时才使用中位；运行中 IMU 异常保持上一目标。 */
           moves[0].pulse_us = DRV_COAX_CTRL_SERVO_ALPHA_CENTER_US;
           moves[1].pulse_us = DRV_COAX_CTRL_SERVO_BETA_CENTER_US;
@@ -1042,7 +1384,7 @@ void StabilizerTask(void *argument)
 
         stabilizer_servo_record_target(moves);
 
-        /* 有变化才发（带 500ms 强制刷新），避免占用舵机总线 */
+        /* Send only on change, with a 500 ms forced refresh, to avoid bus flooding. */
         if (stabilizer_servo_should_send(moves, now) != 0U) {
           if (BSP_BusServo_MoveManyAsync(moves, 2U,
                                          STABILIZER_SERVO_MOVE_TIME_MS) == DRV_SERVO_OK) {
@@ -1052,8 +1394,8 @@ void StabilizerTask(void *argument)
 
 #if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
         if ((rc_link_ok != 0U) && (rc_armed != 0U)) {
-          if ((ident_running == 0U) &&
-              (rc_use_stabilized_motor_mix != 0U) &&
+          if ((rc_use_stabilized_motor_mix != 0U) &&
+              (ident_running == 0U) &&
               (imu_control_valid != 0U)) {
             uint16_t ctrl_upper_us =
               DRV_COAX_CTRL_OmegaToMotorPulse(ctrl_out.omega_upper);
@@ -1488,8 +1830,9 @@ void VOFA_task(void *argument)
   /* USER CODE BEGIN VOFA_task */
 
   APP_Sensor_SampleMessage msg;
-  #define VOFA_DATA_SIZE 28U
+  #define VOFA_DATA_SIZE 63U
   float vofa_data[VOFA_DATA_SIZE];
+  StabilizerVofaDebug vofa_debug;
 
   /* 地面气压平均 */
   #define VOFA_P0_SAMPLES 50U
@@ -1561,13 +1904,49 @@ void VOFA_task(void *argument)
       vofa_data[19] = msg.attitude_debug.pitch_residual_deg;
       vofa_data[20] = msg.attitude_debug.alpha;
       vofa_data[21] = msg.attitude_debug.dt_ms;
-      (void)DRV_COAX_CTRL_GetParam("coax.roll_angle_kp", &vofa_data[22]);
-      (void)DRV_COAX_CTRL_GetParam("coax.roll_rate_kd", &vofa_data[23]);
-      (void)DRV_COAX_CTRL_GetParam("coax.pitch_angle_kp", &vofa_data[24]);
-      (void)DRV_COAX_CTRL_GetParam("coax.pitch_rate_kd", &vofa_data[25]);
-      (void)DRV_COAX_CTRL_GetParam("coax.yaw_angle_kp", &vofa_data[26]);
-      (void)DRV_COAX_CTRL_GetParam("coax.yaw_rate_kd", &vofa_data[27]);
-      /* 28 floats + VOFA tail, sent by AT+SOCKETSEND with the actual frame length. */
+      (void)DRV_COAX_CTRL_GetParam("coax.roll_rate_kd", &vofa_data[22]);
+      (void)DRV_COAX_CTRL_GetParam("coax.pitch_rate_kd", &vofa_data[23]);
+      (void)DRV_COAX_CTRL_GetParam("coax.yaw_angle_kp", &vofa_data[24]);
+      (void)DRV_COAX_CTRL_GetParam("coax.yaw_rate_kd", &vofa_data[25]);
+      (void)DRV_COAX_CTRL_GetParam("coax.vel_x_kd", &vofa_data[26]);
+      (void)DRV_COAX_CTRL_GetParam("coax.vel_y_kd", &vofa_data[27]);
+      (void)DRV_COAX_CTRL_GetParam("coax.vel_z_kd", &vofa_data[28]);
+      (void)DRV_COAX_CTRL_GetParam("coax.accel_xy_limit_m_s2", &vofa_data[29]);
+      (void)DRV_COAX_CTRL_GetParam("coax.accel_z_limit_m_s2", &vofa_data[30]);
+      stabilizer_vofa_debug_read(&vofa_debug);
+      vofa_data[31] = vofa_debug.acc_nav_m_s2[0];
+      vofa_data[32] = vofa_debug.acc_nav_m_s2[1];
+      vofa_data[33] = vofa_debug.acc_nav_m_s2[2];
+      vofa_data[34] = vofa_debug.vel_est_m_s[0];
+      vofa_data[35] = vofa_debug.vel_est_m_s[1];
+      vofa_data[36] = vofa_debug.vel_ref_m_s[0];
+      vofa_data[37] = vofa_debug.vel_ref_m_s[1];
+      vofa_data[38] = vofa_debug.vel_err_m_s[0];
+      vofa_data[39] = vofa_debug.vel_err_m_s[1];
+      vofa_data[40] = vofa_debug.vel_pid_out_m_s2[0];
+      vofa_data[41] = vofa_debug.vel_pid_out_m_s2[1];
+      vofa_data[42] = vofa_debug.vel_pid_p_m_s2[0];
+      vofa_data[43] = vofa_debug.vel_pid_i_m_s2[0];
+      vofa_data[44] = vofa_debug.vel_pid_d_m_s2[0];
+      vofa_data[45] = vofa_debug.vel_pid_p_m_s2[1];
+      vofa_data[46] = vofa_debug.vel_pid_i_m_s2[1];
+      vofa_data[47] = vofa_debug.vel_pid_d_m_s2[1];
+      vofa_data[48] = vofa_debug.servo_alpha_us;
+      vofa_data[49] = vofa_debug.servo_beta_us;
+      vofa_data[50] = vofa_debug.motor_upper_us;
+      vofa_data[51] = vofa_debug.motor_lower_us;
+      vofa_data[52] = vofa_debug.vel_loop_x_kp;
+      vofa_data[53] = vofa_debug.vel_loop_x_ki;
+      vofa_data[54] = vofa_debug.vel_loop_x_kd;
+      vofa_data[55] = vofa_debug.vel_loop_y_kp;
+      vofa_data[56] = vofa_debug.vel_loop_y_ki;
+      vofa_data[57] = vofa_debug.vel_loop_y_kd;
+      vofa_data[58] = vofa_debug.vel_loop_output_limit_m_s2;
+      vofa_data[59] = vofa_debug.vel_loop_i_limit_m_s2;
+      vofa_data[60] = vofa_debug.nav_accel_lpf_alpha;
+      vofa_data[61] = vofa_debug.nav_velocity_leak_hz;
+      vofa_data[62] = vofa_debug.vel_loop_active;
+      /* 63 floats + VOFA tail = 256 bytes, matching APP_UART_TX_TEXT_SIZE. */
       APP_VOFA_SendFloats(vofa_data, VOFA_DATA_SIZE);
     }
   }

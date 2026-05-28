@@ -16,7 +16,7 @@ def test_attitude_filter_uses_fixed_1ms_dt_with_timestamp_option() -> None:
     assert "float dt_sec" in header
     assert "APP_IMU_ACCEL_CORRECTION_TAU_SEC" in source
     assert "osKernelGetTickCount()" not in source
-    assert "#define STABILIZER_USE_FIXED_IMU_DT    1U" in freertos
+    assert "#define STABILIZER_USE_FIXED_IMU_DT    0U" in freertos
     assert "float dt_sec = SENSOR_IMU_DEFAULT_DT_SEC;" in freertos
     assert "#if (STABILIZER_USE_FIXED_IMU_DT == 0U)" in freertos
     assert "msg.base.timestamp_us - last_imu_timestamp_us" in freertos
@@ -27,7 +27,7 @@ def test_attitude_filter_uses_fixed_1ms_dt_with_timestamp_option() -> None:
     assert "#define APP_IMU_ROLL_SIGN         (1.0f)" in source
     assert "#define APP_IMU_PITCH_SIGN        (-1.0f)" in source
     assert "#define APP_IMU_GYRO_ROLL_SIGN    (-1.0f)" in source
-    assert "#define APP_IMU_GYRO_PITCH_SIGN   (-1.0f)" in source
+    assert "#define APP_IMU_GYRO_PITCH_SIGN   (1.0f)" in source
 
 
 def test_slow_mag_step_is_not_run_for_every_imu_sample() -> None:
@@ -57,7 +57,7 @@ def test_vofa_stream_reports_imu_rate_and_interrupt_vs_poll_counts() -> None:
     assert "msg.imu_irq_sample_rate_hz  = APP_SensorRateMeter_Update(&imu_irq_rate_meter," in freertos
     assert "msg.imu_poll_sample_rate_hz = APP_SensorRateMeter_Update(&imu_poll_rate_meter," in freertos
     assert "#define VOFA_SEND_PERIOD_MS            20U" in freertos
-    assert "#define VOFA_DATA_SIZE 22U" in freertos
+    assert "#define VOFA_DATA_SIZE 63U" in freertos
     assert "uint64_t now_us = SVC_Timestamp_Us();" in freertos
     assert "msg.imu_age_ms = (float)(now_us - msg.base.timestamp_us) * 0.001f;" in freertos
     assert "vofa_data[10] = (float)(now_us / 1000ULL) * 0.001f;" in freertos
@@ -68,6 +68,8 @@ def test_vofa_stream_reports_imu_rate_and_interrupt_vs_poll_counts() -> None:
     assert "vofa_data[16] = msg.attitude_debug.roll_gyro_deg;" in freertos
     assert "vofa_data[20] = msg.attitude_debug.alpha;" in freertos
     assert "vofa_data[21] = msg.attitude_debug.dt_ms;" in freertos
+    assert "vofa_data[31] = vofa_debug.acc_nav_m_s2[0];" in freertos
+    assert "vofa_data[62] = vofa_debug.vel_loop_active;" in freertos
 
 
 def test_message_task_does_not_consume_sensor_sample_queue() -> None:
@@ -142,6 +144,16 @@ def test_stabilizer_uses_boot_attitude_average_as_zero_point() -> None:
     assert "attitude.roll_rad = roll_control * STABILIZER_DEG_TO_RAD;" in freertos
     assert "attitude.pitch_rad = pitch_control * STABILIZER_DEG_TO_RAD;" in freertos
     assert "attitude.yaw_rad = yaw_control * STABILIZER_DEG_TO_RAD;" in freertos
+
+
+def test_nav_gravity_compensation_uses_absolute_attitude_not_boot_zero() -> None:
+    freertos = read("Core/Src/freertos.c")
+
+    assert "nav_input.roll_rad = roll * STABILIZER_DEG_TO_RAD;" in freertos
+    assert "nav_input.pitch_rad = pitch * STABILIZER_DEG_TO_RAD;" in freertos
+    assert "nav_input.yaw_rad = yaw_control * STABILIZER_DEG_TO_RAD;" in freertos
+    assert "nav_input.roll_rad = roll_control * STABILIZER_DEG_TO_RAD;" not in freertos
+    assert "nav_input.pitch_rad = pitch_control * STABILIZER_DEG_TO_RAD;" not in freertos
 
 
 def test_imu_spi_timeout_is_short_but_not_overly_aggressive() -> None:

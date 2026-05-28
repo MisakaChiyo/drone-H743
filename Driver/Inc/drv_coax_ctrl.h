@@ -11,19 +11,36 @@ extern "C" {
 #define DRV_COAX_CTRL_REF_LEN   4U
 #define DRV_COAX_CTRL_CMD_LEN   4U
 
-#define DRV_COAX_CTRL_SERVO_ALPHA_CENTER_US 1412U
-#define DRV_COAX_CTRL_SERVO_BETA_CENTER_US  1851U
-#define DRV_COAX_CTRL_SERVO_MIN_US           500U
-#define DRV_COAX_CTRL_SERVO_MAX_US          2500U
+#define DRV_COAX_CTRL_SERVO_ALPHA_CENTER_US 1441U
+#define DRV_COAX_CTRL_SERVO_BETA_CENTER_US  1877U
+#define DRV_COAX_CTRL_SERVO_PHYSICAL_MIN_US  500U
+#define DRV_COAX_CTRL_SERVO_PHYSICAL_MAX_US 2500U
+#define DRV_COAX_CTRL_SERVO_LIMIT_DELTA_US   667U
+#define DRV_COAX_CTRL_SERVO_MIN_US           833U
+#define DRV_COAX_CTRL_SERVO_MAX_US          2167U
+#define DRV_COAX_CTRL_SERVO_TRAVEL_DEG       270.0f
+#define DRV_COAX_CTRL_SERVO_LIMIT_DEG         90.0f
 
 typedef struct {
     float x_m;
     float y_m;
     float z_m;
+    float vx_m_s;
+    float vy_m_s;
+    float vz_m_s;
+    float ax_m_s2;
+    float ay_m_s2;
+    float az_m_s2;
     float yaw_rad;
 } DRV_COAX_CTRL_Reference;
 
 typedef struct {
+    float x_m;
+    float y_m;
+    float z_m;
+    float vx_m_s;
+    float vy_m_s;
+    float vz_m_s;
     float roll_rad;
     float pitch_rad;
     float yaw_rad;
@@ -51,6 +68,15 @@ typedef struct {
     float rotation_error_gain;
     float accel_xy_limit_m_s2;
     float accel_z_limit_m_s2;
+    float vel_loop_enable;
+    float vel_loop_x_kp;
+    float vel_loop_x_ki;
+    float vel_loop_x_kd;
+    float vel_loop_y_kp;
+    float vel_loop_y_ki;
+    float vel_loop_y_kd;
+    float vel_loop_output_limit_m_s2;
+    float vel_loop_i_limit_m_s2;
     float mass_kg;
     float gravity_m_s2;
     float min_total_force_n;

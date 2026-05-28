@@ -1,0 +1,17 @@
+{
+  "airframe": {},
+  "axis": "pitch",
+  "bit_ms": 250,
+  "center": {
+    "alpha_us": 1500,
+    "beta_us": 1500
+  },
+  "command": "IDENT STEP pitch pulse_us=30 duration_ms=4000",
+  "duration_ms": 4000,
+  "hold_ms": 700,
+  "host_time": 1779826402.3132284,
+  "mode": "STEP",
+  "pulse_us": 30,
+  "repeat": 2,
+  "seed": 1
+}

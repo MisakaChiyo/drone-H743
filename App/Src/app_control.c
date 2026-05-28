@@ -37,7 +37,7 @@
 #include <string.h>
 
 #define APP_CONTROL_CFG_MAGIC       0x44524346UL
-#define APP_CONTROL_CFG_VERSION     4U
+#define APP_CONTROL_CFG_VERSION     5U
 #define APP_CONTROL_CFG_ADDRESS     (APP_FLASH_SERVICE_SIZE_BYTES - 4096UL)
 #define APP_CONTROL_MAX_LINE        128U
 #define APP_CONTROL_HEARTBEAT_ENABLED 0U
@@ -104,15 +104,53 @@ typedef struct {
 } APP_ControlFlashRecordV2;
 
 typedef struct {
+    float pos_x_kp;
+    float pos_y_kp;
+    float pos_z_kp;
+    float vel_x_kd;
+    float vel_y_kd;
+    float vel_z_kd;
+    float rotation_error_gain;
+    float accel_xy_limit_m_s2;
+    float accel_z_limit_m_s2;
+    float mass_kg;
+    float gravity_m_s2;
+    float min_total_force_n;
+    float max_total_force_n;
+    float tilt_lever_arm_m;
+    float roll_angle_kp;
+    float roll_rate_kd;
+    float pitch_angle_kp;
+    float pitch_rate_kd;
+    float tilt_limit_rad;
+    float yaw_angle_kp;
+    float yaw_rate_kd;
+    float yaw_rate_limit_rad_s;
+    float yaw_inertia;
+    float thrust_coeff_n_per_rad2;
+    float yaw_torque_coeff_n_m_per_rad2;
+    float motor_omega_max_rad_s;
+} APP_ControlCoaxParamsV4;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size;
+    APP_ControlConfig config;
+    APP_ControlCoaxParamsV4 coax_params;
+    uint32_t checksum;
+} APP_ControlFlashRecordV3;
+
+typedef APP_ControlFlashRecordV3 APP_ControlFlashRecordV4;
+
+typedef struct {
     uint32_t magic;
     uint16_t version;
     uint16_t size;
     APP_ControlConfig config;
     DRV_COAX_CTRL_Params coax_params;
     uint32_t checksum;
-} APP_ControlFlashRecordV3;
-
-typedef APP_ControlFlashRecordV3 APP_ControlFlashRecordV4;
+} APP_ControlFlashRecordV5;
 
 static APP_ControlConfig control_config;
 #if (APP_CONTROL_HEARTBEAT_ENABLED != 0U)
@@ -472,7 +510,20 @@ static uint8_t app_control_valid_motor(uint32_t motor)
 static uint16_t app_control_servo_angle_to_pulse(uint32_t angle)
 {
     if (angle > 180U) { angle = 180U; }
-    return (uint16_t)(500U + ((angle * 2000U) / 180U));
+    return (uint16_t)(DRV_COAX_CTRL_SERVO_PHYSICAL_MIN_US +
+                      ((angle * (DRV_COAX_CTRL_SERVO_PHYSICAL_MAX_US -
+                                 DRV_COAX_CTRL_SERVO_PHYSICAL_MIN_US)) / 270U));
+}
+
+static uint16_t app_control_servo_clamp_pulse(uint16_t pulse_us)
+{
+    if (pulse_us < DRV_COAX_CTRL_SERVO_MIN_US) {
+        return DRV_COAX_CTRL_SERVO_MIN_US;
+    }
+    if (pulse_us > DRV_COAX_CTRL_SERVO_MAX_US) {
+        return DRV_COAX_CTRL_SERVO_MAX_US;
+    }
+    return pulse_us;
 }
 
 static uint8_t app_control_parse_vofa_pwm(const char *text,
@@ -562,15 +613,15 @@ static void app_control_report_pwm(void)
                           (unsigned long)TIM2->PSC,
                           (unsigned long)TIM2->ARR,
                           (unsigned long)TIM2->CNT);
-    APP_Control_QueueText("PWM ccr=%lu,%lu,%lu,%lu bsp_us=%u,%u,%u,%u start=%u,%u,%u,%u pa0_moder=%lu pa0_af=%lu odr=0x%08lX idr=0x%08lX\r\n",
+    APP_Control_QueueText("PWM ccr=%lu,%lu,%lu,%lu esc_us=%u,%u servo_us=%u,%u start=%u,%u,%u,%u pa0_moder=%lu pa0_af=%lu odr=0x%08lX idr=0x%08lX\r\n",
                           (unsigned long)TIM2->CCR1,
                           (unsigned long)TIM2->CCR2,
                           (unsigned long)TIM2->CCR3,
                           (unsigned long)TIM2->CCR4,
                           (unsigned int)BSP_PWM_GetEscPulse(1U),
                           (unsigned int)BSP_PWM_GetEscPulse(2U),
-                          (unsigned int)BSP_PWM_GetEscPulse(3U),
-                          (unsigned int)BSP_PWM_GetEscPulse(4U),
+                          (unsigned int)BSP_PWM_GetServoPulse(1U),
+                          (unsigned int)BSP_PWM_GetServoPulse(2U),
                           (unsigned int)BSP_PWM_GetStartStatus(1U),
                           (unsigned int)BSP_PWM_GetStartStatus(2U),
                           (unsigned int)BSP_PWM_GetStartStatus(3U),
@@ -669,6 +720,70 @@ static const char *app_control_token_value(char **tokens,
     return NULL;
 }
 
+static const char *app_control_after_param_separator(const char *text)
+{
+    if (text == NULL) {
+        return NULL;
+    }
+
+    if (text[0] == ':') {
+        return text + 1U;
+    }
+
+    if (((uint8_t)text[0] == 0xEFU) &&
+        ((uint8_t)text[1] == 0xBCU) &&
+        ((uint8_t)text[2] == 0x9AU)) {
+        return text + 3U;
+    }
+
+    return NULL;
+}
+
+static uint8_t app_control_named_value_line(const char *line,
+                                            const char *name,
+                                            char *value_text,
+                                            uint32_t value_size)
+{
+    const char *match;
+    const char *cursor;
+    const char *value_start;
+    uint32_t value_len = 0U;
+
+    if ((line == NULL) || (name == NULL) || (value_text == NULL) ||
+        (value_size == 0U)) {
+        return 0U;
+    }
+
+    match = strstr(line, name);
+    if (match == NULL) {
+        return 0U;
+    }
+
+    cursor = match + strlen(name);
+    while (*cursor == ' ') {
+        ++cursor;
+    }
+
+    value_start = app_control_after_param_separator(cursor);
+    if (value_start == NULL) {
+        return 0U;
+    }
+
+    while (*value_start == ' ') {
+        ++value_start;
+    }
+
+    while ((value_start[value_len] > ' ') &&
+           (value_start[value_len] != ',') &&
+           (value_len < (value_size - 1U))) {
+        value_text[value_len] = value_start[value_len];
+        ++value_len;
+    }
+    value_text[value_len] = '\0';
+
+    return (value_len != 0U) ? 1U : 0U;
+}
+
 static void app_control_protocol_err(uint32_t id,
                                      const char *mod,
                                      const char *op,
@@ -728,6 +843,15 @@ static void app_control_report_coax_param(const char *name, float value)
                                  value_text);
 }
 
+static void app_control_report_coax_param_by_name(const char *name)
+{
+    float value;
+
+    if ((name != NULL) && (DRV_COAX_CTRL_GetParam(name, &value) != 0U)) {
+        app_control_report_coax_param(name, value);
+    }
+}
+
 static void app_control_report_params(void)
 {
     float value;
@@ -749,6 +873,64 @@ static void app_control_force_airframe_params(DRV_COAX_CTRL_Params *params)
     params->mass_kg = DRV_AIRFRAME_MASS_KG;
     params->min_total_force_n = DRV_AIRFRAME_WEIGHT_N;
     params->max_total_force_n = DRV_AIRFRAME_MAX_TOTAL_FORCE_N;
+}
+
+static void app_control_apply_new_coax_param_defaults(DRV_COAX_CTRL_Params *params)
+{
+    DRV_COAX_CTRL_Params defaults;
+
+    if (params == NULL) {
+        return;
+    }
+
+    DRV_COAX_CTRL_GetDefaultParams(&defaults);
+    params->vel_loop_enable = defaults.vel_loop_enable;
+    params->vel_loop_x_kp = defaults.vel_loop_x_kp;
+    params->vel_loop_x_ki = defaults.vel_loop_x_ki;
+    params->vel_loop_x_kd = defaults.vel_loop_x_kd;
+    params->vel_loop_y_kp = defaults.vel_loop_y_kp;
+    params->vel_loop_y_ki = defaults.vel_loop_y_ki;
+    params->vel_loop_y_kd = defaults.vel_loop_y_kd;
+    params->vel_loop_output_limit_m_s2 = defaults.vel_loop_output_limit_m_s2;
+    params->vel_loop_i_limit_m_s2 = defaults.vel_loop_i_limit_m_s2;
+}
+
+static void app_control_migrate_coax_params_v4(const APP_ControlCoaxParamsV4 *legacy,
+                                               DRV_COAX_CTRL_Params *params)
+{
+    if ((legacy == NULL) || (params == NULL)) {
+        return;
+    }
+
+    DRV_COAX_CTRL_GetDefaultParams(params);
+    params->pos_x_kp = legacy->pos_x_kp;
+    params->pos_y_kp = legacy->pos_y_kp;
+    params->pos_z_kp = legacy->pos_z_kp;
+    params->vel_x_kd = legacy->vel_x_kd;
+    params->vel_y_kd = legacy->vel_y_kd;
+    params->vel_z_kd = legacy->vel_z_kd;
+    params->rotation_error_gain = legacy->rotation_error_gain;
+    params->accel_xy_limit_m_s2 = legacy->accel_xy_limit_m_s2;
+    params->accel_z_limit_m_s2 = legacy->accel_z_limit_m_s2;
+    params->mass_kg = legacy->mass_kg;
+    params->gravity_m_s2 = legacy->gravity_m_s2;
+    params->min_total_force_n = legacy->min_total_force_n;
+    params->max_total_force_n = legacy->max_total_force_n;
+    params->tilt_lever_arm_m = legacy->tilt_lever_arm_m;
+    params->roll_angle_kp = legacy->roll_angle_kp;
+    params->roll_rate_kd = legacy->roll_rate_kd;
+    params->pitch_angle_kp = legacy->pitch_angle_kp;
+    params->pitch_rate_kd = legacy->pitch_rate_kd;
+    params->tilt_limit_rad = legacy->tilt_limit_rad;
+    params->yaw_angle_kp = legacy->yaw_angle_kp;
+    params->yaw_rate_kd = legacy->yaw_rate_kd;
+    params->yaw_rate_limit_rad_s = legacy->yaw_rate_limit_rad_s;
+    params->yaw_inertia = legacy->yaw_inertia;
+    params->thrust_coeff_n_per_rad2 = legacy->thrust_coeff_n_per_rad2;
+    params->yaw_torque_coeff_n_m_per_rad2 = legacy->yaw_torque_coeff_n_m_per_rad2;
+    params->motor_omega_max_rad_s = legacy->motor_omega_max_rad_s;
+    app_control_force_airframe_params(params);
+    app_control_apply_new_coax_param_defaults(params);
 }
 
 static void app_control_report_airframe(void)
@@ -1715,7 +1897,7 @@ static void app_control_report_uart_stats(uint32_t rx_bytes,
 
 static APP_FlashService_Status app_control_load_config(void)
 {
-    APP_ControlFlashRecordV4 record;
+    APP_ControlFlashRecordV5 record;
     APP_FlashService_Status status;
     uint32_t checksum;
 
@@ -1739,18 +1921,19 @@ static APP_FlashService_Status app_control_load_config(void)
         }
         control_config = record.config;
         DRV_COAX_CTRL_SetParams(&record.coax_params);
-    } else if ((record.version == 3U) &&
-               (record.size == (sizeof(record.config) + sizeof(record.coax_params)))) {
+    } else if (((record.version == 3U) || (record.version == 4U)) &&
+               (record.size == (sizeof(APP_ControlConfig) + sizeof(APP_ControlCoaxParamsV4)))) {
+        const APP_ControlFlashRecordV4 *legacy =
+            (const APP_ControlFlashRecordV4 *)&record;
         DRV_COAX_CTRL_Params migrated_params;
 
-        checksum = app_control_checksum((const uint8_t *)&record.config,
-                                        record.size);
-        if (checksum != record.checksum) {
+        checksum = app_control_checksum((const uint8_t *)&legacy->config,
+                                        legacy->size);
+        if (checksum != legacy->checksum) {
             return APP_FLASH_SERVICE_ERROR;
         }
-        control_config = record.config;
-        migrated_params = record.coax_params;
-        app_control_force_airframe_params(&migrated_params);
+        control_config = legacy->config;
+        app_control_migrate_coax_params_v4(&legacy->coax_params, &migrated_params);
         DRV_COAX_CTRL_SetParams(&migrated_params);
     } else if ((record.version == 2U) &&
                (record.size == sizeof(APP_ControlConfigV2))) {
@@ -1800,7 +1983,7 @@ static APP_FlashService_Status app_control_load_config(void)
 
 static APP_FlashService_Status app_control_save_config(void)
 {
-    APP_ControlFlashRecordV4 record;
+    APP_ControlFlashRecordV5 record;
     APP_FlashService_Status status;
 
     memset(&record, 0xFF, sizeof(record));
@@ -1837,7 +2020,8 @@ static void app_control_servo_move_configured(void)
         }
 
         moves[count].id = control_config.servo[index].id;
-        moves[count].pulse_us = control_config.servo[index].pulse_us;
+        moves[count].pulse_us =
+            app_control_servo_clamp_pulse(control_config.servo[index].pulse_us);
         if (control_config.servo[index].time_ms > time_ms) {
             time_ms = control_config.servo[index].time_ms;
         }
@@ -1879,7 +2063,7 @@ static void app_control_handle_servo(char **tokens, uint32_t count)
             return;
         }
 
-        control_config.servo[index].pulse_us = (uint16_t)pulse;
+        control_config.servo[index].pulse_us = app_control_servo_clamp_pulse((uint16_t)pulse);
         control_config.servo[index].time_ms = (uint16_t)time_ms;
         status = BSP_BusServo_Move(control_config.servo[index].id,
                                    control_config.servo[index].pulse_us,
@@ -1920,13 +2104,16 @@ static void app_control_handle_servo(char **tokens, uint32_t count)
             time_ms = control_config.servo[index].time_ms;
         }
 
-        control_config.servo[index].pulse_us = pulse;
+        control_config.servo[index].pulse_us = app_control_servo_clamp_pulse(pulse);
         control_config.servo[index].time_ms = (uint16_t)time_ms;
-        status = BSP_BusServo_Move(control_config.servo[index].id, pulse, (uint16_t)time_ms);
+        status = BSP_BusServo_Move(control_config.servo[index].id,
+                                   control_config.servo[index].pulse_us,
+                                   control_config.servo[index].time_ms);
         APP_Control_QueueText("OK servo%lu angle st=%u id=%u deg=%u pulse=%u\r\n",
                               (unsigned long)index, (unsigned int)status,
                               (unsigned int)control_config.servo[index].id,
-                              (unsigned int)angle, (unsigned int)pulse);
+                              (unsigned int)angle,
+                              (unsigned int)control_config.servo[index].pulse_us);
         return;
     }
 
@@ -2674,6 +2861,9 @@ static void app_control_handle_pid(char **tokens, uint32_t count)
     }
 
     APP_Control_QueueText("OK pid axis=%s target=coax\r\n", tokens[2]);
+    app_control_report_coax_param_by_name(kp_name);
+    app_control_report_coax_param_by_name(kd_name);
+    app_control_report_pid_legacy();
 }
 
 static uint8_t app_control_handle_pid_slider_line(const char *line)
@@ -2684,16 +2874,26 @@ static uint8_t app_control_handle_pid_slider_line(const char *line)
     } APP_ControlPidSliderMap;
 
     static const APP_ControlPidSliderMap map[] = {
-        { "roll_angle_kp",  "coax.roll_angle_kp"  },
         { "roll_rate_kd",   "coax.roll_rate_kd"   },
-        { "pitch_angle_kp", "coax.pitch_angle_kp" },
         { "pitch_rate_kd",  "coax.pitch_rate_kd"  },
         { "yaw_angle_kp",   "coax.yaw_angle_kp"   },
         { "yaw_rate_kd",    "coax.yaw_rate_kd"    },
+        { "vel_x_kd",       "coax.vel_x_kd"       },
+        { "vel_y_kd",       "coax.vel_y_kd"       },
+        { "vel_z_kd",       "coax.vel_z_kd"       },
+        { "accel_xy",       "coax.accel_xy_limit_m_s2" },
+        { "accel_z",        "coax.accel_z_limit_m_s2"  },
+        { "vel_loop_enable", "coax.vel_loop_enable" },
+        { "vel_loop_x_kp",  "coax.vel_loop_x_kp" },
+        { "vel_loop_x_ki",  "coax.vel_loop_x_ki" },
+        { "vel_loop_x_kd",  "coax.vel_loop_x_kd" },
+        { "vel_loop_y_kp",  "coax.vel_loop_y_kp" },
+        { "vel_loop_y_ki",  "coax.vel_loop_y_ki" },
+        { "vel_loop_y_kd",  "coax.vel_loop_y_kd" },
+        { "vel_loop_out",   "coax.vel_loop_output_limit_m_s2" },
+        { "vel_loop_i",     "coax.vel_loop_i_limit_m_s2" },
         { "aw_angle_kp",    "coax.yaw_angle_kp"   },
         { "aw_rate_kd",     "coax.yaw_rate_kd"    },
-        { "Angle",          "coax.tilt_limit_rad" },
-        { "angle",          "coax.tilt_limit_rad" },
     };
 
     char value_text[24];
@@ -2703,36 +2903,16 @@ static uint8_t app_control_handle_pid_slider_line(const char *line)
     }
 
     for (uint32_t map_index = 0U; map_index < (sizeof(map) / sizeof(map[0])); ++map_index) {
-        const char *name = strstr(line, map[map_index].slider_name);
-        const char *value_start;
-        uint32_t value_len = 0U;
         float value;
 
-        if (name == NULL) {
+        if (app_control_named_value_line(line,
+                                         map[map_index].slider_name,
+                                         value_text,
+                                         (uint32_t)sizeof(value_text)) == 0U) {
             continue;
         }
 
-        value_start = name + strlen(map[map_index].slider_name);
-        while (*value_start == ' ') {
-            ++value_start;
-        }
-        if (*value_start != ':') {
-            continue;
-        }
-        ++value_start;
-        while (*value_start == ' ') {
-            ++value_start;
-        }
-
-        while ((value_start[value_len] > ' ') &&
-               (value_start[value_len] != ',') &&
-               (value_len < (sizeof(value_text) - 1U))) {
-            value_text[value_len] = value_start[value_len];
-            ++value_len;
-        }
-        value_text[value_len] = '\0';
-
-        if ((value_len == 0U) ||
+        if ((value_text[0] == '\0') ||
             (app_control_parse_f32(value_text, &value) == 0U)) {
             return 0U;
         }
@@ -2749,7 +2929,51 @@ static uint8_t app_control_handle_pid_slider_line(const char *line)
             APP_Control_QueueText("ERR pid slider %s\r\n", map[map_index].slider_name);
         } else {
             app_control_schedule_flash_autosave();
+            app_control_report_coax_param_by_name(map[map_index].param_name);
+            app_control_report_pid_legacy();
         }
+        return 1U;
+    }
+
+    return 0U;
+}
+
+static uint8_t app_control_handle_param_value_line(const char *line)
+{
+    char value_text[24];
+
+    if ((line == NULL) || (*line == '\0')) {
+        return 0U;
+    }
+
+    for (uint32_t index = 0U; index < DRV_COAX_CTRL_ParamCount(); ++index) {
+        const char *name = DRV_COAX_CTRL_ParamName(index);
+        float value;
+
+        if (name == NULL) {
+            continue;
+        }
+
+        if (app_control_named_value_line(line,
+                                         name,
+                                         value_text,
+                                         (uint32_t)sizeof(value_text)) == 0U) {
+            continue;
+        }
+
+        if (app_control_parse_f32(value_text, &value) == 0U) {
+            APP_Control_QueueText("ERR param value %s\r\n", name);
+            return 1U;
+        }
+
+        if (DRV_COAX_CTRL_SetParam(name, value) == 0U) {
+            APP_Control_QueueText("ERR param target %s\r\n", name);
+            return 1U;
+        }
+
+        app_control_schedule_flash_autosave();
+        app_control_report_coax_param_by_name(name);
+        app_control_report_pid_legacy();
         return 1U;
     }
 
@@ -2840,6 +3064,8 @@ static void app_control_handle_param(char **tokens, uint32_t count)
 
     app_control_format_float(value, formatted, (uint32_t)sizeof(formatted));
     APP_Control_QueueText("OK param name=%s value=%s\r\n", name, formatted);
+    app_control_report_coax_param_by_name(name);
+    app_control_report_pid_legacy();
 }
 
 void APP_Control_Init(void)
@@ -3049,7 +3275,7 @@ static void app_control_dispatch_tokens(char **tokens, uint32_t count, uint8_t e
                                       (unsigned int)pulse);
             }
         } else {
-            APP_Control_QueueText("ERR usage PWM1..4:0..100\r\n");
+            APP_Control_QueueText("ERR usage PWM1..2:0..100\r\n");
         }
     } else if (strncmp(tokens[0], "Servor", 6) == 0) {
         unsigned int parsed_index;
@@ -3067,15 +3293,16 @@ static void app_control_dispatch_tokens(char **tokens, uint32_t count, uint8_t e
             index = vofa_index - 1U;
             pulse = app_control_servo_angle_to_pulse(angle);
 
-            control_config.servo[index].pulse_us = pulse;
-            status = BSP_BusServo_Move(control_config.servo[index].id, pulse,
+            control_config.servo[index].pulse_us = app_control_servo_clamp_pulse(pulse);
+            status = BSP_BusServo_Move(control_config.servo[index].id,
+                                       control_config.servo[index].pulse_us,
                                        control_config.servo[index].time_ms);
             APP_Control_QueueText("OK servo%lu vofa_angle st=%u id=%u deg=%u pulse=%u\r\n",
                                   (unsigned long)index,
                                   (unsigned int)status,
                                   (unsigned int)control_config.servo[index].id,
                                   (unsigned int)angle,
-                                  (unsigned int)pulse);
+                                  (unsigned int)control_config.servo[index].pulse_us);
         }
     } else if (strcmp(tokens[0], "SERVO") == 0) {
         app_control_handle_servo(tokens, count);
@@ -3101,6 +3328,10 @@ void APP_Control_ProcessLine(const char *line)
     }
 
     if (app_control_handle_pid_slider_line(line) != 0U) {
+        return;
+    }
+
+    if (app_control_handle_param_value_line(line) != 0U) {
         return;
     }
 

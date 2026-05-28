@@ -53,7 +53,7 @@ def test_ident_sample_parser_and_step_fit() -> None:
     panel = load_panel_module()
     line = (
         "IDENT sample id=3 seq=12 t_ms=3456 axis=roll mode=step "
-        "alpha_us=1412 beta_us=1891 roll=1.230 pitch=-0.120 "
+        "alpha_us=1441 beta_us=1917 roll=1.230 pitch=-0.120 "
         "gx=4.50 gy=-0.80 rc_arm=1 throttle_us=1180"
     )
     record = panel.ident_record_from_line(line)
@@ -65,12 +65,12 @@ def test_ident_sample_parser_and_step_fit() -> None:
     samples = []
     for index in range(30):
         t_ms = index * 40
-        beta = 1851 if index < 3 else 1891
+        beta = 1877 if index < 3 else 1917
         response = 0.0 if index < 3 else 4.0 * (1.0 - pow(2.718281828, -((index - 3) * 0.04) / 0.25))
         samples.append(
             panel.ident_record_from_line(
                 f"IDENT sample id=1 seq={index} t_ms={t_ms} axis=roll mode=step "
-                f"alpha_us=1412 beta_us={beta} roll={response:.3f} "
+                f"alpha_us=1441 beta_us={beta} roll={response:.3f} "
                 "pitch=0.000 gx=0.00 gy=0.00 rc_arm=1 throttle_us=1180"
             )
         )

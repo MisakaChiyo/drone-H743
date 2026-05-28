@@ -13,12 +13,14 @@ def test_stabilizer_uses_nonblocking_servo_dma_path() -> None:
 
     assert "BSP_BusServo_MoveManyAsync(moves, 2U,\n                                         STABILIZER_SERVO_MOVE_TIME_MS)" in freertos
     assert "BSP_BusServo_MoveMany(moves, 2U" not in freertos
+    assert "DRV_SERVO_MoveCmd moves[2]" in freertos
+    assert "BSP_PWM_SetServoPulse" not in freertos
     assert "stabilizer_servo_should_send" in freertos
     assert "stabilizer_servo_record_target(moves);" in freertos
     assert "STABILIZER_SERVO_REFRESH_MS" in freertos
     assert "STABILIZER_SERVO_DELTA_US" in freertos
     assert "#define STABILIZER_CONTROL_PERIOD_MS   2U" in freertos
-    assert "#define STABILIZER_SERVO_MOVE_TIME_MS  0U" in freertos
+    assert "#define STABILIZER_SERVO_MOVE_TIME_MS 0U" in freertos
     assert "#define STABILIZER_SERVO_REFRESH_MS    500U" in freertos
     assert "#define VOFA_SEND_PERIOD_MS            20U" in freertos
     assert "stabilizer_servo_commit_sent(moves, now);" in freertos
@@ -82,7 +84,7 @@ def test_uart_callbacks_route_uart7_to_servo_dma_diagnostics() -> None:
 def test_vofa_stream_sends_only_runtime_flight_channels() -> None:
     freertos = read("Core/Src/freertos.c")
 
-    assert "#define VOFA_DATA_SIZE 22U" in freertos
+    assert "#define VOFA_DATA_SIZE 63U" in freertos
     assert "DRV_SERVO_Diag servo_diag;" not in freertos
     assert "BSP_BusServo_GetDiag(&servo_diag);" not in freertos
     assert "vofa_data[10] = (float)(now_us / 1000ULL) * 0.001f;" in freertos
@@ -90,6 +92,12 @@ def test_vofa_stream_sends_only_runtime_flight_channels() -> None:
     assert "vofa_data[12] = msg.imu_poll_sample_rate_hz;" in freertos
     assert "vofa_data[13] = msg.imu_age_ms;" in freertos
     assert "vofa_data[21] = msg.attitude_debug.dt_ms;" in freertos
+    assert '(void)DRV_COAX_CTRL_GetParam("coax.roll_rate_kd", &vofa_data[22]);' in freertos
+    assert '(void)DRV_COAX_CTRL_GetParam("coax.yaw_angle_kp", &vofa_data[24]);' in freertos
+    assert '(void)DRV_COAX_CTRL_GetParam("coax.yaw_rate_kd", &vofa_data[25]);' in freertos
+    assert '(void)DRV_COAX_CTRL_GetParam("coax.accel_z_limit_m_s2", &vofa_data[30]);' in freertos
+    assert "vofa_data[48] = vofa_debug.servo_alpha_us;" in freertos
+    assert "vofa_data[51] = vofa_debug.motor_lower_us;" in freertos
     assert "osDelay(VOFA_SEND_PERIOD_MS);" in freertos
 
 

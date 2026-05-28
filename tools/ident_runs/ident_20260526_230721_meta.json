@@ -1,0 +1,17 @@
+{
+  "airframe": {},
+  "axis": "roll",
+  "bit_ms": 250,
+  "center": {
+    "alpha_us": 1412,
+    "beta_us": 1851
+  },
+  "command": "IDENT STEP roll pulse_us=20 duration_ms=3000",
+  "duration_ms": 3000,
+  "hold_ms": 800,
+  "host_time": 1779808041.8249207,
+  "mode": "STEP",
+  "pulse_us": 20,
+  "repeat": 2,
+  "seed": 1
+}

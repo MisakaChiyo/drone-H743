@@ -825,14 +825,14 @@ class DronePanel(tk.Tk):
         self.serial_baud_var = tk.IntVar(value=115200)
         self.ident_axis_var = tk.StringVar(value="roll")
         self.ident_mode_var = tk.StringVar(value="STEP")
-        self.ident_pulse_var = tk.IntVar(value=40)
+        self.ident_pulse_var = tk.IntVar(value=20)
         self.ident_duration_var = tk.IntVar(value=3000)
         self.ident_hold_var = tk.IntVar(value=800)
         self.ident_repeat_var = tk.IntVar(value=2)
         self.ident_bit_var = tk.IntVar(value=250)
         self.ident_seed_var = tk.IntVar(value=1)
-        self.ident_alpha_center_var = tk.IntVar(value=1412)
-        self.ident_beta_center_var = tk.IntVar(value=1851)
+        self.ident_alpha_center_var = tk.IntVar(value=1441)
+        self.ident_beta_center_var = tk.IntVar(value=1877)
         self.ident_status_var = tk.StringVar(value="idle")
         self.ident_sample_count_var = tk.StringVar(value="samples=0")
         self.ident_reason_var = tk.StringVar(value="-")
@@ -843,6 +843,12 @@ class DronePanel(tk.Tk):
         self.ident_output_dir_var = tk.StringVar(value=f"save dir: {self.ident_save_dir}")
         self.ident_last_file_var = tk.StringVar(value="last file: none")
         self.ident_link_var = tk.StringVar(value="UDP text: waiting")
+        self.ident_command_preview_var = tk.StringVar(value="")
+        self.ident_mode_hint_var = tk.StringVar(value="")
+        self.ident_safety_hint_var = tk.StringVar(
+            value="建议第一次：STEP，小幅 20us，3s；确认方向后再加到 30-40us。"
+        )
+        self.ident_field_rows: dict[str, tuple[ttk.Label, ttk.Widget, ttk.Label]] = {}
 
         self.module_state: dict[str, dict[str, tk.StringVar]] = {}
         self.baro_vars: dict[str, tk.StringVar] = {}
@@ -851,6 +857,20 @@ class DronePanel(tk.Tk):
         self.mag_vars: dict[str, tk.StringVar] = {}
 
         self._build_ui()
+        self.ident_axis_var.trace_add("write", self._on_ident_config_change)
+        self.ident_mode_var.trace_add("write", self._on_ident_config_change)
+        for var in (
+            self.ident_pulse_var,
+            self.ident_duration_var,
+            self.ident_hold_var,
+            self.ident_repeat_var,
+            self.ident_bit_var,
+            self.ident_seed_var,
+            self.ident_alpha_center_var,
+            self.ident_beta_center_var,
+        ):
+            var.trace_add("write", self._on_ident_config_change)
+        self._on_ident_config_change()
         self.after(1000, self._check_link_health)
         self.after(100, self._drain_rx)
         self.after(250, self._baro_tick)
@@ -1336,12 +1356,13 @@ class DronePanel(tk.Tk):
     def _build_ident_page(self, parent: ttk.Frame) -> None:
         top = ttk.Frame(parent)
         top.pack(fill=tk.X)
-        ttk.Button(top, text="ARM", command=lambda: self._send_proto(PROTO_REQ_IDENT, "IDENT ARM")).pack(side=tk.LEFT)
+        ttk.Button(top, text="ARM 辨识", command=lambda: self._send_proto(PROTO_REQ_IDENT, "IDENT ARM")).pack(side=tk.LEFT)
         ttk.Button(top, text="DISARM", command=lambda: self._send_proto(PROTO_REQ_IDENT, "IDENT DISARM")).pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text="STOP", command=lambda: self._send_proto(PROTO_REQ_IDENT, "IDENT STOP")).pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text="STATUS", command=lambda: self._send_proto(PROTO_REQ_IDENT, "IDENT?")).pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text="AIRFRAME", command=self._request_airframe).pack(side=tk.LEFT, padx=4)
-        ttk.Label(top, textvariable=self.ident_status_var).pack(side=tk.LEFT, padx=(18, 4))
+        ttk.Label(top, text="状态").pack(side=tk.LEFT, padx=(18, 4))
+        ttk.Label(top, textvariable=self.ident_status_var).pack(side=tk.LEFT, padx=4)
         ttk.Label(top, textvariable=self.ident_sample_count_var).pack(side=tk.LEFT, padx=4)
         ttk.Label(top, textvariable=self.ident_reason_var).pack(side=tk.LEFT, padx=4)
 
@@ -1354,25 +1375,49 @@ class DronePanel(tk.Tk):
 
         cfg = ttk.LabelFrame(left, text="Experiment", padding=10)
         cfg.pack(fill=tk.X)
-        ttk.Label(cfg, text="Axis").grid(row=0, column=0, sticky=tk.W, pady=3)
-        ttk.Combobox(cfg, textvariable=self.ident_axis_var, values=("roll", "pitch"), width=10, state="readonly").grid(row=0, column=1, sticky=tk.W, pady=3)
-        ttk.Label(cfg, text="Mode").grid(row=1, column=0, sticky=tk.W, pady=3)
-        ttk.Combobox(cfg, textvariable=self.ident_mode_var, values=("STEP", "DOUBLET", "PRBS"), width=10, state="readonly").grid(row=1, column=1, sticky=tk.W, pady=3)
-        numeric = [
-            ("pulse_us", self.ident_pulse_var),
-            ("duration_ms", self.ident_duration_var),
-            ("hold_ms", self.ident_hold_var),
-            ("repeat", self.ident_repeat_var),
-            ("bit_ms", self.ident_bit_var),
-            ("seed", self.ident_seed_var),
-            ("alpha_center", self.ident_alpha_center_var),
-            ("beta_center", self.ident_beta_center_var),
+        cfg.columnconfigure(1, weight=1)
+        ttk.Label(cfg, text="辨识轴").grid(row=0, column=0, sticky=tk.W, pady=3)
+        ttk.Combobox(cfg, textvariable=self.ident_axis_var, values=("roll", "pitch"), width=12, state="readonly").grid(row=0, column=1, sticky=tk.W, pady=3)
+        ttk.Label(cfg, text="波形").grid(row=1, column=0, sticky=tk.W, pady=3)
+        ttk.Combobox(cfg, textvariable=self.ident_mode_var, values=("STEP", "DOUBLET", "PRBS"), width=12, state="readonly").grid(row=1, column=1, sticky=tk.W, pady=3)
+
+        presets = ttk.Frame(cfg)
+        presets.grid(row=2, column=0, columnspan=3, sticky=tk.EW, pady=(6, 8))
+        ttk.Button(presets, text="小幅首测", command=lambda: self._ident_apply_preset("small")).pack(side=tk.LEFT)
+        ttk.Button(presets, text="标准阶跃", command=lambda: self._ident_apply_preset("step")).pack(side=tk.LEFT, padx=4)
+        ttk.Button(presets, text="标准双脉冲", command=lambda: self._ident_apply_preset("doublet")).pack(side=tk.LEFT)
+
+        field_specs = [
+            ("pulse", "舵机偏置", self.ident_pulse_var, "us，正负都可；越大响应越明显"),
+            ("duration", "阶跃/PRBS 时长", self.ident_duration_var, "ms，最大 10000"),
+            ("hold", "双脉冲保持", self.ident_hold_var, "ms，每段保持时间"),
+            ("repeat", "双脉冲次数", self.ident_repeat_var, "次，默认 2"),
+            ("bit", "PRBS 位宽", self.ident_bit_var, "ms，随机输入切换间隔"),
+            ("seed", "PRBS seed", self.ident_seed_var, "相同 seed 可复现实验"),
+            ("alpha_center", "alpha 中位", self.ident_alpha_center_var, "us，pitch/1号舵机中心"),
+            ("beta_center", "beta 中位", self.ident_beta_center_var, "us，roll/2号舵机中心"),
         ]
-        for index, (label, var) in enumerate(numeric, start=2):
-            ttk.Label(cfg, text=label).grid(row=index, column=0, sticky=tk.W, pady=3)
-            ttk.Entry(cfg, textvariable=var, width=12).grid(row=index, column=1, sticky=tk.W, pady=3)
-        ttk.Button(cfg, text="Set Center", command=self._ident_send_center).grid(row=10, column=0, sticky=tk.EW, pady=(8, 0))
-        ttk.Button(cfg, text="Run", command=self._ident_run).grid(row=10, column=1, sticky=tk.EW, pady=(8, 0))
+        self.ident_field_rows.clear()
+        for index, (key, label, var, hint) in enumerate(field_specs, start=3):
+            label_widget = ttk.Label(cfg, text=label)
+            entry = ttk.Entry(cfg, textvariable=var, width=12)
+            hint_widget = ttk.Label(cfg, text=hint, foreground="#555555")
+            label_widget.grid(row=index, column=0, sticky=tk.W, pady=3)
+            entry.grid(row=index, column=1, sticky=tk.W, pady=3)
+            hint_widget.grid(row=index, column=2, sticky=tk.W, padx=(8, 0), pady=3)
+            self.ident_field_rows[key] = (label_widget, entry, hint_widget)
+
+        ttk.Label(cfg, textvariable=self.ident_mode_hint_var, wraplength=520, foreground="#333333").grid(
+            row=11, column=0, columnspan=3, sticky=tk.EW, pady=(8, 2)
+        )
+        ttk.Label(cfg, textvariable=self.ident_command_preview_var, wraplength=520, font=("Consolas", 9)).grid(
+            row=12, column=0, columnspan=3, sticky=tk.EW, pady=(2, 6)
+        )
+        ttk.Button(cfg, text="Set Center", command=self._ident_send_center).grid(row=13, column=0, sticky=tk.EW, pady=(4, 0))
+        ttk.Button(cfg, text="Run", command=self._ident_run).grid(row=13, column=1, sticky=tk.EW, pady=(4, 0))
+        ttk.Label(cfg, textvariable=self.ident_safety_hint_var, wraplength=520, foreground="#7A3E00").grid(
+            row=14, column=0, columnspan=3, sticky=tk.EW, pady=(8, 0)
+        )
 
         fit = ttk.LabelFrame(left, text="Fit / PID", padding=10)
         fit.pack(fill=tk.X, pady=(10, 0))
@@ -3092,16 +3137,64 @@ class DronePanel(tk.Tk):
         self.ident_csv_file = None
         self.ident_csv_writer = None
 
-    def _ident_run(self) -> None:
+    def _ident_payload(self) -> str:
         axis = self.ident_axis_var.get()
         mode = self.ident_mode_var.get().upper()
         pulse = int(self.ident_pulse_var.get())
         if mode == "STEP":
-            payload = f"IDENT STEP {axis} pulse_us={pulse} duration_ms={int(self.ident_duration_var.get())}"
-        elif mode == "DOUBLET":
-            payload = f"IDENT DOUBLET {axis} pulse_us={pulse} hold_ms={int(self.ident_hold_var.get())} repeat={int(self.ident_repeat_var.get())}"
-        else:
-            payload = f"IDENT PRBS {axis} pulse_us={pulse} bit_ms={int(self.ident_bit_var.get())} duration_ms={int(self.ident_duration_var.get())} seed={int(self.ident_seed_var.get())}"
+            return f"IDENT STEP {axis} pulse_us={pulse} duration_ms={int(self.ident_duration_var.get())}"
+        if mode == "DOUBLET":
+            return f"IDENT DOUBLET {axis} pulse_us={pulse} hold_ms={int(self.ident_hold_var.get())} repeat={int(self.ident_repeat_var.get())}"
+        return f"IDENT PRBS {axis} pulse_us={pulse} bit_ms={int(self.ident_bit_var.get())} duration_ms={int(self.ident_duration_var.get())} seed={int(self.ident_seed_var.get())}"
+
+    def _on_ident_config_change(self, *_args) -> None:
+        try:
+            payload = self._ident_payload()
+        except Exception:
+            payload = "参数未完整"
+        self.ident_command_preview_var.set(f"将发送: {payload}")
+        self._ident_update_mode_fields()
+
+    def _ident_update_mode_fields(self) -> None:
+        if not self.ident_field_rows:
+            return
+        mode = self.ident_mode_var.get().upper()
+        visible = {
+            "STEP": {"pulse", "duration", "alpha_center", "beta_center"},
+            "DOUBLET": {"pulse", "hold", "repeat", "alpha_center", "beta_center"},
+            "PRBS": {"pulse", "duration", "bit", "seed", "alpha_center", "beta_center"},
+        }.get(mode, set(self.ident_field_rows.keys()))
+        hints = {
+            "STEP": "STEP 用来看最基础的阶跃响应，适合第一次确认方向和估计 K/tau/L。",
+            "DOUBLET": "DOUBLET 正负各打一段，能减少持续偏置，适合绑绳台架。",
+            "PRBS": "PRBS 信息量大，建议等 STEP/DOUBLET 都正常后再用。",
+        }
+        self.ident_mode_hint_var.set(hints.get(mode, ""))
+        for key, widgets in self.ident_field_rows.items():
+            for widget in widgets:
+                if key in visible:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+
+    def _ident_apply_preset(self, name: str) -> None:
+        if name == "small":
+            self.ident_mode_var.set("STEP")
+            self.ident_pulse_var.set(20)
+            self.ident_duration_var.set(3000)
+        elif name == "step":
+            self.ident_mode_var.set("STEP")
+            self.ident_pulse_var.set(30)
+            self.ident_duration_var.set(4000)
+        elif name == "doublet":
+            self.ident_mode_var.set("DOUBLET")
+            self.ident_pulse_var.set(30)
+            self.ident_hold_var.set(700)
+            self.ident_repeat_var.set(2)
+        self._on_ident_config_change()
+
+    def _ident_run(self) -> None:
+        payload = self._ident_payload()
         self.ident_current_command = payload
         self._ident_begin_recording()
         self._send_proto(PROTO_REQ_IDENT, payload)
@@ -3353,12 +3446,24 @@ class DronePanel(tk.Tk):
         lowered = name.strip().lower()
         parts = lowered.split(".")
         pid_aliases = {
-            "pid.roll.kp": "coax.roll_angle_kp",
             "pid.roll.kd": "coax.roll_rate_kd",
-            "pid.pitch.kp": "coax.pitch_angle_kp",
             "pid.pitch.kd": "coax.pitch_rate_kd",
             "pid.yaw.kp": "coax.yaw_angle_kp",
             "pid.yaw.kd": "coax.yaw_rate_kd",
+            "pid.vel.x.kd": "coax.vel_x_kd",
+            "pid.vel.y.kd": "coax.vel_y_kd",
+            "pid.vel.z.kd": "coax.vel_z_kd",
+            "pid.accel.xy.limit": "coax.accel_xy_limit_m_s2",
+            "pid.accel.z.limit": "coax.accel_z_limit_m_s2",
+            "pid.vel_loop.enable": "coax.vel_loop_enable",
+            "pid.vel_loop.x.kp": "coax.vel_loop_x_kp",
+            "pid.vel_loop.x.ki": "coax.vel_loop_x_ki",
+            "pid.vel_loop.x.kd": "coax.vel_loop_x_kd",
+            "pid.vel_loop.y.kp": "coax.vel_loop_y_kp",
+            "pid.vel_loop.y.ki": "coax.vel_loop_y_ki",
+            "pid.vel_loop.y.kd": "coax.vel_loop_y_kd",
+            "pid.vel_loop.output.limit": "coax.vel_loop_output_limit_m_s2",
+            "pid.vel_loop.i.limit": "coax.vel_loop_i_limit_m_s2",
         }
         if lowered in pid_aliases:
             payload = f"PARAM SET {pid_aliases[lowered]} {value}"

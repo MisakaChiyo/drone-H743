@@ -124,6 +124,49 @@ static uint8_t aiwb2_is_transparent_prompt(const char *line)
     return ((line != 0) && (line[0] == '>')) ? 1U : 0U;
 }
 
+static uint8_t aiwb2_is_pid_slider_payload(const char *line)
+{
+    static const char *const slider_names[] = {
+        "roll_rate_kd",
+        "pitch_rate_kd",
+        "yaw_angle_kp",
+        "yaw_rate_kd",
+        "vel_x_kd",
+        "vel_y_kd",
+        "vel_z_kd",
+        "accel_xy",
+        "accel_z",
+        "vel_loop_enable",
+        "vel_loop_x_kp",
+        "vel_loop_x_ki",
+        "vel_loop_x_kd",
+        "vel_loop_y_kp",
+        "vel_loop_y_ki",
+        "vel_loop_y_kd",
+        "vel_loop_out",
+        "vel_loop_i",
+        "aw_angle_kp",
+        "aw_rate_kd",
+    };
+
+    if (line == 0) {
+        return 0U;
+    }
+
+    for (uint32_t index = 0U; index < (sizeof(slider_names) / sizeof(slider_names[0])); ++index) {
+        size_t name_len = strlen(slider_names[index]);
+        if ((strncmp(line, slider_names[index], name_len) == 0) &&
+            ((line[name_len] == ':') ||
+             (((uint8_t)line[name_len] == 0xEFU) &&
+              ((uint8_t)line[name_len + 1U] == 0xBCU) &&
+              ((uint8_t)line[name_len + 2U] == 0x9AU)))) {
+            return 1U;
+        }
+    }
+
+    return 0U;
+}
+
 static uint8_t aiwb2_should_mirror_to_maint(const char *line)
 {
     if ((line == 0) || (*line == '\0')) {
@@ -699,6 +742,7 @@ uint8_t APP_AiWB2_IsControlPayload(const char *line)
         (aiwb2_starts_with(line, "WIFI_EN ") != 0U) ||
         (aiwb2_starts_with(line, "PARAM ") != 0U) ||
         (aiwb2_starts_with(line, "PID ") != 0U) ||
+        (aiwb2_is_pid_slider_payload(line) != 0U) ||
         (aiwb2_starts_with(line, "SERVO ") != 0U) ||
         (aiwb2_starts_with(line, "Servor") != 0U) ||
         (aiwb2_starts_with(line, "PWM") != 0U) ||

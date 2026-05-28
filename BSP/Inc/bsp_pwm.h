@@ -17,14 +17,22 @@ typedef enum {
 #define BSP_PWM_ESC_MAX_US      1940U
 #define BSP_PWM_ESC_NEUTRAL_US  1100U
 #define BSP_PWM_ESC_MAX_PERCENT 100U
-#define BSP_PWM_ESC_CHANNEL_COUNT 4U
+#define BSP_PWM_TIM_CHANNEL_COUNT 4U
+#define BSP_PWM_ESC_CHANNEL_COUNT 2U
+
+#define BSP_PWM_SERVO_CHANNEL_COUNT 2U
+#define BSP_PWM_SERVO_MIN_US       500U
+#define BSP_PWM_SERVO_MAX_US      2500U
+#define BSP_PWM_SERVO_CENTER_US   1500U
 
 BSP_PWM_Status BSP_PWM_Init(void);
 BSP_PWM_Status BSP_PWM_SetEscPulse(uint32_t channel, uint16_t pulse_us);
 BSP_PWM_Status BSP_PWM_SetEscPercent(uint32_t channel, uint32_t percent);
 BSP_PWM_Status BSP_PWM_DisableEsc(uint32_t channel);
+BSP_PWM_Status BSP_PWM_SetServoPulse(uint32_t channel, uint16_t pulse_us);
 uint16_t BSP_PWM_PercentToPulse(uint32_t percent);
 uint16_t BSP_PWM_GetEscPulse(uint32_t channel);
+uint16_t BSP_PWM_GetServoPulse(uint32_t channel);
 uint8_t BSP_PWM_GetStartStatus(uint32_t channel);
 
 #ifdef __cplusplus

@@ -128,32 +128,34 @@ IDENT STEP roll ...   -> 主要激励 2 号舵机 beta
 由此可得近似换算：
 
 ```text
-2000 us -> 180 deg
-1 us    -> 0.09 deg
-1 deg   -> 11.11 us
+2000 us -> 270 deg
+1 us    -> 0.135 deg
+1 deg   -> 7.407 us
 ```
 
 常用辨识激励幅值对应舵机角度近似为：
 
 | pulse 偏置 | 角度偏置 |
 |---:|---:|
-| 20 us | 1.8 deg |
-| 30 us | 2.7 deg |
-| 40 us | 3.6 deg |
-| 80 us | 7.2 deg |
+| 20 us | 2.7 deg |
+| 30 us | 4.05 deg |
+| 40 us | 5.4 deg |
+| 80 us | 10.8 deg |
 
 当前固件中的机械校准中心来自 `Driver/Inc/drv_coax_ctrl.h`：
 
 ```c
-#define DRV_COAX_CTRL_SERVO_ALPHA_CENTER_US 1412U
-#define DRV_COAX_CTRL_SERVO_BETA_CENTER_US  1851U
+#define DRV_COAX_CTRL_SERVO_ALPHA_CENTER_US 1500U
+#define DRV_COAX_CTRL_SERVO_BETA_CENTER_US  1500U
+#define DRV_COAX_CTRL_SERVO_TRAVEL_DEG       270.0f
+#define DRV_COAX_CTRL_SERVO_LIMIT_DEG         90.0f
 ```
 
 因此辨识模块默认中心不是 `1500 us`，而是：
 
 ```text
-alpha center = 1412 us
-beta  center = 1851 us
+alpha center = 1500 us
+beta  center = 1500 us
 ```
 
 若台架机械零位重新调整，应使用：

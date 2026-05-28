@@ -10,7 +10,11 @@
 #include <string.h>
 
 #define DRV_COAX_CTRL_TILT_LIMIT_RAD 0.174533f
-#define DRV_COAX_CTRL_SERVO_TRAVEL_RAD 3.141592654f
+#define DRV_COAX_CTRL_PI 3.141592654f
+#define DRV_COAX_CTRL_SERVO_TRAVEL_RAD \
+    (DRV_COAX_CTRL_SERVO_TRAVEL_DEG * DRV_COAX_CTRL_PI / 180.0f)
+#define DRV_COAX_CTRL_SERVO_LIMIT_RAD \
+    (DRV_COAX_CTRL_SERVO_LIMIT_DEG * DRV_COAX_CTRL_PI / 180.0f)
 #define DRV_COAX_CTRL_SERVO_ALPHA_SIGN    (1.0f)
 #define DRV_COAX_CTRL_SERVO_BETA_SIGN    (-1.0f)
 #define DRV_COAX_CTRL_MOTOR_OMEGA_MAX_RAD_S 900.0f
@@ -36,6 +40,15 @@ static const DRV_COAX_CTRL_ParamEntry coax_ctrl_param_table[] = {
     DRV_COAX_CTRL_PARAM_ENTRY(rotation_error_gain),
     DRV_COAX_CTRL_PARAM_ENTRY(accel_xy_limit_m_s2),
     DRV_COAX_CTRL_PARAM_ENTRY(accel_z_limit_m_s2),
+    DRV_COAX_CTRL_PARAM_ENTRY(vel_loop_enable),
+    DRV_COAX_CTRL_PARAM_ENTRY(vel_loop_x_kp),
+    DRV_COAX_CTRL_PARAM_ENTRY(vel_loop_x_ki),
+    DRV_COAX_CTRL_PARAM_ENTRY(vel_loop_x_kd),
+    DRV_COAX_CTRL_PARAM_ENTRY(vel_loop_y_kp),
+    DRV_COAX_CTRL_PARAM_ENTRY(vel_loop_y_ki),
+    DRV_COAX_CTRL_PARAM_ENTRY(vel_loop_y_kd),
+    DRV_COAX_CTRL_PARAM_ENTRY(vel_loop_output_limit_m_s2),
+    DRV_COAX_CTRL_PARAM_ENTRY(vel_loop_i_limit_m_s2),
     DRV_COAX_CTRL_PARAM_ENTRY(mass_kg),
     DRV_COAX_CTRL_PARAM_ENTRY(gravity_m_s2),
     DRV_COAX_CTRL_PARAM_ENTRY(min_total_force_n),
@@ -70,6 +83,58 @@ static uint16_t coax_ctrl_clamp_u16(int32_t value, uint16_t lo, uint16_t hi)
     if (value < (int32_t)lo) { return lo; }
     if (value > (int32_t)hi) { return hi; }
     return (uint16_t)value;
+}
+
+static void coax_ctrl_compute_pure_damping_tilt(
+    const DRV_COAX_CTRL_AttitudeInput *attitude,
+    const DRV_COAX_CTRL_Reference *reference,
+    float *alpha_rad,
+    float *beta_rad)
+{
+    float acc_x_m_s2;
+    float acc_y_m_s2;
+    float vertical_acc_m_s2;
+    float rate_torque_scale;
+
+    acc_x_m_s2 = reference->ax_m_s2 -
+                 coax_ctrl_params.vel_x_kd *
+                 (reference->vx_m_s - attitude->vx_m_s);
+    acc_y_m_s2 = reference->ay_m_s2 -
+                 coax_ctrl_params.vel_y_kd *
+                 (reference->vy_m_s - attitude->vy_m_s);
+
+    acc_x_m_s2 = coax_ctrl_clamp_f32(acc_x_m_s2,
+                                     -coax_ctrl_params.accel_xy_limit_m_s2,
+                                      coax_ctrl_params.accel_xy_limit_m_s2);
+    acc_y_m_s2 = coax_ctrl_clamp_f32(acc_y_m_s2,
+                                     -coax_ctrl_params.accel_xy_limit_m_s2,
+                                      coax_ctrl_params.accel_xy_limit_m_s2);
+
+    vertical_acc_m_s2 = coax_ctrl_params.gravity_m_s2 - reference->az_m_s2;
+    if (vertical_acc_m_s2 < 1.0e-3f) {
+        vertical_acc_m_s2 = 1.0e-3f;
+    }
+
+    rate_torque_scale = coax_ctrl_params.mass_kg *
+                        vertical_acc_m_s2 *
+                        coax_ctrl_params.tilt_lever_arm_m;
+    if (rate_torque_scale < 1.0e-6f) {
+        rate_torque_scale = 1.0e-6f;
+    }
+
+    *alpha_rad = atan2f(acc_x_m_s2, vertical_acc_m_s2) +
+                 (coax_ctrl_params.pitch_rate_kd * attitude->gyro_y_rad_s) /
+                 rate_torque_scale;
+    *beta_rad = atan2f(acc_y_m_s2, vertical_acc_m_s2) +
+                (coax_ctrl_params.roll_rate_kd * attitude->gyro_x_rad_s) /
+                rate_torque_scale;
+
+    *alpha_rad = coax_ctrl_clamp_f32(*alpha_rad,
+                                     -coax_ctrl_params.tilt_limit_rad,
+                                      coax_ctrl_params.tilt_limit_rad);
+    *beta_rad = coax_ctrl_clamp_f32(*beta_rad,
+                                    -coax_ctrl_params.tilt_limit_rad,
+                                     coax_ctrl_params.tilt_limit_rad);
 }
 
 static float *coax_ctrl_param_ptr(DRV_COAX_CTRL_Params *params,
@@ -119,6 +184,15 @@ static uint8_t coax_ctrl_param_value_valid(const DRV_COAX_CTRL_ParamEntry *entry
 
     if ((entry->offset == offsetof(DRV_COAX_CTRL_Params, accel_xy_limit_m_s2)) ||
         (entry->offset == offsetof(DRV_COAX_CTRL_Params, accel_z_limit_m_s2)) ||
+        (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_enable)) ||
+        (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_x_kp)) ||
+        (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_x_ki)) ||
+        (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_x_kd)) ||
+        (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_y_kp)) ||
+        (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_y_ki)) ||
+        (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_y_kd)) ||
+        (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_output_limit_m_s2)) ||
+        (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_i_limit_m_s2)) ||
         (entry->offset == offsetof(DRV_COAX_CTRL_Params, yaw_rate_limit_rad_s))) {
         return (value >= 0.0f) ? 1U : 0U;
     }
@@ -190,15 +264,24 @@ void DRV_COAX_CTRL_GetDefaultParams(DRV_COAX_CTRL_Params *params)
     params->rotation_error_gain = 0.5f;
     params->accel_xy_limit_m_s2 = 3.0f;
     params->accel_z_limit_m_s2 = 2.5f;
+    params->vel_loop_enable = 1.0f;
+    params->vel_loop_x_kp = 1.2f;
+    params->vel_loop_x_ki = 0.0f;
+    params->vel_loop_x_kd = 0.0f;
+    params->vel_loop_y_kp = 1.2f;
+    params->vel_loop_y_ki = 0.0f;
+    params->vel_loop_y_kd = 0.0f;
+    params->vel_loop_output_limit_m_s2 = 1.2f;
+    params->vel_loop_i_limit_m_s2 = 0.4f;
     params->mass_kg = DRV_AIRFRAME_MASS_KG;
     params->gravity_m_s2 = DRV_AIRFRAME_GRAVITY_M_S2;
     params->min_total_force_n = DRV_AIRFRAME_WEIGHT_N;
     params->max_total_force_n = DRV_AIRFRAME_MAX_TOTAL_FORCE_N;
     params->tilt_lever_arm_m = 0.18f;
-    params->roll_angle_kp = 0.10f;//6.5
-    params->roll_rate_kd = 0.0f;//0.7
-    params->pitch_angle_kp = 0.10f;//6.5
-    params->pitch_rate_kd = 0.0f;//0.7
+    params->roll_angle_kp = 0.0f;
+    params->roll_rate_kd = -0.12f;
+    params->pitch_angle_kp = 0.0f;
+    params->pitch_rate_kd = -0.12f;
 
     params->tilt_limit_rad = DRV_COAX_CTRL_TILT_LIMIT_RAD;
     params->yaw_angle_kp = 0.8f;
@@ -285,9 +368,13 @@ uint8_t DRV_COAX_CTRL_SetParam(const char *name, float value)
 static uint16_t coax_ctrl_tilt_rad_to_servo_pulse(float tilt_rad,
                                                   uint16_t center_us)
 {
-    const float servo_span_us = (float)(DRV_COAX_CTRL_SERVO_MAX_US -
-                                        DRV_COAX_CTRL_SERVO_MIN_US);
+    const float servo_span_us = (float)(DRV_COAX_CTRL_SERVO_PHYSICAL_MAX_US -
+                                        DRV_COAX_CTRL_SERVO_PHYSICAL_MIN_US);
     const float servo_us_per_rad = servo_span_us / DRV_COAX_CTRL_SERVO_TRAVEL_RAD;
+    const int32_t limit_delta_us =
+        (int32_t)((servo_us_per_rad * DRV_COAX_CTRL_SERVO_LIMIT_RAD) + 0.5f);
+    int32_t servo_min_us = (int32_t)center_us - limit_delta_us;
+    int32_t servo_max_us = (int32_t)center_us + limit_delta_us;
     DRV_COAX_CTRL_Init();
     const float tilt = coax_ctrl_clamp_f32(tilt_rad,
                                           -coax_ctrl_params.tilt_limit_rad,
@@ -296,9 +383,15 @@ static uint16_t coax_ctrl_tilt_rad_to_servo_pulse(float tilt_rad,
                           tilt * servo_us_per_rad;
     const int32_t pulse_i = (int32_t)(pulse_f + ((pulse_f >= 0.0f) ? 0.5f : -0.5f));
 
+    if (servo_min_us < (int32_t)DRV_COAX_CTRL_SERVO_PHYSICAL_MIN_US) {
+        servo_min_us = (int32_t)DRV_COAX_CTRL_SERVO_PHYSICAL_MIN_US;
+    }
+    if (servo_max_us > (int32_t)DRV_COAX_CTRL_SERVO_PHYSICAL_MAX_US) {
+        servo_max_us = (int32_t)DRV_COAX_CTRL_SERVO_PHYSICAL_MAX_US;
+    }
     return coax_ctrl_clamp_u16(pulse_i,
-                               DRV_COAX_CTRL_SERVO_MIN_US,
-                               DRV_COAX_CTRL_SERVO_MAX_US);
+                               (uint16_t)servo_min_us,
+                               (uint16_t)servo_max_us);
 }
 
 uint16_t DRV_COAX_CTRL_AlphaTiltRadToServoPulse(float tilt_rad)
@@ -334,6 +427,11 @@ void DRV_COAX_CTRL_Run(const DRV_COAX_CTRL_AttitudeInput *attitude,
     float x_rb[DRV_COAX_CTRL_STATE_LEN];
     float ref_cmd[DRV_COAX_CTRL_REF_LEN];
     float cmd[DRV_COAX_CTRL_CMD_LEN];
+    float pos_ref_x;
+    float pos_ref_y;
+    float pos_ref_z;
+    float alpha_rad;
+    float beta_rad;
 
     if ((attitude == NULL) || (reference == NULL) || (output == NULL)) {
         return;
@@ -342,6 +440,12 @@ void DRV_COAX_CTRL_Run(const DRV_COAX_CTRL_AttitudeInput *attitude,
     DRV_COAX_CTRL_Init();
 
     memset(x_rb, 0, sizeof(x_rb));
+    x_rb[0] = attitude->x_m;
+    x_rb[1] = attitude->y_m;
+    x_rb[2] = attitude->z_m;
+    x_rb[3] = attitude->vx_m_s;
+    x_rb[4] = attitude->vy_m_s;
+    x_rb[5] = attitude->vz_m_s;
     coax_ctrl_fill_rotation_zyx(attitude->roll_rad,
                                 attitude->pitch_rad,
                                 attitude->yaw_rad,
@@ -350,19 +454,37 @@ void DRV_COAX_CTRL_Run(const DRV_COAX_CTRL_AttitudeInput *attitude,
     x_rb[16] = attitude->gyro_y_rad_s;
     x_rb[17] = attitude->gyro_z_rad_s;
 
-    ref_cmd[0] = reference->x_m;
-    ref_cmd[1] = reference->y_m;
-    ref_cmd[2] = reference->z_m;
+    pos_ref_x = reference->x_m;
+    pos_ref_y = reference->y_m;
+    pos_ref_z = reference->z_m;
+    if (fabsf(coax_ctrl_params.pos_x_kp) > 1.0e-6f) {
+        pos_ref_x += (coax_ctrl_params.vel_x_kd * reference->vx_m_s +
+                      reference->ax_m_s2) / coax_ctrl_params.pos_x_kp;
+    }
+    if (fabsf(coax_ctrl_params.pos_y_kp) > 1.0e-6f) {
+        pos_ref_y += (coax_ctrl_params.vel_y_kd * reference->vy_m_s +
+                      reference->ay_m_s2) / coax_ctrl_params.pos_y_kp;
+    }
+    if (fabsf(coax_ctrl_params.pos_z_kp) > 1.0e-6f) {
+        pos_ref_z += (coax_ctrl_params.vel_z_kd * reference->vz_m_s +
+                      reference->az_m_s2) / coax_ctrl_params.pos_z_kp;
+    }
+
+    ref_cmd[0] = pos_ref_x;
+    ref_cmd[1] = pos_ref_y;
+    ref_cmd[2] = pos_ref_z;
     ref_cmd[3] = reference->yaw_rad;
 
     coax_tiltrotor_controller_codegen(x_rb, ref_cmd, &coax_ctrl_params, cmd);
+    coax_ctrl_compute_pure_damping_tilt(attitude, reference,
+                                        &alpha_rad, &beta_rad);
 
     output->omega_upper = cmd[0];
     output->omega_lower = cmd[1];
-    output->alpha_rad = cmd[2];
-    output->beta_rad = cmd[3];
+    output->alpha_rad = alpha_rad;
+    output->beta_rad = beta_rad;
     output->servo_alpha_us = DRV_COAX_CTRL_AlphaTiltRadToServoPulse(
-        cmd[2] * DRV_COAX_CTRL_SERVO_ALPHA_SIGN);
+        output->alpha_rad * DRV_COAX_CTRL_SERVO_ALPHA_SIGN);
     output->servo_beta_us = DRV_COAX_CTRL_BetaTiltRadToServoPulse(
-        cmd[3] * DRV_COAX_CTRL_SERVO_BETA_SIGN);
+        output->beta_rad * DRV_COAX_CTRL_SERVO_BETA_SIGN);
 }

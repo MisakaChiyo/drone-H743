@@ -54,6 +54,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Driver/Src/drv_motor.c
     Driver/Src/drv_elrs.c
     Driver/Src/drv_coax_ctrl.c
+    Driver/Src/drv_imu_nav.c
     Driver/Generated/coax_ctrl/coax_tiltrotor_controller_codegen.c
     Driver/Generated/coax_ctrl/coax_tiltrotor_controller_codegen_data.c
     Driver/Generated/coax_ctrl/coax_tiltrotor_controller_codegen_initialize.c
