@@ -30,4 +30,17 @@
 #define DRV_AIRFRAME_MAX_TOTAL_FORCE_N            13.375052f
 #define DRV_AIRFRAME_HOVER_THRUST_PERCENT         56.079367f
 
+/* Servo axis z-positions (origin = board center, z+ up) */
+#define DRV_AIRFRAME_SERVO1_AXIS_Z_M              -0.161f
+#define DRV_AIRFRAME_SERVO2_AXIS_Z_M              -0.215f
+
+/* Effective thrust application point (coax twin-prop midpoint) */
+#define DRV_AIRFRAME_THRUST_POINT_Z_M             -0.2955f
+#define DRV_AIRFRAME_THRUST_LEVER_ARM_M            0.201f
+
+/* Estimated moments of inertia about CG (kg*m^2) */
+#define DRV_AIRFRAME_IXX_KGM2                      0.019f
+#define DRV_AIRFRAME_IYY_KGM2                      0.019f
+#define DRV_AIRFRAME_IZZ_KGM2                      0.00035f
+
 #endif /* DRV_AIRFRAME_MODEL_H */
