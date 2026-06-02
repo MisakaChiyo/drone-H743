@@ -6,6 +6,7 @@
 #include "drv_gd25q32.h"
 #include "drv_mag.h"
 #include "drv_gps.h"
+#include "drv_optical_flow.h"
 #include "drv_servo.h"
 
 #ifdef __cplusplus
@@ -21,6 +22,7 @@ const DRV_BARO_Bus  *BSP_Board_GetBaroBus(void);
 const DRV_GD25Q32_Bus *BSP_Board_GetFlashBus(void);
 const DRV_MAG_Bus   *BSP_Board_GetMagBus(void);
 const DRV_GPS_Bus   *BSP_Board_GetGpsBus(void);
+const DRV_OPTICAL_FLOW_Bus *BSP_Board_GetOpticalFlowBus(void);
 const DRV_SERVO_Bus *BSP_Board_GetServoBus(void);
 
 #ifdef __cplusplus

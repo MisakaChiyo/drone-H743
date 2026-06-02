@@ -17,77 +17,6 @@
   */
 /* USER CODE END Header */
 
-/*
- * ============================================================================
- * freertos.c —— 同轴双旋翼无人机 RTOS 任务架构
- * ============================================================================
- *
- * 概述：
- *   本文件是飞控固件的 RTOS 层入口，由 STM32CubeMX 生成框架代码，
- *   在 USER CODE 区域填充应用逻辑。文件包含 6 个 FreeRTOS 任务、
- *   5 个消息队列、1 个互斥锁、1 个信号量的声明和初始化。
- *
- * ┌─────────────────────────────────────────────────────────────────┐
- * │                     系统数据流架构（按数据传递顺序）               │
- * │                                                                 │
- * │  ┌──────────┐    IMU 1kHz       ┌──────────────┐                │
- * │  │ 硬件 IRQ  │ ────────────────→ │  Sensor_Task │                │
- * │  │ PC0 EXTI │   Thread Flag     │  (Normal)    │                │
- * │  └──────────┘                   │              │                │
- * │                                 │ 1.读取 SPI1  │                │
- * │                                 │ 2.零偏校准   │                │
- * │                                 │ 3.坐标对齐   │                │
- * │                                 │ 4.低通滤波   │                │
- * │                                 │ 5.气压计降采样│               │
- * │                                 └──────┬───────┘                │
- * │                                        │                        │
- * │                            SensorSampleQueue (深度8)             │
- * │                                        │                        │
- * │                                 ┌──────▼───────┐                │
- * │                                 │ Stabilizer   │                │
- * │                                 │   Task       │                │
- * │                                 │  (Normal)    │                │
- * │                                 │              │                │
- * │                                 │ 1.互补滤波   │                │
- * │                                 │ 2.姿态解算   │                │
- * │                                 │ 3.舵机控制   │                │
- * │                                 │   (25Hz)     │                │
- * │                                 └──┬───────┬───┘                │
- * │                                    │       │                    │
- * │                      vofaLogQueue  │       │  舵机总线           │
- * │                       (深度1覆盖)  │       │  (UART7)           │
- * │                                    │       │                    │
- * │                           ┌────────▼─┐  ┌──▼──────────┐        │
- * │                           │ VOFA_Task │  │ BSP_BusServo │       │
- * │                           │  (Low)    │  │   (ISR)      │       │
- * │                           │           │  └──────────────┘       │
- * │                           │ 50Hz 发送 │                         │
- * │                           │ WiFi→上位机│                        │
- * │                           └───────────┘                         │
- * │                                                                 │
- * │  ┌───────────┐     ┌───────────┐     ┌───────────────┐         │
- * │  │ UARTTask  │     │messageTask│     │backgroundTask │         │
- * │  │ (Normal)  │     │(BelowN)   │     │  (BelowN)     │         │
- * │  │           │     │           │     │               │         │
- * │  │ UART4:舵机│     │ JSON解析  │     │ FLASH参数读写  │         │
- * │  │ UART7:ELRS│     │ 协议编解码│     │ 磨损均衡      │         │
- * │  │ UART8:WiFi│     │ 参数API   │     │ 异步保存      │         │
- * │  └───────────┘     └───────────┘     └───────────────┘         │
- * └─────────────────────────────────────────────────────────────────┘
- *
- * ┌─────────────────────────────────────────────────────────────────┐
- * │                     CubeMX 代码生成注意事项                       │
- * │                                                                 │
- * │  CubeMX 重新生成 .ioc 后，USER CODE BEGIN/END 之外的内容会被     │
- * │  覆盖。本文件中的 USER CODE 区域：                                │
- * │    - Includes / PD / PM / Variables  — 常量定义和辅助函数        │
- * │    - Init / RTOS_MUTEX / RTOS_SEMAPHORES / RTOS_QUEUES /        │
- * │      RTOS_THREADS / RTOS_EVENTS     — 内核对象创建               │
- * │    - Header_* / 各任务函数体         — 任务实现代码               │
- * │    - 4 / 5 / Application            — 钩子函数和应用代码         │
- * └─────────────────────────────────────────────────────────────────┘
- */
-
 /* Includes ------------------------------------------------------------------*/
 #include "FreeRTOS.h"
 #include "task.h"
@@ -119,6 +48,7 @@
  *   drv_coax_ctrl.h  — 同轴倾转旋翼控制器（Simulink 代码生成）
  */
 #include "app_diag.h"
+#include "app_flight_log.h"
 #include "app_sensor.h"
 #include "app_messages.h"
 #include "app_tasks.h"
@@ -128,6 +58,7 @@
 
 #include "app_vofa.h"
 #include "app_elrs.h"
+#include "app_optical_flow.h"
 #include "bsp_baro.h"
 #include "bsp_imu.h"
 #include "bsp_bus_servo.h"
@@ -140,6 +71,8 @@
 #define STABILIZER_SERVO_MOVE_TIME_MS 0U
 #define STABILIZER_NAV_ACCEL_LPF_ALPHA 0.94f
 #define STABILIZER_NAV_VEL_LEAK_HZ 0.25f
+#define STABILIZER_FLOW_VEL_LPF_ALPHA 0.15f
+#define STABILIZER_FLOW_CORRECTION_GAIN 0.08f
 
 /* USER CODE END Includes */
 
@@ -233,7 +166,8 @@
  */
 #define STABILIZER_SERVO_REFRESH_MS    500U      /* 强制刷新间隔 [ms]（即使脉宽未变）    */
 #define STABILIZER_SERVO_DELTA_US      3U        /* 脉宽变化死区 [μs]（小于此值不发送）  */
-#define VOFA_SEND_PERIOD_MS            20U       /* VOFA 姿态诊断输出周期 20ms = 50Hz */
+#define STABILIZER_ATTITUDE_ZERO_MS 1500U        /* 上电后姿态零偏采集时长 [ms]          */
+#define VOFA_SEND_PERIOD_MS            100U       /* VOFA 姿态诊断输出周期 50ms = 20Hz */
 
 /* USER CODE END PD */
 
@@ -257,7 +191,7 @@
  *   由上位机通过消息系统远程控制，置 0 时暂停 VOFA 发送
  */
 osSemaphoreId_t imuDataReadySemaphore;
-volatile uint8_t vofaStreamActive = 1U;
+volatile uint8_t vofaStreamActive = 0U;  /* 默认关闭，发 Sensor_Data:1 开启 */
 
 typedef enum
 {
@@ -495,7 +429,84 @@ typedef struct {
   uint8_t prev_valid;
 } StabilizerVelocityPidState;
 
+typedef struct {
+  float vel_m_s[2];
+  float flow_lpf_m_s[2];
+  uint8_t initialized;
+  uint8_t flow_lpf_valid;
+  uint32_t last_flow_sample_ms;
+} StabilizerVelocityEstimatorState;
+
 static StabilizerVofaDebug stabilizer_vofa_debug;
+
+static void stabilizer_velocity_estimator_reset(StabilizerVelocityEstimatorState *state)
+{
+  if (state == NULL) {
+    return;
+  }
+
+  state->vel_m_s[0] = 0.0f;
+  state->vel_m_s[1] = 0.0f;
+  state->flow_lpf_m_s[0] = 0.0f;
+  state->flow_lpf_m_s[1] = 0.0f;
+  state->initialized = 0U;
+  state->flow_lpf_valid = 0U;
+  state->last_flow_sample_ms = 0U;
+}
+
+static void stabilizer_velocity_estimator_step(StabilizerVelocityEstimatorState *state,
+                                               float acc_x_m_s2,
+                                               float acc_y_m_s2,
+                                               float imu_vx_m_s,
+                                               float imu_vy_m_s,
+                                               float flow_vx_m_s,
+                                               float flow_vy_m_s,
+                                               uint8_t flow_valid,
+                                               uint32_t flow_sample_ms,
+                                               float dt_sec)
+{
+  uint8_t new_flow_sample = 0U;
+
+  if (state == NULL) {
+    return;
+  }
+
+  if (dt_sec <= 0.0f) {
+    dt_sec = SENSOR_IMU_DEFAULT_DT_SEC;
+  }
+
+  if (state->initialized == 0U) {
+    state->vel_m_s[0] = imu_vx_m_s;
+    state->vel_m_s[1] = imu_vy_m_s;
+    state->initialized = 1U;
+  }
+
+  state->vel_m_s[0] += acc_x_m_s2 * dt_sec;
+  state->vel_m_s[1] += acc_y_m_s2 * dt_sec;
+
+  if ((flow_valid != 0U) && (flow_sample_ms != state->last_flow_sample_ms)) {
+    new_flow_sample = 1U;
+    state->last_flow_sample_ms = flow_sample_ms;
+  }
+
+  if (new_flow_sample != 0U) {
+    if (state->flow_lpf_valid == 0U) {
+      state->flow_lpf_m_s[0] = flow_vx_m_s;
+      state->flow_lpf_m_s[1] = flow_vy_m_s;
+      state->flow_lpf_valid = 1U;
+    } else {
+      state->flow_lpf_m_s[0] += STABILIZER_FLOW_VEL_LPF_ALPHA *
+                                (flow_vx_m_s - state->flow_lpf_m_s[0]);
+      state->flow_lpf_m_s[1] += STABILIZER_FLOW_VEL_LPF_ALPHA *
+                                (flow_vy_m_s - state->flow_lpf_m_s[1]);
+    }
+
+    state->vel_m_s[0] += STABILIZER_FLOW_CORRECTION_GAIN *
+                         (state->flow_lpf_m_s[0] - state->vel_m_s[0]);
+    state->vel_m_s[1] += STABILIZER_FLOW_CORRECTION_GAIN *
+                         (state->flow_lpf_m_s[1] - state->vel_m_s[1]);
+  }
+}
 
 static void stabilizer_velocity_pid_reset(StabilizerVelocityPidState *state)
 {
@@ -611,52 +622,6 @@ static void stabilizer_servo_record_target(const DRV_SERVO_MoveCmd moves[2])
 }
 
 /* USER CODE END Variables */
-/*
- * ============================================================================
- * RTOS 内核对象一览
- * ============================================================================
- *
- * ┌──────────────────────────────────────────────────────────────────┐
- * │                         任务拓扑 (6 线程)                         │
- * ├──────────────┬──────────┬──────────┬──────────────┬──────────────┤
- * │ 任务名        │ 优先级    │ 栈深度    │ 周期/触发     │ 职责          │
- * ├──────────────┼──────────┼──────────┼──────────────┼──────────────┤
- * │ SensorTask   │ Normal   │ 512×4   │ 1kHz 中断驱动 │ IMU 采集+前处理│
- * │ Stabilizer   │ Normal   │ 512×4   │ 信号量触发     │ 姿态融合+控制 │
- * │ UARTTask     │ Normal   │ 1024×4  │ 事件驱动       │ UART 收发调度  │
- * │ messageTask  │ BelowNormal│1024×4│ 事件驱动       │ 消息协议处理   │
- * │ backgroundTask│BelowNormal│1024×4│ 事件驱动       │ FLASH 参数读写  │
- * │ VOFA_Task    │ Low      │ 512×4   │ 50Hz 定时      │ 上位机数据发送 │
- * └──────────────┴──────────┴──────────┴──────────────┴──────────────┘
- *
- * ┌──────────────────────────────────────────────────────────────────┐
- * │                       消息队列 (5 队列)                           │
- * ├────────────────────┬──────────┬──────────────────────────────────┤
- * │ 队列名              │ 深度      │ 用途                              │
- * ├────────────────────┼──────────┼──────────────────────────────────┤
- * │ SensorSampleQueue  │ 8        │ SensorTask → Stabilizer          │
- * │ vofaLogQueue       │ 1 (覆盖) │ Stabilizer → VOFA_Task           │
- * │ uartTxQueue        │ 32       │ 各任务 → UARTTask (发送缓冲)      │
- * │ backgroundReqQueue │ 8        │ 任意任务 → BackgroundTask (请求)  │
- * │ backgroundRespQueue│ 8        │ BackgroundTask → 请求者 (响应)    │
- * └────────────────────┴──────────┴──────────────────────────────────┘
- *
- * ┌──────────────────────────────────────────────────────────────────┐
- * │                     互斥锁 (1 个)                                  │
- * ├────────────────────┬──────────────────────────────────────────────┤
- * │ flashBusMutex      │ 保护 FLASH 读写操作（递归锁，允许同一任务重入）│
- * └────────────────────┴──────────────────────────────────────────────┘
- *
- * 关键数据流（按数据传递顺序）：
- *   硬件 IRQ ──→ Sensor_Task ──→ SensorSampleQueue ──→ StabilizerTask
- *                                                          │
- *                                                    vofaLogQueue (50Hz)
- *                                                          │
- *                                                       VOFA_task
- *                                                          │
- *                                                    WiFi → 上位机
- */
-
 /* Definitions for Stabilizer */
 osThreadId_t StabilizerHandle;
 const osThreadAttr_t Stabilizer_attributes = {
@@ -803,19 +768,9 @@ void vApplicationMallocFailedHook(void)
 /* USER CODE END 5 */
 
 /**
-  * @brief  FreeRTOS 初始化 —— 创建所有内核对象并启动调度器
+  * @brief  FreeRTOS initialization
   * @param  None
   * @retval None
-  *
-  * 初始化顺序（按依赖关系排列，不可随意调换）：
-  *   1. 互斥锁    — flashBusMutex（FLASH 读写保护，递归锁）
-  *   2. 信号量    — imuDataReadySemaphore（IMU 数据就绪通知）
-  *   3. 消息队列  — 5 个队列（详见上方拓扑图）
-  *   4. 线程      — 6 个任务（按优先级：Normal → BelowNormal → Low）
-  *
-  * 注意：
-  *   - CubeMX 重新生成代码时会覆盖此函数中 USER CODE BEGIN/END 之外的部分
-  *   - 队列/线程的属性定义在文件上方，方便 CubeMX 识别和修改
   */
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
@@ -914,8 +869,6 @@ void MX_FREERTOS_Init(void) {
   * 注意：未满足安全条件时断开电调 PWM 输出（CCR=0）。
   */
 /* USER CODE END Header_StabilizerTask */
-#define STABILIZER_ATTITUDE_ZERO_MS 1500U
-
 void StabilizerTask(void *argument)
 {
   /* init code for USB_DEVICE */
@@ -947,19 +900,24 @@ void StabilizerTask(void *argument)
 #if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
   float velocity_state_x_m_s = 0.0f;
   float velocity_state_y_m_s = 0.0f;
+  float velocity_imu_x_m_s = 0.0f;
+  float velocity_imu_y_m_s = 0.0f;
   float position_ref_x_m = 0.0f;
   float position_ref_y_m = 0.0f;
   DRV_IMU_NAV_State nav_state;
   StabilizerVelocityPidState vel_pid_x;
   StabilizerVelocityPidState vel_pid_y;
+  StabilizerVelocityEstimatorState vel_estimator;
   StabilizerVofaDebug vofa_debug = {0};
   uint32_t last_ctrl_model_ms = 0U;
+  uint8_t flight_log_divider = 0U;
 #endif
 
 #if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
   DRV_IMU_NAV_Reset(&nav_state);
   stabilizer_velocity_pid_reset(&vel_pid_x);
   stabilizer_velocity_pid_reset(&vel_pid_y);
+  stabilizer_velocity_estimator_reset(&vel_estimator);
 #endif
 
   for(;;)
@@ -1058,13 +1016,38 @@ void StabilizerTask(void *argument)
           DRV_IMU_NAV_Update(&nav_state, &nav_input);
         }
 
-        velocity_state_x_m_s = nav_state.vel_m_s[0];
-        velocity_state_y_m_s = nav_state.vel_m_s[1];
+        velocity_imu_x_m_s = nav_state.vel_m_s[0];
+        velocity_imu_y_m_s = nav_state.vel_m_s[1];
+        {
+          float flow_vx_m_s = 0.0f;
+          float flow_vy_m_s = 0.0f;
+          uint32_t flow_sample_ms = 0U;
+          uint8_t flow_valid =
+            APP_OpticalFlow_GetVelocitySample(&flow_vx_m_s,
+                                              &flow_vy_m_s,
+                                              &flow_sample_ms);
+
+          stabilizer_velocity_estimator_step(&vel_estimator,
+                                             nav_state.acc_nav_m_s2[0],
+                                             nav_state.acc_nav_m_s2[1],
+                                             velocity_imu_x_m_s,
+                                             velocity_imu_y_m_s,
+                                             flow_vx_m_s,
+                                             flow_vy_m_s,
+                                             flow_valid,
+                                             flow_sample_ms,
+                                             dt_sec);
+          velocity_state_x_m_s = vel_estimator.vel_m_s[0];
+          velocity_state_y_m_s = vel_estimator.vel_m_s[1];
+          if (flow_valid == 0U) {
+            APP_OpticalFlow_SetVelocitySource(APP_OPTICAL_FLOW_VEL_SOURCE_IMU);
+          }
+        }
         vofa_debug.acc_nav_m_s2[0] = nav_state.acc_nav_m_s2[0];
         vofa_debug.acc_nav_m_s2[1] = nav_state.acc_nav_m_s2[1];
         vofa_debug.acc_nav_m_s2[2] = nav_state.acc_nav_m_s2[2];
-        vofa_debug.vel_est_m_s[0] = nav_state.vel_m_s[0];
-        vofa_debug.vel_est_m_s[1] = nav_state.vel_m_s[1];
+        vofa_debug.vel_est_m_s[0] = velocity_state_x_m_s;
+        vofa_debug.vel_est_m_s[1] = velocity_state_y_m_s;
         vofa_debug.vel_est_m_s[2] = nav_state.vel_m_s[2];
         vofa_debug.nav_accel_lpf_alpha = nav_state.accel_lpf_alpha;
         vofa_debug.nav_velocity_leak_hz = nav_state.velocity_leak_rate_hz;
@@ -1171,6 +1154,7 @@ void StabilizerTask(void *argument)
           position_ref_x_m = 0.0f;
           position_ref_y_m = 0.0f;
           DRV_IMU_NAV_Reset(&nav_state);
+          stabilizer_velocity_estimator_reset(&vel_estimator);
           stabilizer_velocity_pid_reset(&vel_pid_x);
           stabilizer_velocity_pid_reset(&vel_pid_y);
           vofa_debug.vel_loop_active = 0.0f;
@@ -1357,6 +1341,7 @@ void StabilizerTask(void *argument)
         } else if (has_imu_sample == 0U) {
 #if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
           DRV_IMU_NAV_Reset(&nav_state);
+          stabilizer_velocity_estimator_reset(&vel_estimator);
           stabilizer_velocity_pid_reset(&vel_pid_x);
           stabilizer_velocity_pid_reset(&vel_pid_y);
           vofa_debug.vel_loop_active = 0.0f;
@@ -1425,6 +1410,74 @@ void StabilizerTask(void *argument)
           BSP_PWM_DisableEsc(1);
           BSP_PWM_DisableEsc(2);
         }
+#if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
+        if (flight_log_divider == 0U) {
+          APP_FlightLogSnapshot flog_snapshot;
+
+          memset(&flog_snapshot, 0, sizeof(flog_snapshot));
+          flog_snapshot.timestamp_us = msg.base.timestamp_us;
+          flog_snapshot.tick_ms = now;
+          flog_snapshot.imu_sequence = msg.base.sequence;
+          flog_snapshot.imu_raw = msg.raw_imu;
+          flog_snapshot.imu = msg.imu;
+          flog_snapshot.roll_deg = roll_control;
+          flog_snapshot.pitch_deg = pitch_control;
+          flog_snapshot.yaw_deg = yaw_control;
+          memcpy(flog_snapshot.rc_channels,
+                 ch,
+                 sizeof(flog_snapshot.rc_channels));
+          flog_snapshot.throttle_us = rc_throttle_motor_us;
+          flog_snapshot.servo_alpha_us = moves[0].pulse_us;
+          flog_snapshot.servo_beta_us = moves[1].pulse_us;
+          flog_snapshot.motor_upper_us = BSP_PWM_GetEscPulse(1);
+          flog_snapshot.motor_lower_us = BSP_PWM_GetEscPulse(2);
+          flog_snapshot.rc_armed = rc_armed;
+          flog_snapshot.rc_link_ok = rc_link_ok;
+          flog_snapshot.throttle_over_20 = rc_use_stabilized_motor_mix;
+          flog_snapshot.imu_valid = imu_control_valid;
+          memcpy(flog_snapshot.acc_nav_m_s2,
+                 vofa_debug.acc_nav_m_s2,
+                 sizeof(flog_snapshot.acc_nav_m_s2));
+          memcpy(flog_snapshot.vel_est_m_s,
+                 vofa_debug.vel_est_m_s,
+                 sizeof(flog_snapshot.vel_est_m_s));
+          memcpy(flog_snapshot.vel_ref_m_s,
+                 vofa_debug.vel_ref_m_s,
+                 sizeof(flog_snapshot.vel_ref_m_s));
+          memcpy(flog_snapshot.vel_err_m_s,
+                 vofa_debug.vel_err_m_s,
+                 sizeof(flog_snapshot.vel_err_m_s));
+          memcpy(flog_snapshot.vel_pid_out_m_s2,
+                 vofa_debug.vel_pid_out_m_s2,
+                 sizeof(flog_snapshot.vel_pid_out_m_s2));
+          memcpy(flog_snapshot.vel_pid_p_m_s2,
+                 vofa_debug.vel_pid_p_m_s2,
+                 sizeof(flog_snapshot.vel_pid_p_m_s2));
+          memcpy(flog_snapshot.vel_pid_i_m_s2,
+                 vofa_debug.vel_pid_i_m_s2,
+                 sizeof(flog_snapshot.vel_pid_i_m_s2));
+          memcpy(flog_snapshot.vel_pid_d_m_s2,
+                 vofa_debug.vel_pid_d_m_s2,
+                 sizeof(flog_snapshot.vel_pid_d_m_s2));
+          flog_snapshot.vel_loop_active = vofa_debug.vel_loop_active;
+          DRV_COAX_CTRL_GetLastDebug(&flog_snapshot.ctrl_debug);
+          flog_snapshot.z_ref_m =
+            stabilizer_rc_throttle_01(ch[STABILIZER_RC_CH_THROTTLE_Z]) *
+            STABILIZER_Z_REF_RANGE_M;
+
+          APP_FlightLog_Observe(&flog_snapshot,
+                                ((rc_link_ok != 0U) &&
+                                 (rc_armed != 0U) &&
+                                 (rc_use_stabilized_motor_mix != 0U)) ? 1U : 0U);
+        } else {
+          if ((rc_link_ok == 0U) ||
+              (rc_armed == 0U) ||
+              (rc_use_stabilized_motor_mix == 0U)) {
+            APP_FlightLog_Observe(NULL, 0U);
+          }
+        }
+        flight_log_divider ^= 1U;
+#endif
       }
     }
   }
@@ -1465,6 +1518,7 @@ void Sensor_Task(void *argument)
   BSP_IMU_Invalidate();                  /* 复位 IMU 驱动内部状态              */
 
   /* APP_Task_GPS_Init();  暂时停止 GPS */
+  APP_Task_OpticalFlow_Init();
   APP_Task_MAG_Init();                   /* 初始化磁力计 QMC5883L              */
 
   /* ---- 初始化 IMU（重试直到成功） ---- */
@@ -1612,6 +1666,7 @@ void Sensor_Task(void *argument)
 
         APP_IMU_ConvertBaro(prs_raw, tmp_raw, &baro_pa, &baro_temp);
         baro_fresh = 1U;
+        APP_OpticalFlow_UpdateHeightFromPressure(baro_pa, baro_fresh);
       } else {
         /* 读取失败：复位驱动状态 + 重新初始化传感器 */
         BSP_BARO_Invalidate();
@@ -1637,6 +1692,7 @@ void Sensor_Task(void *argument)
     msg.base.timestamp_us    = SVC_Timestamp_Us();
     msg.base.type            = APP_SENSOR_TYPE_IMU;
     msg.base.sequence        = sample_count;
+    msg.raw_imu              = raw;
     msg.imu                  = scaled;
     msg.roll_deg             = 0.0f;   /* Stabilizer 填入 */
     msg.pitch_deg            = 0.0f;
@@ -1673,6 +1729,7 @@ void Sensor_Task(void *argument)
      * 使用独立的时间间隔 SENSOR_MAG_PERIOD_US (50ms = 20Hz) 来控制步进。
      */
                              /* APP_Task_GPS_Step();  暂时停止 GPS */
+    APP_Task_OpticalFlow_Step();
     {
       uint64_t now_us = msg.base.timestamp_us;
 
@@ -1847,6 +1904,9 @@ void VOFA_task(void *argument)
     osDelay(VOFA_SEND_PERIOD_MS);
 
     if (!vofaStreamActive) {
+      continue;
+    }
+    if (APP_FlightLog_IsExportActive() != 0U) {
       continue;
     }
 

@@ -23,6 +23,8 @@ void APP_Task_LED_Init(void);
 void APP_Task_LED_Step(void);
 void APP_Task_GPS_Init(void);
 void APP_Task_GPS_Step(void);
+void APP_Task_OpticalFlow_Init(void);
+void APP_Task_OpticalFlow_Step(void);
 void APP_Task_MAG_Init(void);
 void APP_Task_MAG_Step(void);
 void APP_Task_Message_Init(void);

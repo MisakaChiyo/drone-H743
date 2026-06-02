@@ -53,6 +53,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Driver/Src/drv_servo.c
     Driver/Src/drv_motor.c
     Driver/Src/drv_elrs.c
+    Driver/Src/drv_optical_flow.c
     Driver/Src/drv_coax_ctrl.c
     Driver/Src/drv_imu_nav.c
     Driver/Generated/coax_ctrl/coax_tiltrotor_controller_codegen.c
@@ -79,6 +80,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     BSP/Src/bsp_baro.c
     BSP/Src/bsp_flash_bus.c
     BSP/Src/bsp_gps.c
+    BSP/Src/bsp_optical_flow.c
     BSP/Src/bsp_mag.c
     BSP/Src/bsp_pwm.c
     BSP/Src/bsp_bus_servo.c
@@ -91,8 +93,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     App/Src/app_control.c
     App/Src/app_diag.c
     App/Src/app_flash.c
+    App/Src/app_flight_log.c
     App/Src/app_flash_service.c
     App/Src/app_gps.c
+    App/Src/app_optical_flow.c
     App/Src/app_ident.c
     App/Src/app_sensor.c
     App/Src/app_led.c
