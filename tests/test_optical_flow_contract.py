@@ -152,6 +152,7 @@ def test_velocity_source_prefers_flow_and_falls_back_to_imu() -> None:
     app_flow_header = read("App/Inc/app_optical_flow.h")
 
     assert "velocity_imu_x_m_s = nav_state.vel_m_s[0];" in freertos
+    assert "#define STABILIZER_USE_FLOW_IMU_COMPLEMENTARY 1U" in freertos
     assert "APP_OpticalFlow_GetVelocitySample(&flow_vx_m_s," in freertos
     assert "stabilizer_velocity_estimator_step(&vel_estimator," in freertos
     assert "state->vel_m_s[0] += acc_x_m_s2 * dt_sec;" in freertos
@@ -159,6 +160,7 @@ def test_velocity_source_prefers_flow_and_falls_back_to_imu() -> None:
     assert "STABILIZER_FLOW_CORRECTION_GAIN *" in freertos
     assert "flow_sample_ms != state->last_flow_sample_ms" in freertos
     assert "velocity_state_x_m_s = vel_estimator.vel_m_s[0];" in freertos
+    assert "APP_OpticalFlow_GetVelocity(&velocity_state_x_m_s," in freertos
     assert "APP_OpticalFlow_SetVelocitySource(APP_OPTICAL_FLOW_VEL_SOURCE_IMU);" in freertos
     assert "APP_OpticalFlow_GetVelocitySample" in app_flow_header
     assert "uint32_t *sample_ms" in app_flow_header

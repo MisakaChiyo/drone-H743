@@ -71,6 +71,7 @@
 #define STABILIZER_SERVO_MOVE_TIME_MS 0U
 #define STABILIZER_NAV_ACCEL_LPF_ALPHA 0.94f
 #define STABILIZER_NAV_VEL_LEAK_HZ 0.25f
+#define STABILIZER_USE_FLOW_IMU_COMPLEMENTARY 1U
 #define STABILIZER_FLOW_VEL_LPF_ALPHA 0.15f
 #define STABILIZER_FLOW_CORRECTION_GAIN 0.08f
 
@@ -191,7 +192,7 @@
  *   由上位机通过消息系统远程控制，置 0 时暂停 VOFA 发送
  */
 osSemaphoreId_t imuDataReadySemaphore;
-volatile uint8_t vofaStreamActive = 0U;  /* 默认关闭，发 Sensor_Data:1 开启 */
+volatile uint8_t vofaStreamActive = 1U;  /* 默认开启，发 Sensor_Data:0 暂停 */
 
 typedef enum
 {
@@ -429,6 +430,7 @@ typedef struct {
   uint8_t prev_valid;
 } StabilizerVelocityPidState;
 
+#if (STABILIZER_USE_FLOW_IMU_COMPLEMENTARY != 0U)
 typedef struct {
   float vel_m_s[2];
   float flow_lpf_m_s[2];
@@ -436,9 +438,11 @@ typedef struct {
   uint8_t flow_lpf_valid;
   uint32_t last_flow_sample_ms;
 } StabilizerVelocityEstimatorState;
+#endif
 
 static StabilizerVofaDebug stabilizer_vofa_debug;
 
+#if (STABILIZER_USE_FLOW_IMU_COMPLEMENTARY != 0U)
 static void stabilizer_velocity_estimator_reset(StabilizerVelocityEstimatorState *state)
 {
   if (state == NULL) {
@@ -507,6 +511,7 @@ static void stabilizer_velocity_estimator_step(StabilizerVelocityEstimatorState 
                          (state->flow_lpf_m_s[1] - state->vel_m_s[1]);
   }
 }
+#endif
 
 static void stabilizer_velocity_pid_reset(StabilizerVelocityPidState *state)
 {
@@ -626,7 +631,7 @@ static void stabilizer_servo_record_target(const DRV_SERVO_MoveCmd moves[2])
 osThreadId_t StabilizerHandle;
 const osThreadAttr_t Stabilizer_attributes = {
   .name = "Stabilizer",
-  .stack_size = 512 * 4,
+  .stack_size = 1024 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for SensorTask */
@@ -907,7 +912,9 @@ void StabilizerTask(void *argument)
   DRV_IMU_NAV_State nav_state;
   StabilizerVelocityPidState vel_pid_x;
   StabilizerVelocityPidState vel_pid_y;
+#if (STABILIZER_USE_FLOW_IMU_COMPLEMENTARY != 0U)
   StabilizerVelocityEstimatorState vel_estimator;
+#endif
   StabilizerVofaDebug vofa_debug = {0};
   uint32_t last_ctrl_model_ms = 0U;
   uint8_t flight_log_divider = 0U;
@@ -917,7 +924,9 @@ void StabilizerTask(void *argument)
   DRV_IMU_NAV_Reset(&nav_state);
   stabilizer_velocity_pid_reset(&vel_pid_x);
   stabilizer_velocity_pid_reset(&vel_pid_y);
+#if (STABILIZER_USE_FLOW_IMU_COMPLEMENTARY != 0U)
   stabilizer_velocity_estimator_reset(&vel_estimator);
+#endif
 #endif
 
   for(;;)
@@ -1018,6 +1027,7 @@ void StabilizerTask(void *argument)
 
         velocity_imu_x_m_s = nav_state.vel_m_s[0];
         velocity_imu_y_m_s = nav_state.vel_m_s[1];
+#if (STABILIZER_USE_FLOW_IMU_COMPLEMENTARY != 0U)
         {
           float flow_vx_m_s = 0.0f;
           float flow_vy_m_s = 0.0f;
@@ -1043,6 +1053,14 @@ void StabilizerTask(void *argument)
             APP_OpticalFlow_SetVelocitySource(APP_OPTICAL_FLOW_VEL_SOURCE_IMU);
           }
         }
+#else
+        velocity_state_x_m_s = velocity_imu_x_m_s;
+        velocity_state_y_m_s = velocity_imu_y_m_s;
+        if (APP_OpticalFlow_GetVelocity(&velocity_state_x_m_s,
+                                        &velocity_state_y_m_s) == 0U) {
+          APP_OpticalFlow_SetVelocitySource(APP_OPTICAL_FLOW_VEL_SOURCE_IMU);
+        }
+#endif
         vofa_debug.acc_nav_m_s2[0] = nav_state.acc_nav_m_s2[0];
         vofa_debug.acc_nav_m_s2[1] = nav_state.acc_nav_m_s2[1];
         vofa_debug.acc_nav_m_s2[2] = nav_state.acc_nav_m_s2[2];
@@ -1154,7 +1172,9 @@ void StabilizerTask(void *argument)
           position_ref_x_m = 0.0f;
           position_ref_y_m = 0.0f;
           DRV_IMU_NAV_Reset(&nav_state);
+#if (STABILIZER_USE_FLOW_IMU_COMPLEMENTARY != 0U)
           stabilizer_velocity_estimator_reset(&vel_estimator);
+#endif
           stabilizer_velocity_pid_reset(&vel_pid_x);
           stabilizer_velocity_pid_reset(&vel_pid_y);
           vofa_debug.vel_loop_active = 0.0f;
@@ -1341,7 +1361,9 @@ void StabilizerTask(void *argument)
         } else if (has_imu_sample == 0U) {
 #if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
           DRV_IMU_NAV_Reset(&nav_state);
+#if (STABILIZER_USE_FLOW_IMU_COMPLEMENTARY != 0U)
           stabilizer_velocity_estimator_reset(&vel_estimator);
+#endif
           stabilizer_velocity_pid_reset(&vel_pid_x);
           stabilizer_velocity_pid_reset(&vel_pid_y);
           vofa_debug.vel_loop_active = 0.0f;
@@ -1522,9 +1544,17 @@ void Sensor_Task(void *argument)
   APP_Task_MAG_Init();                   /* 初始化磁力计 QMC5883L              */
 
   /* ---- 初始化 IMU（重试直到成功） ---- */
-  while (BSP_IMU_Init() != DRV_IMU_OK) {
+ /*while (BSP_IMU_Init() != DRV_IMU_OK) {
+    osDelay(50);
+  }*/
+  DRV_IMU_Status imu_init_status;
+
+do {
+  imu_init_status = BSP_IMU_Init();
+  if (imu_init_status != DRV_IMU_OK) {
     osDelay(50);
   }
+} while (imu_init_status != DRV_IMU_OK);
   BSP_BARO_Init();   /* 气压计初始化，失败时在读数据时重试 */
 
   DRV_IMU_RawData    raw;               /* IMU 原始 ADC 值（寄存器原始读数）    */

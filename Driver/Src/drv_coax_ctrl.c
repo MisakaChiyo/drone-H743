@@ -297,7 +297,7 @@ void DRV_COAX_CTRL_GetDefaultParams(DRV_COAX_CTRL_Params *params)
     params->gravity_m_s2 = DRV_AIRFRAME_GRAVITY_M_S2;
     params->min_total_force_n = DRV_AIRFRAME_WEIGHT_N;
     params->max_total_force_n = DRV_AIRFRAME_MAX_TOTAL_FORCE_N;
-    params->tilt_lever_arm_m = 0.18f;
+    params->tilt_lever_arm_m = DRV_AIRFRAME_THRUST_LEVER_ARM_M;
     params->roll_angle_kp = 0.0f;
     params->roll_rate_kd = -0.12f;
     params->pitch_angle_kp = 0.0f;
@@ -307,7 +307,7 @@ void DRV_COAX_CTRL_GetDefaultParams(DRV_COAX_CTRL_Params *params)
     params->yaw_angle_kp = 0.8f;
     params->yaw_rate_kd = 1.0f;
     params->yaw_rate_limit_rad_s = 1.04719758f;
-    params->yaw_inertia = 0.52f;
+    params->yaw_inertia = DRV_AIRFRAME_IZZ_KGM2;
     params->thrust_coeff_n_per_rad2 = 3.0e-5f;
     params->yaw_torque_coeff_n_m_per_rad2 = 1.5e-6f;
     params->motor_omega_max_rad_s = DRV_COAX_CTRL_MOTOR_OMEGA_MAX_RAD_S;

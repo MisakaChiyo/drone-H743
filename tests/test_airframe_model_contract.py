@@ -40,6 +40,8 @@ def test_airframe_constants_capture_measured_tether_geometry() -> None:
     assert "#define DRV_AIRFRAME_SERVO_US_PER_DEG              7.407407f" in header
     assert "#define DRV_AIRFRAME_MAX_TOTAL_FORCE_N            13.375052f" in header
     assert "#define DRV_AIRFRAME_HOVER_THRUST_PERCENT         56.079367f" in header
+    assert "#define DRV_AIRFRAME_THRUST_LEVER_ARM_M            0.201f" in header
+    assert "#define DRV_AIRFRAME_IZZ_KGM2                      0.00035f" in header
 
 
 def test_coax_defaults_use_airframe_model_not_old_placeholder_mass() -> None:
@@ -49,9 +51,12 @@ def test_coax_defaults_use_airframe_model_not_old_placeholder_mass() -> None:
     assert "params->mass_kg = DRV_AIRFRAME_MASS_KG;" in source
     assert "params->min_total_force_n = DRV_AIRFRAME_WEIGHT_N;" in source
     assert "params->max_total_force_n = DRV_AIRFRAME_MAX_TOTAL_FORCE_N;" in source
-    assert "params->tilt_lever_arm_m = 0.18f;" in source
+    assert "params->tilt_lever_arm_m = DRV_AIRFRAME_THRUST_LEVER_ARM_M;" in source
+    assert "params->yaw_inertia = DRV_AIRFRAME_IZZ_KGM2;" in source
     assert "params->mass_kg = 2.2f;" not in source
     assert "params->max_total_force_n = 38.8476f;" not in source
+    assert "params->tilt_lever_arm_m = 0.18f;" not in source
+    assert "params->yaw_inertia = 0.52f;" not in source
 
 
 def test_flash_v3_migration_forces_new_physical_model() -> None:

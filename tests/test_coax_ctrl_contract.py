@@ -99,6 +99,13 @@ def test_controller_wrapper_exposes_velocity_first_vector_control_inputs() -> No
     assert "velocity_ref_x_m_s" not in freertos
 
 
+def test_stabilizer_task_has_stack_headroom_for_generated_controller() -> None:
+    freertos = read("Core/Src/freertos.c")
+
+    assert "const osThreadAttr_t Stabilizer_attributes" in freertos
+    assert ".stack_size = 1024 * 4," in freertos
+
+
 def test_roll_pitch_angle_gains_default_to_zero_as_constraints_not_primary_loop() -> None:
     wrapper = read("Driver/Src/drv_coax_ctrl.c")
 
