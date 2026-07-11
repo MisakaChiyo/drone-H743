@@ -15,7 +15,9 @@
  * which VOFA+ uses as a frame delimiter.
  *
  * Data is sent through the shared uartTxQueue (DMA) to avoid conflict
- * with the UART task's DMA-based TX.
+ * with the UART task's DMA-based TX. Runtime plots prefer fresh samples over
+ * complete history, so VOFA frames are dropped instead of queued behind older
+ * UART messages.
  */
 static const uint8_t app_vofa_tail[4U] = {0x00U, 0x00U, 0x80U, 0x7FU};
 
@@ -46,6 +48,10 @@ void APP_VOFA_SendFloats(const float *data, uint8_t count)
     tx_msg.function = APP_UART_TX_FUNCTION_VOFA_SOCKET;
 
     if (uartTxQueueHandle == 0) {
+        return;
+    }
+
+    if (osMessageQueueGetCount(uartTxQueueHandle) != 0U) {
         return;
     }
 

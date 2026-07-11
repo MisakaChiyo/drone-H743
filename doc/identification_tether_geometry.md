@@ -308,7 +308,7 @@ IDENT CENTER alpha_us=<v> beta_us=<v>
 
 ```text
 Driver/Inc/drv_motor_model.h          (精简版，21点插值，无 lag update)
-tools/0002_hammerstein_model.h        (完整版，含 interp + lag update)
+D:\stm32hal\drone-H743\tools\0002_hammerstein_model.h        (完整版，含 interp + lag update)
 tools/0002_hammerstein_report.md      (辨识报告)
 tools/hammerstein_00001_1_check/      (另一组数据，tau 不可用)
 ```

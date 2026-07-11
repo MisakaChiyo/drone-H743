@@ -1,6 +1,7 @@
 #include "app_background.h"
 
 #include "app_flash_service.h"
+#include "app_flight_log.h"
 #include "app_tasks.h"
 #include "svc_param.h"
 
@@ -98,7 +99,12 @@ void APP_Background_Step(void)
     APP_BackgroundRequest request;
     APP_BackgroundStatus result = APP_BACKGROUND_STATUS_OK;
 
-    if (osMessageQueueGet(backgroundReqQueueHandle, &request, NULL, osWaitForever) != osOK) {
+    APP_FlightLog_BackgroundStep();
+
+    if (osMessageQueueGet(backgroundReqQueueHandle,
+                          &request,
+                          NULL,
+                          APP_FLIGHT_LOG_BACKGROUND_IDLE_MS) != osOK) {
         return;
     }
 

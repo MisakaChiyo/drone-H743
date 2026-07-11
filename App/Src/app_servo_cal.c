@@ -1,0 +1,233 @@
+#include "app_servo_cal.h"
+
+#include "app_control.h"
+#include "app_led.h"
+#include "bsp_bus_servo.h"
+
+#define APP_SERVO_CAL_CH_ROLL       0U
+#define APP_SERVO_CAL_CH_PITCH      1U
+#define APP_SERVO_CAL_CH_THROTTLE   2U
+#define APP_SERVO_CAL_CH_YAW        3U
+
+#define APP_SERVO_CAL_LOW_US        1150U
+#define APP_SERVO_CAL_HIGH_US       1850U
+#define APP_SERVO_CAL_HOLD_MS        800U
+#define APP_SERVO_CAL_ACK_MS        1200U
+#define APP_SERVO_CAL_ERROR_MS      1500U
+
+static APP_ServoCalState servo_cal_state;
+static uint32_t servo_cal_release_hold_start_ms;
+static uint32_t servo_cal_save_hold_start_ms;
+static uint32_t servo_cal_transient_start_ms;
+
+static uint8_t servo_cal_low(uint16_t value)
+{
+    return (value <= APP_SERVO_CAL_LOW_US) ? 1U : 0U;
+}
+
+static uint8_t servo_cal_high(uint16_t value)
+{
+    return (value >= APP_SERVO_CAL_HIGH_US) ? 1U : 0U;
+}
+
+static uint8_t servo_cal_safe_gate(const uint16_t ch[16],
+                                   uint8_t rc_link_ok,
+                                   uint8_t rc_arm_switch_high)
+{
+    if ((ch == NULL) || (rc_link_ok == 0U) || (rc_arm_switch_high != 0U)) {
+        return 0U;
+    }
+
+    return servo_cal_low(ch[APP_SERVO_CAL_CH_THROTTLE]);
+}
+
+static uint8_t servo_cal_release_gesture(const uint16_t ch[16])
+{
+    return ((servo_cal_low(ch[APP_SERVO_CAL_CH_THROTTLE]) != 0U) &&
+            (servo_cal_low(ch[APP_SERVO_CAL_CH_YAW]) != 0U) &&
+            (servo_cal_low(ch[APP_SERVO_CAL_CH_PITCH]) != 0U) &&
+            (servo_cal_high(ch[APP_SERVO_CAL_CH_ROLL]) != 0U)) ? 1U : 0U;
+}
+
+static uint8_t servo_cal_save_gesture(const uint16_t ch[16])
+{
+    return ((servo_cal_low(ch[APP_SERVO_CAL_CH_THROTTLE]) != 0U) &&
+            (servo_cal_high(ch[APP_SERVO_CAL_CH_YAW]) != 0U) &&
+            (servo_cal_low(ch[APP_SERVO_CAL_CH_PITCH]) != 0U) &&
+            (servo_cal_low(ch[APP_SERVO_CAL_CH_ROLL]) != 0U)) ? 1U : 0U;
+}
+
+static void servo_cal_set_error(const char *op, uint8_t id, DRV_SERVO_Status status,
+                                uint32_t now_ms)
+{
+    servo_cal_state = APP_SERVO_CAL_STATE_ERROR;
+    servo_cal_transient_start_ms = now_ms;
+    APP_LED_SetServoCalMode(APP_LED_SERVO_CAL_ERROR);
+    APP_Control_QueueText("ERR servo_cal %s id=%u st=%u\r\n",
+                          op,
+                          (unsigned int)id,
+                          (unsigned int)status);
+}
+
+static uint8_t servo_cal_release_all(uint32_t now_ms)
+{
+    DRV_SERVO_Status status;
+
+    status = BSP_BusServo_ReleaseTorque(1U);
+    if (status != DRV_SERVO_OK) {
+        servo_cal_set_error("release", 1U, status, now_ms);
+        return 0U;
+    }
+
+    status = BSP_BusServo_ReleaseTorque(2U);
+    if (status != DRV_SERVO_OK) {
+        servo_cal_set_error("release", 2U, status, now_ms);
+        return 0U;
+    }
+
+    servo_cal_state = APP_SERVO_CAL_STATE_RELEASED;
+    servo_cal_save_hold_start_ms = 0U;
+    APP_LED_SetServoCalMode(APP_LED_SERVO_CAL_RELEASED);
+    APP_Control_QueueText("OK servo_cal released\r\n");
+    return 1U;
+}
+
+static uint8_t servo_cal_restore_all(uint32_t now_ms, uint8_t report_error)
+{
+    DRV_SERVO_Status status;
+
+    status = BSP_BusServo_RestoreTorque(1U);
+    if ((status != DRV_SERVO_OK) && (report_error != 0U)) {
+        servo_cal_set_error("restore", 1U, status, now_ms);
+        return 0U;
+    }
+
+    status = BSP_BusServo_RestoreTorque(2U);
+    if ((status != DRV_SERVO_OK) && (report_error != 0U)) {
+        servo_cal_set_error("restore", 2U, status, now_ms);
+        return 0U;
+    }
+
+    return 1U;
+}
+
+static uint8_t servo_cal_save_startup_all(uint32_t now_ms)
+{
+    DRV_SERVO_Status status;
+
+    status = BSP_BusServo_SetStartupPosition(1U);
+    if (status != DRV_SERVO_OK) {
+        servo_cal_set_error("save_startup", 1U, status, now_ms);
+        return 0U;
+    }
+
+    status = BSP_BusServo_SetStartupPosition(2U);
+    if (status != DRV_SERVO_OK) {
+        servo_cal_set_error("save_startup", 2U, status, now_ms);
+        return 0U;
+    }
+
+    if (servo_cal_restore_all(now_ms, 1U) == 0U) {
+        return 0U;
+    }
+
+    servo_cal_state = APP_SERVO_CAL_STATE_SAVE_LOCK_ACK;
+    servo_cal_transient_start_ms = now_ms;
+    APP_LED_SetServoCalMode(APP_LED_SERVO_CAL_SAVE_ACK);
+    APP_Control_QueueText("OK servo_cal startup_saved\r\n");
+    return 1U;
+}
+
+void APP_ServoCal_Init(void)
+{
+    servo_cal_state = APP_SERVO_CAL_STATE_IDLE;
+    servo_cal_release_hold_start_ms = 0U;
+    servo_cal_save_hold_start_ms = 0U;
+    servo_cal_transient_start_ms = 0U;
+    APP_LED_SetServoCalMode(APP_LED_SERVO_CAL_NONE);
+}
+
+APP_ServoCalResult APP_ServoCal_Step(const uint16_t ch[16],
+                                     uint8_t rc_link_ok,
+                                     uint8_t rc_arm_switch_high,
+                                     uint32_t now_ms)
+{
+    if (servo_cal_state == APP_SERVO_CAL_STATE_SAVE_LOCK_ACK) {
+        if ((now_ms - servo_cal_transient_start_ms) >= APP_SERVO_CAL_ACK_MS) {
+            servo_cal_state = APP_SERVO_CAL_STATE_IDLE;
+            APP_LED_SetServoCalMode(APP_LED_SERVO_CAL_NONE);
+        }
+        return APP_SERVO_CAL_RESULT_NONE;
+    }
+
+    if (servo_cal_state == APP_SERVO_CAL_STATE_ERROR) {
+        if ((now_ms - servo_cal_transient_start_ms) >= APP_SERVO_CAL_ERROR_MS) {
+            (void)servo_cal_restore_all(now_ms, 0U);
+            servo_cal_state = APP_SERVO_CAL_STATE_IDLE;
+            APP_LED_SetServoCalMode(APP_LED_SERVO_CAL_NONE);
+        }
+        return APP_SERVO_CAL_RESULT_NONE;
+    }
+
+    if (servo_cal_safe_gate(ch, rc_link_ok, rc_arm_switch_high) == 0U) {
+        servo_cal_release_hold_start_ms = 0U;
+        servo_cal_save_hold_start_ms = 0U;
+        if (servo_cal_state == APP_SERVO_CAL_STATE_RELEASED) {
+            (void)servo_cal_restore_all(now_ms, 0U);
+            servo_cal_state = APP_SERVO_CAL_STATE_IDLE;
+            APP_LED_SetServoCalMode(APP_LED_SERVO_CAL_NONE);
+            APP_Control_QueueText("ERR servo_cal aborted\r\n");
+            return APP_SERVO_CAL_RESULT_ERROR;
+        }
+        return APP_SERVO_CAL_RESULT_NONE;
+    }
+
+    if (servo_cal_state == APP_SERVO_CAL_STATE_IDLE) {
+        if (servo_cal_release_gesture(ch) == 0U) {
+            servo_cal_release_hold_start_ms = 0U;
+            return APP_SERVO_CAL_RESULT_NONE;
+        }
+
+        if (servo_cal_release_hold_start_ms == 0U) {
+            servo_cal_release_hold_start_ms = now_ms;
+            return APP_SERVO_CAL_RESULT_NONE;
+        }
+
+        if ((now_ms - servo_cal_release_hold_start_ms) >= APP_SERVO_CAL_HOLD_MS) {
+            servo_cal_release_hold_start_ms = 0U;
+            return (servo_cal_release_all(now_ms) != 0U) ?
+                   APP_SERVO_CAL_RESULT_RELEASED : APP_SERVO_CAL_RESULT_ERROR;
+        }
+        return APP_SERVO_CAL_RESULT_NONE;
+    }
+
+    if (servo_cal_state == APP_SERVO_CAL_STATE_RELEASED) {
+        if (servo_cal_save_gesture(ch) == 0U) {
+            servo_cal_save_hold_start_ms = 0U;
+            return APP_SERVO_CAL_RESULT_NONE;
+        }
+
+        if (servo_cal_save_hold_start_ms == 0U) {
+            servo_cal_save_hold_start_ms = now_ms;
+            return APP_SERVO_CAL_RESULT_NONE;
+        }
+
+        if ((now_ms - servo_cal_save_hold_start_ms) >= APP_SERVO_CAL_HOLD_MS) {
+            servo_cal_save_hold_start_ms = 0U;
+            return (servo_cal_save_startup_all(now_ms) != 0U) ?
+                   APP_SERVO_CAL_RESULT_SAVED : APP_SERVO_CAL_RESULT_ERROR;
+        }
+    }
+
+    return APP_SERVO_CAL_RESULT_NONE;
+}
+
+uint8_t APP_ServoCal_IsActive(void)
+{
+    return (servo_cal_state != APP_SERVO_CAL_STATE_IDLE) ? 1U : 0U;
+}
+
+APP_ServoCalState APP_ServoCal_GetState(void)
+{
+    return servo_cal_state;
+}

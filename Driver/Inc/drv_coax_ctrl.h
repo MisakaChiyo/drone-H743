@@ -59,6 +59,20 @@ typedef struct {
 } DRV_COAX_CTRL_Output;
 
 typedef struct {
+    float pos_p_m_s2[3];
+    float vel_d_m_s2[3];
+    float accel_out_m_s2[3];
+    float tilt_ff_rad[2];
+    float tilt_rate_d_rad[2];
+    float tilt_out_rad[2];
+    float yaw_angle_p_rad_s;
+    float yaw_rate_d_rad_s;
+    float yaw_torque_cmd;
+    float total_force_n;
+    float omega_cmd_rad_s[2];
+} DRV_COAX_CTRL_Debug;
+
+typedef struct {
     float pos_x_kp;
     float pos_y_kp;
     float pos_z_kp;
@@ -101,6 +115,7 @@ void DRV_COAX_CTRL_Init(void);
 void DRV_COAX_CTRL_Run(const DRV_COAX_CTRL_AttitudeInput *attitude,
                        const DRV_COAX_CTRL_Reference *reference,
                        DRV_COAX_CTRL_Output *output);
+void DRV_COAX_CTRL_GetLastDebug(DRV_COAX_CTRL_Debug *debug);
 
 void DRV_COAX_CTRL_GetDefaultParams(DRV_COAX_CTRL_Params *params);
 void DRV_COAX_CTRL_ResetParams(void);

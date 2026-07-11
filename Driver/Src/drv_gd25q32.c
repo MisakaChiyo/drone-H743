@@ -7,6 +7,10 @@
 
 #define GD25Q32_CMD_RELEASE_POWER_DOWN 0xABU
 #define GD25Q32_CMD_READ_STATUS1       0x05U
+#define GD25Q32_CMD_READ_STATUS2       0x35U
+#define GD25Q32_CMD_READ_STATUS3       0x15U
+#define GD25Q32_CMD_WRITE_STATUS1      0x01U
+#define GD25Q32_CMD_WRITE_STATUS2      0x31U
 #define GD25Q32_CMD_WRITE_ENABLE       0x06U
 #define GD25Q32_CMD_READ_DATA          0x03U
 #define GD25Q32_CMD_READ_DATA_FAST     0x0BU
@@ -24,6 +28,10 @@
 #define GD25Q32_BLOCK_ERASE_32K_TIMEOUT_MS 2500U
 #define GD25Q32_BLOCK_ERASE_64K_TIMEOUT_MS 4000U
 #define GD25Q32_STATUS1_BUSY           0x01U
+#define GD25Q32_STATUS1_WEL            0x02U
+#define GD25Q32_STATUS1_PROTECT_MASK   0x7CU
+#define GD25Q32_STATUS2_CMP            0x40U
+#define GD25Q32_STATUS2_WRITABLE_MASK  0x7BU
 #define GD25Q32_FAST_READ_DUMMY_BYTES  1U
 #define GD25Q32_FAST_READ_CMD_LEN      5U
 
@@ -124,13 +132,30 @@ static DRV_GD25Q32_Status gd25q32_read_after_command(DRV_GD25Q32_Device *dev,
     return gd25q32_from_hal_status(hal_status);
 }
 
-static DRV_GD25Q32_Status gd25q32_write_enable(DRV_GD25Q32_Device *dev)
+static DRV_GD25Q32_Status gd25q32_write_enable_raw(DRV_GD25Q32_Device *dev)
 {
     uint8_t command = GD25Q32_CMD_WRITE_ENABLE;
 
     if (dev == NULL) { return DRV_GD25Q32_INVALID_ARG; }
 
     return gd25q32_spi_blocking_tx(dev, &command, 1U);
+}
+
+static DRV_GD25Q32_Status gd25q32_write_enable(DRV_GD25Q32_Device *dev)
+{
+    uint8_t status1;
+    DRV_GD25Q32_Status status;
+
+    if (dev == NULL) { return DRV_GD25Q32_INVALID_ARG; }
+
+    status = gd25q32_write_enable_raw(dev);
+    if (status != DRV_GD25Q32_OK) { return status; }
+
+    status = DRV_GD25Q32_ReadStatus1(dev, &status1);
+    if (status != DRV_GD25Q32_OK) { return status; }
+
+    return ((status1 & GD25Q32_STATUS1_WEL) != 0U) ? DRV_GD25Q32_OK
+                                                   : DRV_GD25Q32_ERROR;
 }
 
 static DRV_GD25Q32_Status gd25q32_wait_while_busy(DRV_GD25Q32_Device *dev,
@@ -324,6 +349,115 @@ DRV_GD25Q32_Status DRV_GD25Q32_ReadStatus1(DRV_GD25Q32_Device *dev, uint8_t *sta
 {
     uint8_t command = GD25Q32_CMD_READ_STATUS1;
     return gd25q32_read_after_command(dev, &command, 1U, status1, 1U);
+}
+
+DRV_GD25Q32_Status DRV_GD25Q32_ReadStatus2(DRV_GD25Q32_Device *dev, uint8_t *status2)
+{
+    uint8_t command = GD25Q32_CMD_READ_STATUS2;
+    return gd25q32_read_after_command(dev, &command, 1U, status2, 1U);
+}
+
+DRV_GD25Q32_Status DRV_GD25Q32_ReadStatus3(DRV_GD25Q32_Device *dev, uint8_t *status3)
+{
+    uint8_t command = GD25Q32_CMD_READ_STATUS3;
+    return gd25q32_read_after_command(dev, &command, 1U, status3, 1U);
+}
+
+static DRV_GD25Q32_Status gd25q32_write_status_byte(DRV_GD25Q32_Device *dev,
+                                                    uint8_t command,
+                                                    uint8_t value)
+{
+    uint8_t tx[2] = { command, value };
+    DRV_GD25Q32_Status status;
+
+    status = gd25q32_write_enable(dev);
+    if (status != DRV_GD25Q32_OK) { return status; }
+
+    status = gd25q32_spi_blocking_tx(dev, tx, sizeof(tx));
+    if (status != DRV_GD25Q32_OK) { return status; }
+
+    return gd25q32_wait_while_busy(dev, GD25Q32_PROGRAM_TIMEOUT_MS);
+}
+
+DRV_GD25Q32_Status DRV_GD25Q32_ClearProtection(DRV_GD25Q32_Device *dev,
+                                               uint8_t *status1_before,
+                                               uint8_t *status2_before,
+                                               uint8_t *status1_after,
+                                               uint8_t *status2_after)
+{
+    uint8_t sr1_before = 0U;
+    uint8_t sr2_before = 0U;
+    uint8_t sr1_after = 0U;
+    uint8_t sr2_after = 0U;
+    uint8_t sr1_write;
+    uint8_t sr2_write;
+    DRV_GD25Q32_Status status;
+
+    if (dev == NULL) { return DRV_GD25Q32_INVALID_ARG; }
+
+    status = gd25q32_wait_while_busy(dev, GD25Q32_DEFAULT_TIMEOUT_MS);
+    if (status != DRV_GD25Q32_OK) { return status; }
+
+    status = DRV_GD25Q32_ReadStatus1(dev, &sr1_before);
+    if (status != DRV_GD25Q32_OK) { return status; }
+    status = DRV_GD25Q32_ReadStatus2(dev, &sr2_before);
+    if (status != DRV_GD25Q32_OK) { return status; }
+
+    sr1_write = (uint8_t)(sr1_before & (uint8_t)~GD25Q32_STATUS1_PROTECT_MASK);
+    sr1_write &= (uint8_t)~(GD25Q32_STATUS1_WEL | GD25Q32_STATUS1_BUSY);
+    sr2_write = (uint8_t)((sr2_before & GD25Q32_STATUS2_WRITABLE_MASK) &
+                          (uint8_t)~GD25Q32_STATUS2_CMP);
+
+    status = gd25q32_write_status_byte(dev, GD25Q32_CMD_WRITE_STATUS1, sr1_write);
+    if (status != DRV_GD25Q32_OK) { return status; }
+    status = gd25q32_write_status_byte(dev, GD25Q32_CMD_WRITE_STATUS2, sr2_write);
+    if (status != DRV_GD25Q32_OK) { return status; }
+
+    status = DRV_GD25Q32_ReadStatus1(dev, &sr1_after);
+    if (status != DRV_GD25Q32_OK) { return status; }
+    status = DRV_GD25Q32_ReadStatus2(dev, &sr2_after);
+    if (status1_before != NULL) {
+        *status1_before = sr1_before;
+    }
+    if (status2_before != NULL) {
+        *status2_before = sr2_before;
+    }
+    if (status1_after != NULL) {
+        *status1_after = sr1_after;
+    }
+    if (status2_after != NULL) {
+        *status2_after = sr2_after;
+    }
+    return status;
+}
+
+DRV_GD25Q32_Status DRV_GD25Q32_WriteEnableProbe(DRV_GD25Q32_Device *dev,
+                                                uint8_t *status_before,
+                                                uint8_t *status_after)
+{
+    uint8_t before = 0U;
+    uint8_t after = 0U;
+    DRV_GD25Q32_Status status;
+
+    if (dev == NULL) { return DRV_GD25Q32_INVALID_ARG; }
+
+    status = gd25q32_wait_while_busy(dev, GD25Q32_DEFAULT_TIMEOUT_MS);
+    if (status != DRV_GD25Q32_OK) { return status; }
+
+    status = DRV_GD25Q32_ReadStatus1(dev, &before);
+    if (status != DRV_GD25Q32_OK) { return status; }
+
+    status = gd25q32_write_enable_raw(dev);
+    if (status != DRV_GD25Q32_OK) { return status; }
+
+    status = DRV_GD25Q32_ReadStatus1(dev, &after);
+    if (status_before != NULL) {
+        *status_before = before;
+    }
+    if (status_after != NULL) {
+        *status_after = after;
+    }
+    return status;
 }
 
 DRV_GD25Q32_Status DRV_GD25Q32_ReadData(DRV_GD25Q32_Device *dev, uint32_t address,
@@ -523,23 +657,16 @@ DRV_GD25Q32_Status DRV_GD25Q32_PageProgram(DRV_GD25Q32_Device *dev, uint32_t add
 
     uint16_t dma_len = 4U + length;
 
-    gd25q32_cache_clean(dev, flash_dma_tx, dma_len);
-
-    gd25q32_dma_prepare(dev);
     gd25q32_cs_low(dev);
-    HAL_StatusTypeDef hal_status = HAL_SPI_Transmit_DMA(
-        dev->bus.hspi, flash_dma_tx, dma_len);
+    HAL_StatusTypeDef hal_status = HAL_SPI_Transmit(dev->bus.hspi,
+                                                    flash_dma_tx,
+                                                    dma_len,
+                                                    gd25q32_timeout_ms(dev));
+    gd25q32_cs_high(dev);
     if (hal_status != HAL_OK) {
-        gd25q32_cs_high(dev);
-        dma_wait_thread = NULL;
-        dev->dma_state = DRV_GD25Q32_DMA_IDLE;
+        (void)HAL_SPI_Abort(dev->bus.hspi);
         return gd25q32_from_hal_status(hal_status);
     }
-
-    status = gd25q32_dma_wait(dev, GD25Q32_PROGRAM_TIMEOUT_MS);
-    gd25q32_cs_high(dev);
-
-    if (status != DRV_GD25Q32_OK) { return status; }
 
     return gd25q32_wait_while_busy(dev, GD25Q32_PROGRAM_TIMEOUT_MS);
 }

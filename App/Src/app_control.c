@@ -3,9 +3,12 @@
 #include "app_aiwb2.h"
 #include "app_baro.h"
 #include "app_flash.h"
+#include "app_flight_log.h"
 #include "app_diag.h"
 #include "app_gps.h"
 #include "app_ident.h"
+#include "app_optical_flow.h"
+#include "app_rangefinder.h"
 #include "app_sensor.h"
 #include "app_mag.h"
 #include "app_maint_uart.h"
@@ -16,6 +19,7 @@
 #include "bsp_bus_servo.h"
 #include "bsp_aiwb2_power.h"
 #include "bsp_baro.h"
+#include "bsp_optical_flow.h"
 #include "app_flash_service.h"
 #include "bsp_imu.h"
 #include "bsp_pwm.h"
@@ -61,6 +65,7 @@
 #define APP_CONTROL_FLASH_AUTOSAVE_DELAY_MS 1500U
 #define APP_CONTROL_DEG_TO_RAD 0.017453292519943295f
 #define APP_CONTROL_SERVO_ANGLE_MAX_DEG 90.0f
+#define APP_CONTROL_FLOW_RAW_MAX_BYTES 32U
 
 typedef struct {
     uint8_t loaded_from_flash;
@@ -184,8 +189,10 @@ static uint8_t app_control_handle_pid_slider_line(const char *line);
 static void app_control_report_wifi(void);
 void APP_Control_QueueText(const char *format, ...);
 static void app_control_queue_proto_text(uint16_t function, const char *format, ...);
+static void app_control_handle_flight_log(char **tokens, uint32_t count);
 static void app_control_dispatch_tokens(char **tokens, uint32_t count, uint8_t emit_ack);
 static uint32_t app_control_tokenize(char *buffer, char **tokens, uint32_t max_tokens);
+static uint8_t app_control_parse_u32(const char *text, uint32_t *value);
 static uint8_t app_control_payload_to_line(const uint8_t *payload,
                                            uint16_t payload_length,
                                            char *buffer,
@@ -200,6 +207,7 @@ static void app_control_service_flash_autosave(void);
 static void app_control_tick_common(uint8_t emit_heartbeat);
 static void app_control_report_rtos(void);
 static void app_control_handle_flash(char **tokens, uint32_t count);
+static void app_control_handle_flow(char **tokens, uint32_t count);
 static void app_control_req_m9n(uint32_t id, const char *op);
 static void app_control_req_mag(uint32_t id, const char *op);
 static const char *app_control_age_text(uint32_t age_ms, char *buffer, uint16_t size);
@@ -407,6 +415,79 @@ static uint32_t app_control_tokenize(char *buffer, char **tokens, uint32_t max_t
     }
 
     return count;
+}
+
+static void app_control_handle_flight_log(char **tokens, uint32_t count)
+{
+    APP_FlightLogStatus status;
+    APP_FlightLogCommandStatus cmd_status;
+
+    if ((tokens == NULL) || (count == 0U)) {
+        return;
+    }
+
+    if (strcmp(tokens[0], "FLOG?") == 0) {
+        APP_FlightLog_GetStatus(&status);
+        APP_Control_QueueText("FLOG initialized=%u recording=%u export=%u pending=%u "
+                              "used_bytes=%lu used_sectors=%lu records=%lu "
+                              "dropped=%lu buffered=%lu session=%lu "
+                              "export_sent=%lu export_total=%lu flash_status=%lu "
+                              "region=0x%06lX..0x%06lX rate=%u baud=%u\r\n",
+                              (unsigned int)status.initialized,
+                              (unsigned int)status.recording,
+                              (unsigned int)status.export_active,
+                              (unsigned int)status.export_pending,
+                              (unsigned long)status.used_bytes,
+                              (unsigned long)status.used_sectors,
+                              (unsigned long)status.total_records,
+                              (unsigned long)status.dropped_records,
+                              (unsigned long)status.buffered_records,
+                              (unsigned long)status.session_id,
+                              (unsigned long)status.export_bytes_sent,
+                              (unsigned long)status.export_total_bytes,
+                              (unsigned long)status.last_flash_status,
+                              (unsigned long)APP_FLIGHT_LOG_REGION_START,
+                              (unsigned long)APP_FLIGHT_LOG_REGION_END_EXCL,
+                              (unsigned int)APP_FLIGHT_LOG_RATE_HZ,
+                              (unsigned int)APP_FLIGHT_LOG_EXPORT_BAUD);
+        return;
+    }
+
+    if ((count >= 2U) && (strcmp(tokens[0], "FLOG") == 0) &&
+        (strcmp(tokens[1], "DUMP") == 0)) {
+        cmd_status = APP_FlightLog_StartDump();
+        if (cmd_status != APP_FLIGHT_LOG_CMD_OK) {
+            APP_Control_QueueText("FLOG ERROR start %s\r\n",
+                                  APP_FlightLog_CommandStatusText(cmd_status));
+        }
+        return;
+    }
+
+    if ((count >= 2U) && (strcmp(tokens[0], "FLOG") == 0) &&
+        (strcmp(tokens[1], "CANCEL") == 0)) {
+        cmd_status = APP_FlightLog_CancelDump();
+        APP_Control_QueueText("FLOG CANCEL %s\r\n",
+                              APP_FlightLog_CommandStatusText(cmd_status));
+        return;
+    }
+
+    if ((count >= 2U) && (strcmp(tokens[0], "FLOG") == 0) &&
+        (strcmp(tokens[1], "TESTFILL") == 0)) {
+        uint32_t sectors = 15U;
+
+        if ((count >= 3U) && (app_control_parse_u32(tokens[2], &sectors) == 0U)) {
+            APP_Control_QueueText("ERR usage FLOG TESTFILL [sectors]\r\n");
+            return;
+        }
+
+        cmd_status = APP_FlightLog_TestFill(sectors);
+        APP_Control_QueueText("FLOG TESTFILL %s sectors=%lu\r\n",
+                              APP_FlightLog_CommandStatusText(cmd_status),
+                              (unsigned long)sectors);
+        return;
+    }
+
+    APP_Control_QueueText("ERR usage FLOG? | FLOG DUMP | FLOG CANCEL | FLOG TESTFILL [sectors]\r\n");
 }
 
 static uint8_t app_control_payload_to_line(const uint8_t *payload,
@@ -982,9 +1063,9 @@ static void app_control_report_caps(void)
     app_control_queue_proto_text(APP_PROTO_MSG_CAPS_RECORD,
                                  "RSP id=0 mod=CAPS op=LIST legacy=PING,STATUS?,CONFIG?,SAVE,LOAD,SERVO raw=custom-tab\r\n");
     app_control_queue_proto_text(APP_PROTO_MSG_CAPS_RECORD,
-                                 "RSP id=0 mod=CAPS op=LIST mods=MODULES,SPL06,ICM42688,M9N,MAG,PARAM,FLASH,RTOS,WIFI\r\n");
+                                 "RSP id=0 mod=CAPS op=LIST mods=MODULES,SPL06,ICM42688,FLOW,MAG,PARAM,FLASH,RTOS,WIFI\r\n");
     app_control_queue_proto_text(APP_PROTO_MSG_CAPS_RECORD,
-                                 "RSP id=0 mod=CAPS op=LIST ops=SPL06:STATUS,READ,SAMPLE ICM42688:STATUS,DIAG M9N:STATUS,DIAG MAG:STATUS,DIAG\r\n");
+                                 "RSP id=0 mod=CAPS op=LIST ops=SPL06:STATUS,READ,SAMPLE ICM42688:STATUS,DIAG FLOW:STATUS MAG:STATUS,DIAG\r\n");
     app_control_queue_proto_text(APP_PROTO_MSG_CAPS_RECORD,
                                  "RSP id=0 mod=CAPS op=LIST ops=WIFI:STATUS,EN,RESET legacy=WIFI?,WIFI_EN?\r\n");
     app_control_queue_proto_text(APP_PROTO_MSG_CAPS_RECORD,
@@ -1209,6 +1290,167 @@ static void app_control_flash_bench_read(char **tokens, uint32_t count)
                                  (unsigned long)crc);
 }
 
+static void app_control_flash_wren_probe(void)
+{
+    uint8_t before = 0U;
+    uint8_t after = 0U;
+    APP_FlashService_Status status =
+        APP_FlashService_WriteEnableProbe(&before, &after);
+
+    app_control_queue_proto_text(APP_PROTO_MSG_FLASH_BENCH,
+                                 "FLASH wren st=%u before=0x%02X after=0x%02X wel=%u busy=%u\r\n",
+                                 (unsigned int)status,
+                                 (unsigned int)before,
+                                 (unsigned int)after,
+                                 (unsigned int)((after & 0x02U) != 0U),
+                                 (unsigned int)((after & 0x01U) != 0U));
+}
+
+static void app_control_flash_status_regs(void)
+{
+    uint8_t sr1 = 0U;
+    uint8_t sr2 = 0U;
+    uint8_t sr3 = 0U;
+    APP_FlashService_Status st1 = APP_FlashService_ReadStatus1(&sr1);
+    APP_FlashService_Status st2 = APP_FlashService_ReadStatus2(&sr2);
+    APP_FlashService_Status st3 = APP_FlashService_ReadStatus3(&sr3);
+
+    app_control_queue_proto_text(APP_PROTO_MSG_FLASH_BENCH,
+                                 "FLASH sr st=%u/%u/%u sr1=0x%02X sr2=0x%02X sr3=0x%02X wip=%u wel=%u bp=0x%02X cmp=%u qe=%u srp=%u%u\r\n",
+                                 (unsigned int)st1,
+                                 (unsigned int)st2,
+                                 (unsigned int)st3,
+                                 (unsigned int)sr1,
+                                 (unsigned int)sr2,
+                                 (unsigned int)sr3,
+                                 (unsigned int)((sr1 & 0x01U) != 0U),
+                                 (unsigned int)((sr1 & 0x02U) != 0U),
+                                 (unsigned int)((sr1 >> 2U) & 0x1FU),
+                                 (unsigned int)((sr2 & 0x40U) != 0U),
+                                 (unsigned int)((sr2 & 0x02U) != 0U),
+                                 (unsigned int)((sr2 & 0x01U) != 0U),
+                                 (unsigned int)((sr1 & 0x80U) != 0U));
+}
+
+static void app_control_flash_unprotect(void)
+{
+    uint8_t sr1_before = 0U;
+    uint8_t sr2_before = 0U;
+    uint8_t sr1_after = 0U;
+    uint8_t sr2_after = 0U;
+    APP_FlashService_Status status =
+        APP_FlashService_ClearProtection(&sr1_before,
+                                         &sr2_before,
+                                         &sr1_after,
+                                         &sr2_after);
+
+    app_control_queue_proto_text(APP_PROTO_MSG_FLASH_BENCH,
+                                 "FLASH unprotect st=%u sr1_before=0x%02X sr2_before=0x%02X sr1_after=0x%02X sr2_after=0x%02X bp_after=0x%02X cmp_after=%u\r\n",
+                                 (unsigned int)status,
+                                 (unsigned int)sr1_before,
+                                 (unsigned int)sr2_before,
+                                 (unsigned int)sr1_after,
+                                 (unsigned int)sr2_after,
+                                 (unsigned int)((sr1_after >> 2U) & 0x1FU),
+                                 (unsigned int)((sr2_after & 0x40U) != 0U));
+}
+
+static void app_control_flash_scratch_test(char **tokens, uint32_t count)
+{
+    const uint32_t length = APP_FLASH_SERVICE_PAGE_SIZE;
+    uint32_t address;
+    uint32_t erase_kb;
+    APP_FlashService_Status erase_status;
+    APP_FlashService_Status write_status = APP_FLASH_SERVICE_ERROR;
+    APP_FlashService_Status read_status;
+    APP_FlashService_Status sr_status;
+    uint8_t status1 = 0U;
+    uint32_t ff_count = 0U;
+    uint32_t crc = 0U;
+    int match = 0;
+
+    if (!app_control_token_u32(tokens,
+                               count,
+                               3U,
+                               APP_CONTROL_FLASH_SCRATCH_ADDR,
+                               &address) ||
+        !app_control_token_u32(tokens, count, 4U, 4U, &erase_kb) ||
+        (address > (APP_FLASH_SERVICE_SIZE_BYTES - APP_FLASH_SERVICE_SECTOR_SIZE))) {
+        APP_Control_QueueText("ERR usage FLASH SCRATCH TEST [addr] [erase_kb 4|32|64]\r\n");
+        return;
+    }
+    if (erase_kb == 64U) {
+        if (((address % APP_FLASH_SERVICE_BLOCK64K_SIZE) != 0U) ||
+            (address > (APP_FLASH_SERVICE_SIZE_BYTES - APP_FLASH_SERVICE_BLOCK64K_SIZE))) {
+            APP_Control_QueueText("ERR flash scratch addr align for 64K erase\r\n");
+            return;
+        }
+        erase_status = APP_FlashService_EraseBlock64K(address);
+    } else if (erase_kb == 32U) {
+        if (((address % APP_FLASH_SERVICE_BLOCK32K_SIZE) != 0U) ||
+            (address > (APP_FLASH_SERVICE_SIZE_BYTES - APP_FLASH_SERVICE_BLOCK32K_SIZE))) {
+            APP_Control_QueueText("ERR flash scratch addr align for 32K erase\r\n");
+            return;
+        }
+        erase_status = APP_FlashService_EraseBlock32K(address);
+    } else if (erase_kb == 4U) {
+        if ((address % APP_FLASH_SERVICE_SECTOR_SIZE) != 0U) {
+            APP_Control_QueueText("ERR flash scratch addr align for 4K erase\r\n");
+            return;
+        }
+        erase_status = APP_FlashService_EraseSector(address);
+    } else {
+        APP_Control_QueueText("ERR usage FLASH SCRATCH TEST [addr] [erase_kb 4|32|64]\r\n");
+        return;
+    }
+
+    read_status = APP_FlashService_ReadData(address, control_flash_buf_a, length);
+    if (read_status == APP_FLASH_SERVICE_OK) {
+        for (uint32_t index = 0U; index < length; ++index) {
+            if (control_flash_buf_a[index] == 0xFFU) {
+                ++ff_count;
+            }
+        }
+    }
+
+    if ((erase_status == APP_FLASH_SERVICE_OK) &&
+        (read_status == APP_FLASH_SERVICE_OK) &&
+        (ff_count == length)) {
+        for (uint32_t index = 0U; index < length; ++index) {
+            control_flash_buf_b[index] =
+                (uint8_t)(0xA5U ^ (uint8_t)index ^ (uint8_t)(index >> 3U));
+        }
+        write_status = APP_FlashService_WriteData(address,
+                                                  control_flash_buf_b,
+                                                  length);
+        read_status = APP_FlashService_ReadData(address,
+                                                control_flash_buf_a,
+                                                length);
+        if ((write_status == APP_FLASH_SERVICE_OK) &&
+            (read_status == APP_FLASH_SERVICE_OK)) {
+            match = memcmp(control_flash_buf_a, control_flash_buf_b, length);
+            crc = app_control_crc32(control_flash_buf_a, length);
+        }
+    }
+
+    sr_status = APP_FlashService_ReadStatus1(&status1);
+    app_control_queue_proto_text(APP_PROTO_MSG_FLASH_BENCH,
+                                 "FLASH scratch_test addr=0x%06lX len=%lu erase_kb=%lu erase_st=%u read_st=%u ff=%lu write_st=%u match=%u crc=0x%08lX sr_st=%u sr1=0x%02X\r\n",
+                                 (unsigned long)address,
+                                 (unsigned long)length,
+                                 (unsigned long)erase_kb,
+                                 (unsigned int)erase_status,
+                                 (unsigned int)read_status,
+                                 (unsigned long)ff_count,
+                                 (unsigned int)write_status,
+                                 (unsigned int)((match == 0) &&
+                                                (write_status == APP_FLASH_SERVICE_OK) &&
+                                                (read_status == APP_FLASH_SERVICE_OK)),
+                                 (unsigned long)crc,
+                                 (unsigned int)sr_status,
+                                 (unsigned int)status1);
+}
+
 static void app_control_handle_flash(char **tokens, uint32_t count)
 {
     if (count < 2U) {
@@ -1222,13 +1464,26 @@ static void app_control_handle_flash(char **tokens, uint32_t count)
                (count >= 3U) &&
                (strcmp(tokens[2], "READ") == 0)) {
         app_control_flash_bench_read(tokens, count);
+    } else if ((strcmp(tokens[1], "SR?") == 0) ||
+               (strcmp(tokens[1], "STATUS?") == 0)) {
+        app_control_flash_status_regs();
+    } else if ((strcmp(tokens[1], "WREN?") == 0) ||
+               (strcmp(tokens[1], "WEL?") == 0)) {
+        app_control_flash_wren_probe();
+    } else if ((strcmp(tokens[1], "UNPROTECT") == 0) ||
+               (strcmp(tokens[1], "UNLOCK") == 0)) {
+        app_control_flash_unprotect();
+    } else if ((strcmp(tokens[1], "SCRATCH") == 0) &&
+               (count >= 3U) &&
+               (strcmp(tokens[2], "TEST") == 0)) {
+        app_control_flash_scratch_test(tokens, count);
     } else if (strcmp(tokens[1], "SCRATCH?") == 0) {
         app_control_queue_proto_text(APP_PROTO_MSG_FLASH_BENCH,
                                      "FLASH scratch addr=0x%06lX size=%lu note=reserved_test_sector\r\n",
                                      (unsigned long)APP_CONTROL_FLASH_SCRATCH_ADDR,
                                      (unsigned long)4096UL);
     } else {
-        APP_Control_QueueText("ERR usage FLASH VERIFY|BENCH READ|SCRATCH?\r\n");
+        APP_Control_QueueText("ERR usage FLASH VERIFY|BENCH READ|SR?|WREN?|UNPROTECT|SCRATCH?|SCRATCH TEST\r\n");
     }
 }
 
@@ -1347,23 +1602,23 @@ static void app_control_report_modules(void)
     APP_Flash_Status flash_status;
     APP_Baro_Status baro_status;
     APP_IMU_Status imu_status;
-    APP_GPS_Status gps_status;
+    APP_OPTICAL_FLOW_Status flow_status;
     APP_MAG_Status mag_status;
 
     APP_Flash_GetStatus(&flash_status);
     APP_Baro_GetStatus(&baro_status);
     APP_IMU_GetStatus(&imu_status);
-    APP_GPS_GetStatus(&gps_status);
+    APP_OpticalFlow_GetStatus(&flow_status);
     APP_MAG_GetStatus(&mag_status);
 
     app_control_queue_proto_text(APP_PROTO_MSG_MODULES_SUMMARY,
-                                 "RSP id=0 mod=MODULES op=STATUS flash=%u flash_stage=%s baro=%u baro_stage=%s imu=%u gps=%u mag=%u\r\n",
+                                 "RSP id=0 mod=MODULES op=STATUS flash=%u flash_stage=%s baro=%u baro_stage=%s imu=%u flow=%u mag=%u\r\n",
                                  (unsigned int)app_control_flash_ok(&flash_status),
                                  app_control_flash_stage(&flash_status),
                                  (unsigned int)app_control_baro_ok(&baro_status),
                                  app_control_baro_stage(&baro_status),
                                  (unsigned int)imu_status.initialized,
-                                 (unsigned int)gps_status.initialized,
+                                 (unsigned int)flow_status.initialized,
                                  (unsigned int)mag_status.initialized);
     app_control_queue_proto_text(APP_PROTO_MSG_MODULES_SUMMARY,
                                  "RSP id=0 mod=MODULES op=STATUS imu_stage=%s mag_type=%s cfg_valid=%u cfg_loaded=%u servo_slots=%u wifi_en=%u\r\n",
@@ -1695,7 +1950,7 @@ static void app_control_report_status(void)
     APP_Flash_Status flash_status;
     APP_Baro_Status baro_status;
     APP_IMU_Status imu_status;
-    APP_GPS_Status gps_status;
+    APP_OPTICAL_FLOW_Status flow_status;
     APP_MAG_Status mag_status;
     uint32_t uart_rx_bytes = 0U;
     uint32_t uart_rx_lines = 0U;
@@ -1708,7 +1963,7 @@ static void app_control_report_status(void)
     APP_Flash_GetStatus(&flash_status);
     APP_Baro_GetStatus(&baro_status);
     APP_IMU_GetStatus(&imu_status);
-    APP_GPS_GetStatus(&gps_status);
+    APP_OpticalFlow_GetStatus(&flow_status);
     APP_MAG_GetStatus(&mag_status);
     APP_UART_GetStats(&uart_rx_bytes,
                       &uart_rx_lines,
@@ -1772,19 +2027,16 @@ static void app_control_report_status(void)
                                  (unsigned int)imu_status.diag_burst_m3_tok_3,
                                  (unsigned int)imu_status.diag_burst_m3_tok_4);
     app_control_queue_proto_text(APP_PROTO_MSG_GPS_RECORD,
-                                 "HW M9N ok=%u init=%ld fix=%u valid=%u sv=%u packets=%lu nav=%lu nmea=%lu gga=%lu lon=%ld lat=%ld hmsl_mm=%ld\r\n",
-                                 (unsigned int)gps_status.initialized,
-                                 (long)gps_status.init_status,
-                                 (unsigned int)gps_status.fix_type,
-                                 (unsigned int)gps_status.valid_fix,
-                                 (unsigned int)gps_status.num_sv,
-                                 (unsigned long)gps_status.packets,
-                                 (unsigned long)gps_status.nav_pvt_packets,
-                                 (unsigned long)gps_status.nmea_sentences,
-                                 (unsigned long)gps_status.nmea_gga_sentences,
-                                 (long)gps_status.lon_deg_e7,
-                                 (long)gps_status.lat_deg_e7,
-                                 (long)gps_status.hmsl_mm);
+                                 "HW FLOW ok=%u init=%ld baud=%lu bytes=%lu frames=%lu valid=0x%02X age_ms=%lu source=%s vel_valid=%u\r\n",
+                                 (unsigned int)flow_status.initialized,
+                                 (long)flow_status.init_status,
+                                 (unsigned long)flow_status.baud_rate,
+                                 (unsigned long)flow_status.bytes,
+                                 (unsigned long)flow_status.frames,
+                                 (unsigned int)flow_status.valid,
+                                 (unsigned long)flow_status.age_ms,
+                                 APP_OpticalFlow_VelSourceName(flow_status.velocity_source),
+                                 (unsigned int)flow_status.velocity_valid);
     app_control_queue_proto_text(APP_PROTO_MSG_MAG_RECORD,
                                  "HW MAG ok=%u init=%ld st=%ld type=%s addr=0x%02X who=0x%02X n=%lu x=%ld y=%ld z=%ld\r\n",
                                  (unsigned int)mag_status.initialized,
@@ -1834,18 +2086,17 @@ static void app_control_report_status(void)
                                  (long)imu_status.gyro_z_mdps,
                                  (int)imu_status.temperature_cdeg);
     app_control_queue_proto_text(APP_PROTO_MSG_GPS_RECORD,
-                                 "STATUS gps init=%u st=%ld fix=%u valid=%u sv=%u nav=%lu lon=%ld lat=%ld hmsl=%ld hacc=%lu vacc=%lu\r\n",
-                                 (unsigned int)gps_status.initialized,
-                                 (long)gps_status.init_status,
-                                 (unsigned int)gps_status.fix_type,
-                                 (unsigned int)gps_status.valid_fix,
-                                 (unsigned int)gps_status.num_sv,
-                                 (unsigned long)gps_status.nav_pvt_packets,
-                                 (long)gps_status.lon_deg_e7,
-                                 (long)gps_status.lat_deg_e7,
-                                 (long)gps_status.hmsl_mm,
-                                 (unsigned long)gps_status.hacc_mm,
-                                 (unsigned long)gps_status.vacc_mm);
+                                 "STATUS flow init=%u st=%ld valid=0x%02X frames=%lu cksum=%lu age=%lu h=%.3f vx=%.3f vy=%.3f source=%s\r\n",
+                                 (unsigned int)flow_status.initialized,
+                                 (long)flow_status.init_status,
+                                 (unsigned int)flow_status.valid,
+                                 (unsigned long)flow_status.frames,
+                                 (unsigned long)flow_status.checksum_errors,
+                                 (unsigned long)flow_status.age_ms,
+                                 (double)flow_status.height_m,
+                                 (double)flow_status.vx_m_s,
+                                 (double)flow_status.vy_m_s,
+                                 APP_OpticalFlow_VelSourceName(flow_status.velocity_source));
     app_control_queue_proto_text(APP_PROTO_MSG_MAG_RECORD,
                                  "STATUS mag init=%u st=%ld type=%s addr=0x%02X who=0x%02X n=%lu raw=%d,%d,%d mgauss=%ld,%ld,%ld\r\n",
                                  (unsigned int)mag_status.initialized,
@@ -2796,6 +3047,143 @@ static void app_control_handle_baro(char **tokens, uint32_t count)
     APP_Control_QueueText("OK baro stream=0 (streaming removed)\r\n");
 }
 
+static uint8_t app_control_parse_hex_byte(const char *text, uint8_t *value)
+{
+    char *end = NULL;
+    unsigned long parsed;
+
+    if ((text == NULL) || (value == NULL) || (text[0] == '\0')) {
+        return 0U;
+    }
+
+    parsed = strtoul(text, &end, 16);
+    if ((end == text) || (*end != '\0') || (parsed > 0xFFUL)) {
+        return 0U;
+    }
+
+    *value = (uint8_t)parsed;
+    return 1U;
+}
+
+static void app_control_handle_flow(char **tokens, uint32_t count)
+{
+    uint8_t tx_bytes[APP_CONTROL_FLOW_RAW_MAX_BYTES];
+    uint8_t rx_bytes[16];
+    uint32_t tx_count;
+    uint16_t rx_count;
+    BSP_OPTICAL_FLOW_StatusCode status;
+
+    if ((count == 1U) || ((count >= 2U) && (strcmp(tokens[1], "?") == 0))) {
+        APP_Control_QueueText("ERR usage FLOW TX hex... | FLOW RX [max] | FLOW XCV rx_len hex... | FLOW PINGAB\r\n");
+        return;
+    }
+
+    if (strcmp(tokens[1], "PINGAB") == 0) {
+        static const uint8_t ab_command[] = {
+            0xAAU, 0xABU, 0x96U, 0x26U, 0xBCU, 0x50U, 0x5CU
+        };
+        status = BSP_OPTICAL_FLOW_TransceiveRaw(ab_command,
+                                                (uint16_t)sizeof(ab_command),
+                                                rx_bytes, 3U, &rx_count,
+                                                100U);
+        APP_Control_QueueText("FLOW PINGAB tx_st=%ld rx_n=%u rx=%02X,%02X,%02X\r\n",
+                              (long)status,
+                              (unsigned int)rx_count,
+                              (unsigned int)((rx_count > 0U) ? rx_bytes[0] : 0U),
+                              (unsigned int)((rx_count > 1U) ? rx_bytes[1] : 0U),
+                              (unsigned int)((rx_count > 2U) ? rx_bytes[2] : 0U));
+        return;
+    }
+
+    if (strcmp(tokens[1], "RX") == 0) {
+        uint32_t max_rx = 3U;
+        if (count >= 3U) {
+            max_rx = strtoul(tokens[2], NULL, 0);
+        }
+        if ((max_rx == 0U) || (max_rx > sizeof(rx_bytes))) {
+            APP_Control_QueueText("ERR usage FLOW RX 1..16\r\n");
+            return;
+        }
+        rx_count = BSP_OPTICAL_FLOW_ReceiveRaw(rx_bytes, (uint16_t)max_rx, 100U);
+        APP_Control_QueueText("FLOW RX n=%u data=%02X,%02X,%02X,%02X,%02X,%02X,%02X,%02X\r\n",
+                              (unsigned int)rx_count,
+                              (unsigned int)((rx_count > 0U) ? rx_bytes[0] : 0U),
+                              (unsigned int)((rx_count > 1U) ? rx_bytes[1] : 0U),
+                              (unsigned int)((rx_count > 2U) ? rx_bytes[2] : 0U),
+                              (unsigned int)((rx_count > 3U) ? rx_bytes[3] : 0U),
+                              (unsigned int)((rx_count > 4U) ? rx_bytes[4] : 0U),
+                              (unsigned int)((rx_count > 5U) ? rx_bytes[5] : 0U),
+                              (unsigned int)((rx_count > 6U) ? rx_bytes[6] : 0U),
+                              (unsigned int)((rx_count > 7U) ? rx_bytes[7] : 0U));
+        return;
+    }
+
+    if (strcmp(tokens[1], "XCV") == 0) {
+        uint32_t max_rx;
+
+        if ((count < 4U) || ((count - 3U) > APP_CONTROL_FLOW_RAW_MAX_BYTES)) {
+            APP_Control_QueueText("ERR usage FLOW XCV rx_len hex... max=%u\r\n",
+                                  (unsigned int)APP_CONTROL_FLOW_RAW_MAX_BYTES);
+            return;
+        }
+
+        max_rx = strtoul(tokens[2], NULL, 0);
+        if ((max_rx == 0U) || (max_rx > sizeof(rx_bytes))) {
+            APP_Control_QueueText("ERR usage FLOW XCV rx_len 1..16 hex...\r\n");
+            return;
+        }
+
+        tx_count = count - 3U;
+        for (uint32_t i = 0U; i < tx_count; ++i) {
+            if (app_control_parse_hex_byte(tokens[i + 3U], &tx_bytes[i]) == 0U) {
+                APP_Control_QueueText("ERR flow hex %s\r\n", tokens[i + 3U]);
+                return;
+            }
+        }
+
+        status = BSP_OPTICAL_FLOW_TransceiveRaw(tx_bytes, (uint16_t)tx_count,
+                                                rx_bytes, (uint16_t)max_rx,
+                                                &rx_count, 100U);
+        APP_Control_QueueText("FLOW XCV st=%ld tx_n=%lu rx_n=%u data=%02X,%02X,%02X,%02X,%02X,%02X,%02X,%02X\r\n",
+                              (long)status,
+                              (unsigned long)tx_count,
+                              (unsigned int)rx_count,
+                              (unsigned int)((rx_count > 0U) ? rx_bytes[0] : 0U),
+                              (unsigned int)((rx_count > 1U) ? rx_bytes[1] : 0U),
+                              (unsigned int)((rx_count > 2U) ? rx_bytes[2] : 0U),
+                              (unsigned int)((rx_count > 3U) ? rx_bytes[3] : 0U),
+                              (unsigned int)((rx_count > 4U) ? rx_bytes[4] : 0U),
+                              (unsigned int)((rx_count > 5U) ? rx_bytes[5] : 0U),
+                              (unsigned int)((rx_count > 6U) ? rx_bytes[6] : 0U),
+                              (unsigned int)((rx_count > 7U) ? rx_bytes[7] : 0U));
+        return;
+    }
+
+    if (strcmp(tokens[1], "TX") != 0) {
+        APP_Control_QueueText("ERR unknown flow subcmd %s\r\n", tokens[1]);
+        return;
+    }
+
+    if ((count < 3U) || ((count - 2U) > APP_CONTROL_FLOW_RAW_MAX_BYTES)) {
+        APP_Control_QueueText("ERR usage FLOW TX hex... max=%u\r\n",
+                              (unsigned int)APP_CONTROL_FLOW_RAW_MAX_BYTES);
+        return;
+    }
+
+    tx_count = count - 2U;
+    for (uint32_t i = 0U; i < tx_count; ++i) {
+        if (app_control_parse_hex_byte(tokens[i + 2U], &tx_bytes[i]) == 0U) {
+            APP_Control_QueueText("ERR flow hex %s\r\n", tokens[i + 2U]);
+            return;
+        }
+    }
+
+    status = BSP_OPTICAL_FLOW_TransmitRaw(tx_bytes, (uint16_t)tx_count, 100U);
+    APP_Control_QueueText("FLOW TX st=%ld n=%lu\r\n",
+                          (long)status,
+                          (unsigned long)tx_count);
+}
+
 static void app_control_handle_pid(char **tokens, uint32_t count)
 {
     const char *kp_text;
@@ -2883,6 +3271,8 @@ static uint8_t app_control_handle_pid_slider_line(const char *line)
         { "vel_z_kd",       "coax.vel_z_kd"       },
         { "accel_xy",       "coax.accel_xy_limit_m_s2" },
         { "accel_z",        "coax.accel_z_limit_m_s2"  },
+        { "accel_xy_limit_m_s2", "coax.accel_xy_limit_m_s2" },
+        { "accel_z_limit_m_s2",  "coax.accel_z_limit_m_s2"  },
         { "vel_loop_enable", "coax.vel_loop_enable" },
         { "vel_loop_x_kp",  "coax.vel_loop_x_kp" },
         { "vel_loop_x_ki",  "coax.vel_loop_x_ki" },
@@ -3199,6 +3589,12 @@ static void app_control_dispatch_tokens(char **tokens, uint32_t count, uint8_t e
         app_control_handle_baro(tokens, count);
     } else if (strcmp(tokens[0], "IMU?") == 0) {
         app_control_report_imu();
+    } else if (strcmp(tokens[0], "FLOW?") == 0) {
+        APP_OpticalFlow_Report();
+    } else if (strcmp(tokens[0], "FLOW") == 0) {
+        app_control_handle_flow(tokens, count);
+    } else if (strcmp(tokens[0], "RANGE?") == 0) {
+        APP_Rangefinder_Report();
     } else if (strcmp(tokens[0], "GPS?") == 0) {
         APP_GPS_Report();
     } else if (strcmp(tokens[0], "MAG?") == 0) {
@@ -3306,6 +3702,9 @@ static void app_control_dispatch_tokens(char **tokens, uint32_t count, uint8_t e
         }
     } else if (strcmp(tokens[0], "SERVO") == 0) {
         app_control_handle_servo(tokens, count);
+    } else if ((strcmp(tokens[0], "FLOG?") == 0) ||
+               (strcmp(tokens[0], "FLOG") == 0)) {
+        app_control_handle_flight_log(tokens, count);
     } else if (strcmp(tokens[0], "Sensor_Data:1") == 0) {
         vofaStreamActive = 1U;
         APP_Control_QueueText("OK IMU stream started\r\n");

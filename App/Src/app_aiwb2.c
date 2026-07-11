@@ -53,6 +53,7 @@
 #define APP_AIWB2_SOFTAP_GATEWAY "192.168.43.1"
 #endif
 
+#define APP_AIWB2_DIRECT_SERIAL_MODE  1U  /* 设为 1 绕过 WiFi 状态机，配合数传直连使用 */
 #define APP_AIWB2_PASSIVE_ONLY        0U
 #define APP_AIWB2_START_DELAY_MS     8000U
 #define APP_AIWB2_PROBE_TIMEOUT_MS   8000U
@@ -356,6 +357,14 @@ static void aiwb2_parse_socket_error(const char *line)
 
 void APP_AiWB2_Init(void)
 {
+#if (APP_AIWB2_DIRECT_SERIAL_MODE != 0U)
+    /* 数传直连模式：关闭 WiFi 模块电源，设透传桩 */
+    BSP_AiWB2_SetEnabled(0U);
+    aiwb2_state = APP_AIWB2_STATE_TRANSPARENT;
+    aiwb2_socket_ready = 1U;
+    aiwb2_socket_peer_ready = 1U;
+    return;
+#else
     uint32_t now_ms = HAL_GetTick();
 
 #if (APP_AIWB2_PASSIVE_ONLY != 0U)
@@ -378,10 +387,14 @@ void APP_AiWB2_Init(void)
     aiwb2_socket_peer_ready = 0U;
     aiwb2_socket_send_prompt = 0U;
     aiwb2_socket_send_result = 0;
+#endif
 }
 
 void APP_AiWB2_Tick(void)
 {
+#if (APP_AIWB2_DIRECT_SERIAL_MODE != 0U)
+    return;
+#else
     uint32_t now_ms = HAL_GetTick();
     const APP_AiWB2Command *commands;
     const APP_AiWB2Command *command;
@@ -513,6 +526,7 @@ void APP_AiWB2_Tick(void)
     default:
         break;
     }
+#endif /* APP_AIWB2_DIRECT_SERIAL_MODE */
 }
 
 void APP_AiWB2_ProcessLine(const char *line)
@@ -669,14 +683,22 @@ void APP_AiWB2_ProcessLine(const char *line)
 
 uint8_t APP_AiWB2_IsTransparent(void)
 {
+#if (APP_AIWB2_DIRECT_SERIAL_MODE != 0U)
+    return 1U;
+#else
     return (aiwb2_state == APP_AIWB2_STATE_TRANSPARENT) ? 1U : 0U;
+#endif
 }
 
 uint8_t APP_AiWB2_IsSocketReady(void)
 {
+#if (APP_AIWB2_DIRECT_SERIAL_MODE != 0U)
+    return 1U;
+#else
     return ((aiwb2_state == APP_AIWB2_STATE_SOCKET_READY) &&
             (aiwb2_socket_ready != 0U) &&
             (aiwb2_socket_peer_ready != 0U)) ? 1U : 0U;
+#endif
 }
 
 uint32_t APP_AiWB2_GetSocketConId(void)
@@ -722,8 +744,10 @@ uint8_t APP_AiWB2_IsControlPayload(const char *line)
         (strcmp(line, "STATUS?") == 0) ||
         (strcmp(line, "CONFIG?") == 0) ||
         (strcmp(line, "FLASH?") == 0) ||
+        (strcmp(line, "FLOG?") == 0) ||
         (strcmp(line, "RTOS?") == 0) ||
         (aiwb2_starts_with(line, "FLASH ") != 0U) ||
+        (aiwb2_starts_with(line, "FLOG ") != 0U) ||
         (strcmp(line, "BARO?") == 0) ||
         (strcmp(line, "IMU?") == 0) ||
         (strcmp(line, "PARAM?") == 0) ||
@@ -756,6 +780,10 @@ uint8_t APP_AiWB2_IsControlPayload(const char *line)
 
 uint8_t APP_AiWB2_ShouldConsumeTransparentLine(const char *line)
 {
+#if (APP_AIWB2_DIRECT_SERIAL_MODE != 0U)
+    (void)line;
+    return 0U;
+#else
     if (line == 0) {
         return 0U;
     }
@@ -770,6 +798,7 @@ uint8_t APP_AiWB2_ShouldConsumeTransparentLine(const char *line)
     }
 
     return 0U;
+#endif
 }
 
 void APP_AiWB2_AssumeTransparent(void)

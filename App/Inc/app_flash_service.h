@@ -30,6 +30,14 @@ typedef DRV_GD25Q32_JedecId APP_FlashService_JedecId;
 APP_FlashService_Status APP_FlashService_Init(void);
 APP_FlashService_Status APP_FlashService_ProbeJedecId(APP_FlashService_JedecId *jedec_id);
 APP_FlashService_Status APP_FlashService_ReadStatus1(uint8_t *status1);
+APP_FlashService_Status APP_FlashService_ReadStatus2(uint8_t *status2);
+APP_FlashService_Status APP_FlashService_ReadStatus3(uint8_t *status3);
+APP_FlashService_Status APP_FlashService_WriteEnableProbe(uint8_t *status_before,
+                                                          uint8_t *status_after);
+APP_FlashService_Status APP_FlashService_ClearProtection(uint8_t *status1_before,
+                                                         uint8_t *status2_before,
+                                                         uint8_t *status1_after,
+                                                         uint8_t *status2_after);
 APP_FlashService_Status APP_FlashService_ReadData(uint32_t address, uint8_t *data, uint32_t length);
 APP_FlashService_Status APP_FlashService_ReadDataFast(uint32_t address, uint8_t *data, uint32_t length);
 APP_FlashService_Status APP_FlashService_EraseSector(uint32_t address);

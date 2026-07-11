@@ -481,7 +481,14 @@ void SystemClock_Config(void)
   */
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
 
-  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
+  {
+    uint32_t vos_tickstart = HAL_GetTick();
+    while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {
+      if ((HAL_GetTick() - vos_tickstart) > 100U) {
+        break;
+      }
+    }
+  }
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.

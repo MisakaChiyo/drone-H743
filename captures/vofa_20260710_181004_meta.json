@@ -1,0 +1,254 @@
+{
+  "port": "COM10",
+  "baud": 57600,
+  "duration_s": 16.99538493156433,
+  "frames": 291,
+  "average_frame_hz": 17.122295327335966,
+  "text_lines": 4,
+  "dropped_or_noise_bytes": 214,
+  "csv": "captures\\vofa_20260710_181004.csv",
+  "text_log": "captures\\vofa_20260710_181004_text.txt",
+  "raw_bin": null,
+  "channel_names": [
+    "roll_deg",
+    "pitch_deg",
+    "yaw_deg",
+    "altitude_m",
+    "accel_x_g",
+    "accel_y_g",
+    "accel_z_g",
+    "gyro_x_dps",
+    "gyro_y_dps",
+    "gyro_z_dps",
+    "fc_time_s",
+    "imu_irq_hz",
+    "imu_poll_hz",
+    "imu_age_ms",
+    "roll_acc_deg",
+    "pitch_acc_deg",
+    "roll_gyro_deg",
+    "pitch_gyro_deg",
+    "roll_residual_deg",
+    "pitch_residual_deg",
+    "attitude_cf_alpha",
+    "attitude_dt_ms",
+    "coax_roll_rate_kd",
+    "coax_pitch_rate_kd",
+    "coax_yaw_angle_kp",
+    "coax_yaw_rate_kd",
+    "coax_vel_x_kd",
+    "coax_vel_y_kd",
+    "coax_vel_z_kd",
+    "coax_accel_xy_limit_m_s2",
+    "coax_accel_z_limit_m_s2",
+    "nav_acc_x_m_s2",
+    "nav_acc_y_m_s2",
+    "nav_acc_z_m_s2",
+    "vel_est_x_m_s",
+    "vel_est_y_m_s",
+    "vel_ref_x_m_s",
+    "vel_ref_y_m_s",
+    "vel_err_x_m_s",
+    "vel_err_y_m_s",
+    "vel_pid_out_x_m_s2",
+    "vel_pid_out_y_m_s2",
+    "vel_pid_p_x_m_s2",
+    "vel_pid_i_x_m_s2",
+    "vel_pid_d_x_m_s2",
+    "vel_pid_p_y_m_s2",
+    "vel_pid_i_y_m_s2",
+    "vel_pid_d_y_m_s2",
+    "servo_alpha_us",
+    "servo_beta_us",
+    "motor_upper_us",
+    "motor_lower_us",
+    "vel_loop_x_kp",
+    "vel_loop_y_kp",
+    "vel_loop_output_limit_m_s2",
+    "vel_loop_x_ki",
+    "vel_loop_y_ki",
+    "vel_loop_i_limit_m_s2",
+    "vel_loop_x_kd",
+    "vel_loop_y_kd",
+    "vel_loop_enable",
+    "flow_raw_vx_m_s",
+    "flow_raw_vy_m_s"
+  ],
+  "tuning_stats": {
+    "roll_deg": {
+      "count": 291,
+      "min": -8.637323379516602,
+      "max": 1461.0,
+      "mean": 1.6616969989337462,
+      "max_abs": 1461.0
+    },
+    "pitch_deg": {
+      "count": 291,
+      "min": -8.56422233581543,
+      "max": 3.449002265930176,
+      "mean": -2.4600370602099755,
+      "max_abs": 8.56422233581543
+    },
+    "yaw_deg": {
+      "count": 291,
+      "min": -5.429710388183594,
+      "max": 12.276729583740234,
+      "mean": 1.4061185273108203,
+      "max_abs": 12.276729583740234
+    },
+    "vel_est_x_m_s": {
+      "count": 291,
+      "min": -0.10249131917953491,
+      "max": 0.06820221990346909,
+      "mean": 0.0011501857985135304,
+      "max_abs": 0.10249131917953491
+    },
+    "vel_est_y_m_s": {
+      "count": 291,
+      "min": -0.05979086458683014,
+      "max": 0.31087803840637207,
+      "mean": 0.03362849265796272,
+      "max_abs": 0.31087803840637207
+    },
+    "vel_ref_x_m_s": {
+      "count": 291,
+      "min": 0.0,
+      "max": 0.0,
+      "mean": 0.0,
+      "max_abs": 0.0
+    },
+    "vel_ref_y_m_s": {
+      "count": 291,
+      "min": 0.0,
+      "max": 0.0,
+      "mean": 0.0,
+      "max_abs": 0.0
+    },
+    "vel_err_x_m_s": {
+      "count": 291,
+      "min": -0.06774876266717911,
+      "max": 0.10174300521612167,
+      "mean": -0.028325768623849508,
+      "max_abs": 0.10174300521612167
+    },
+    "vel_err_y_m_s": {
+      "count": 291,
+      "min": -0.312533974647522,
+      "max": 0.0605306550860405,
+      "mean": -0.2077937523230928,
+      "max_abs": 0.312533974647522
+    },
+    "vel_pid_out_x_m_s2": {
+      "count": 291,
+      "min": -0.40649259090423584,
+      "max": 0.6104580163955688,
+      "mean": -0.16995461009558022,
+      "max_abs": 0.6104580163955688
+    },
+    "vel_pid_out_y_m_s2": {
+      "count": 291,
+      "min": -1.8654996156692505,
+      "max": 0.36294451355934143,
+      "mean": -1.2415169144320923,
+      "max_abs": 1.8654996156692505
+    },
+    "vel_pid_p_x_m_s2": {
+      "count": 291,
+      "min": -0.40649259090423584,
+      "max": 0.6104580163955688,
+      "mean": -0.16995461009558022,
+      "max_abs": 0.6104580163955688
+    },
+    "vel_pid_i_x_m_s2": {
+      "count": 291,
+      "min": 0.0,
+      "max": 0.0,
+      "mean": 0.0,
+      "max_abs": 0.0
+    },
+    "vel_pid_d_x_m_s2": {
+      "count": 291,
+      "min": -0.0,
+      "max": -0.0,
+      "mean": 0.0,
+      "max_abs": 0.0
+    },
+    "vel_pid_p_y_m_s2": {
+      "count": 291,
+      "min": -1.8752038478851318,
+      "max": 0.3631839156150818,
+      "mean": -1.2467625132784699,
+      "max_abs": 1.8752038478851318
+    },
+    "vel_pid_i_y_m_s2": {
+      "count": 291,
+      "min": -0.0005978725384920835,
+      "max": 0.009704215452075005,
+      "mean": 0.0052455873440657,
+      "max_abs": 0.009704215452075005
+    },
+    "vel_pid_d_y_m_s2": {
+      "count": 291,
+      "min": 0.0,
+      "max": 0.0,
+      "mean": 0.0,
+      "max_abs": 0.0
+    },
+    "servo_alpha_us": {
+      "count": 291,
+      "min": 1367.0,
+      "max": 1515.0,
+      "mean": 1453.573883161512,
+      "max_abs": 1515.0
+    },
+    "servo_beta_us": {
+      "count": 291,
+      "min": 1803.0,
+      "max": 1951.0,
+      "mean": 1890.5017182130584,
+      "max_abs": 1951.0
+    },
+    "motor_upper_us": {
+      "count": 291,
+      "min": 1440.0,
+      "max": 1480.0,
+      "mean": 1459.8213058419244,
+      "max_abs": 1480.0
+    },
+    "motor_lower_us": {
+      "count": 291,
+      "min": 1365.0,
+      "max": 1415.0,
+      "mean": 1392.3780068728522,
+      "max_abs": 1415.0
+    },
+    "flow_raw_vx_m_s": {
+      "count": 291,
+      "min": -0.08633773028850555,
+      "max": 0.09355023503303528,
+      "mean": -0.000887892524584971,
+      "max_abs": 0.09355023503303528
+    },
+    "flow_raw_vy_m_s": {
+      "count": 291,
+      "min": -0.2405577301979065,
+      "max": 0.3413204550743103,
+      "mean": 0.03139116652981983,
+      "max_abs": 0.3413204550743103
+    },
+    "imu_age_ms": {
+      "count": 291,
+      "min": 0.06700000166893005,
+      "max": 0.8820000290870667,
+      "mean": 0.4030068913839527,
+      "max_abs": 0.8820000290870667
+    }
+  },
+  "notes": [
+    "34/35 are fused velocity estimates.",
+    "36/37 are velocity references.",
+    "38/39 are velocity errors.",
+    "40/41 are velocity-loop outputs.",
+    "61/62 are raw optical-flow velocities."
+  ]
+}

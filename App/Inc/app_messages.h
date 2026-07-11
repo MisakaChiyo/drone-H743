@@ -41,6 +41,7 @@ typedef struct {
     APP_Sensor_Base base;           /* timestamp + type + sequence */
 
     /* IMU — scaled to physical units */
+    DRV_IMU_RawData raw_imu;
     DRV_IMU_ScaledData imu;
 
     /* Attitude estimate from complementary filter */

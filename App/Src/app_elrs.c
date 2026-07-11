@@ -30,14 +30,45 @@ static uint32_t rx_restarts;
 
 /* ---- helpers ---- */
 
+static void ConfigureRxPinBias(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    GPIO_InitStruct.Pin = GPIO_PIN_0;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF8_UART4;
+    HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+}
+
+static void SuppressRxIrqSources(void)
+{
+    /*
+     * CRSF RX is consumed by polling the circular DMA write position in
+     * APP_ELRS_Step(). Leaving UART IDLE/error IRQs enabled lets a noisy or
+     * floating receiver line trap the CPU in UART4_IRQHandler.
+     */
+    CLEAR_BIT(huart4.Instance->CR1,
+              USART_CR1_IDLEIE | USART_CR1_PEIE | USART_CR1_RXNEIE_RXFNEIE);
+    CLEAR_BIT(huart4.Instance->CR3, USART_CR3_EIE | USART_CR3_RXFTIE);
+}
+
 static void ClearErrors(void)
 {
     uint32_t err = HAL_UART_GetError(&huart4);
-    if (err == HAL_UART_ERROR_NONE) return;
+    uint32_t flags = huart4.Instance->ISR;
+    uint32_t error_flags = flags & (USART_ISR_PE | USART_ISR_FE |
+                                    USART_ISR_NE | USART_ISR_ORE |
+                                    USART_ISR_RTOF);
+
+    if ((err == HAL_UART_ERROR_NONE) && (error_flags == 0U)) return;
 
     __HAL_UART_CLEAR_FLAG(&huart4,
                           UART_CLEAR_OREF | UART_CLEAR_NEF |
-                          UART_CLEAR_PEF | UART_CLEAR_FEF);
+                          UART_CLEAR_PEF | UART_CLEAR_FEF |
+                          UART_CLEAR_RTOF | UART_CLEAR_IDLEF);
+    __HAL_UART_SEND_REQ(&huart4, UART_RXDATA_FLUSH_REQUEST);
     huart4.ErrorCode = HAL_UART_ERROR_NONE;
     dma_started = 0U;
     (void)HAL_UART_AbortReceive(&huart4);
@@ -58,6 +89,7 @@ static void StartRxDma(void)
     }
 
     __HAL_DMA_DISABLE_IT(huart4.hdmarx, DMA_IT_HT);
+    SuppressRxIrqSources();
     BSP_Cache_InvalidateDCache(dma_rx_buf, APP_ELRS_DMA_RX_SIZE);
     dma_started = 1U;
     rx_restarts++;
@@ -121,6 +153,7 @@ static void SendTelemetryFrame(uint8_t type, const uint8_t *payload, uint8_t pay
 void APP_ELRS_Init(void)
 {
     DRV_ELRS_Init();
+    ConfigureRxPinBias();
 
     dma_rx_pos  = 0U;
     dma_started = 0U;

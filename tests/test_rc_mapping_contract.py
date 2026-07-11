@@ -32,14 +32,14 @@ def test_controller_uses_named_rc_channels_for_references() -> None:
     assert "#define STABILIZER_RC_THROTTLE_INPUT_LOW_US  1000U" in freertos
     assert "#define STABILIZER_RC_THROTTLE_INPUT_HIGH_US 2000U" in freertos
     assert "#define STABILIZER_RC_THROTTLE_ARM_LOW_US    1100U" in freertos
-    assert "#define STABILIZER_RC_LOSS_TIMEOUT_MS  150U" in freertos
+    assert "#define STABILIZER_RC_LOSS_TIMEOUT_MS  500U" in freertos
     assert "#define STABILIZER_XY_VEL_REF_MAX_M_S  0.80f" in freertos
     assert "#define STABILIZER_XY_ACCEL_LIMIT_M_S2 1.20f" in freertos
     assert "reference.vx_m_s = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_PITCH])" in freertos
     assert "reference.vy_m_s = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_ROLL])" in freertos
     assert "reference.x_m = position_ref_x_m;" in freertos
     assert "reference.y_m = position_ref_y_m;" in freertos
-    assert "reference.z_m = stabilizer_rc_throttle_01(ch[STABILIZER_RC_CH_THROTTLE_Z])" in freertos
+    assert "reference.z_m = -stabilizer_rc_throttle_01(ch[STABILIZER_RC_CH_THROTTLE_Z])" in freertos
     assert "reference.yaw_rad = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_YAW])" in freertos
 
 
@@ -128,7 +128,7 @@ def test_ch3_is_rc_intent_with_direct_throttle_below_20_percent() -> None:
     assert "(int32_t)STABILIZER_RC_THROTTLE_INPUT_LOW_US" in freertos
     assert "int32_t value = (int32_t)ch_us - (int32_t)STABILIZER_RC_THROTTLE_INPUT_LOW_US;" in freertos
     assert "return (float)value / (float)span;" in freertos
-    assert "reference.z_m = stabilizer_rc_throttle_01(ch[STABILIZER_RC_CH_THROTTLE_Z])" in freertos
+    assert "reference.z_m = -stabilizer_rc_throttle_01(ch[STABILIZER_RC_CH_THROTTLE_Z])" in freertos
     assert "static uint16_t stabilizer_rc_throttle_to_motor_pulse(uint16_t ch_us)" in freertos
     assert "static uint8_t stabilizer_rc_use_stabilized_motor_mix(uint16_t ch_us)" in freertos
     assert "return (ch_us >= STABILIZER_RC_STABILIZE_MIN_US) ? 1U : 0U;" in freertos

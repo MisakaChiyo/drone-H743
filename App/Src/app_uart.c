@@ -3,10 +3,15 @@
 #include "app_aiwb2.h"
 #include "app_control.h"
 #include "app_elrs.h"
+#include "app_led.h"
 #include "app_maint_uart.h"
+#include "app_optical_flow.h"
+#include "app_rangefinder.h"
+#include "bsp_optical_flow.h"
+#include "bsp_rangefinder.h"
 #include "app_tasks.h"
+#include "bsp_aiwb2_power.h"
 #include "bsp_led.h"
-#include "bsp_gps.h"
 #include "bsp_uart.h"
 #include "bsp_cache.h"
 #include "drv_servo.h"
@@ -20,6 +25,7 @@
 #define APP_UART_LINE_DEBUG_ENABLED   0U
 #define APP_UART_PERIODIC_STATS_ENABLED 0U
 #define APP_UART_DISABLE_USART1       0U  /* 设为 1 释放 USART1 给烧录工具 */
+#define APP_UART_DIRECT_SERIAL_MODE   1U  /* 设为 1 绕过 WiFi 状态机，USART1 直连数传 */
 #define APP_UART_DIRECT_CONTROL_ENABLED 1U
 #define APP_UART_TX_WAIT_FOR_TRANSPARENT 1U //是否等待WIFI模块初始化
 #define APP_UART_LEGACY_ASCII_CONTROL_ENABLED 1U
@@ -369,8 +375,13 @@ void APP_UART_Task_Init(void)
 #else
     (void)boot_text;
 #endif
+#if (APP_UART_DIRECT_SERIAL_MODE == 0U)
     APP_AiWB2_Init();
+#else
+    BSP_AiWB2_SetEnabled(0U);  /* 数传模式：关闭 WiFi 模块电源 */
+#endif
     APP_Task_MaintUART_Init();
+    APP_Rangefinder_Init();
     app_uart_prepare_tx_dma();
     app_uart_start_rx_dma();
 #endif
@@ -385,6 +396,7 @@ static void app_uart_ensure_control_ready(void)
         return;
     }
 
+#if (APP_UART_DIRECT_SERIAL_MODE == 0U)
 #if (APP_UART_DIRECT_CONTROL_ENABLED == 0U)
     if ((APP_AiWB2_IsTransparent() == 0U) &&
         (APP_AiWB2_GetState() != APP_AIWB2_STATE_SOCKET_READY)) {
@@ -395,6 +407,7 @@ static void app_uart_ensure_control_ready(void)
         (APP_AiWB2_GetState() != APP_AIWB2_STATE_SOCKET_READY)) {
         return;
     }
+#endif
 #endif
 
 #if (APP_UART_BOOT_DIAG_ENABLED != 0U)
@@ -418,7 +431,6 @@ static void app_uart_ensure_control_ready(void)
 static void app_uart_handle_line(char *line, uint16_t length)
 {
     char *normalized;
-    uint8_t module_event;
 
     app_uart_report_line_debug((const uint8_t *)line, length);
     normalized = app_uart_normalize_line(line, length);
@@ -426,34 +438,47 @@ static void app_uart_handle_line(char *line, uint16_t length)
         return;
     }
 
-    module_event = APP_AiWB2_ShouldConsumeTransparentLine(normalized);
-
-    /* Sensor_Data:1/Stop: 直接到控制，不经过 AiWB2 */
-    if ((strcmp(normalized, "Sensor_Data:1") == 0) ||
-        (strcmp(normalized, "Sensor_Data:0") == 0)) {
-        app_uart_ensure_control_ready();
-        if (app_uart_control_initialized != 0U) {
-            APP_Control_ProcessLine(normalized);
-        }
-        return;
+#if (APP_UART_DIRECT_SERIAL_MODE != 0U)
+    /* 数传直连模式：所有 RX 数据直接送控制处理，不经过 WiFi 状态机 */
+    app_uart_ensure_control_ready();
+    if (app_uart_control_initialized != 0U) {
+        APP_Control_ProcessLine(normalized);
     }
+    return;
+#else
+    {
+        uint8_t module_event;
 
-#if (APP_UART_LEGACY_ASCII_CONTROL_ENABLED != 0U)
-    if (APP_AiWB2_IsControlPayload(normalized) != 0U) {
-        app_uart_ensure_control_ready();
-        if (app_uart_control_initialized != 0U) {
-            APP_Control_ProcessLine(normalized);
+        module_event = APP_AiWB2_ShouldConsumeTransparentLine(normalized);
+
+        /* Sensor_Data:1/Stop: 直接到控制，不经过 AiWB2 */
+        if ((strcmp(normalized, "Sensor_Data:1") == 0) ||
+            (strcmp(normalized, "Sensor_Data:0") == 0)) {
+            app_uart_ensure_control_ready();
+            if (app_uart_control_initialized != 0U) {
+                APP_Control_ProcessLine(normalized);
+            }
             return;
         }
-    }
+
+#if (APP_UART_LEGACY_ASCII_CONTROL_ENABLED != 0U)
+        if (APP_AiWB2_IsControlPayload(normalized) != 0U) {
+            app_uart_ensure_control_ready();
+            if (app_uart_control_initialized != 0U) {
+                APP_Control_ProcessLine(normalized);
+                return;
+            }
+        }
 #endif
 
-    if (module_event != 0U) {
-        APP_AiWB2_ProcessLine(normalized);
-        return;
-    }
+        if (module_event != 0U) {
+            APP_AiWB2_ProcessLine(normalized);
+            return;
+        }
 
-    APP_AiWB2_ProcessLine(normalized);
+        APP_AiWB2_ProcessLine(normalized);
+    }
+#endif
 }
 
 static void app_uart_process_rx_byte(uint8_t byte)
@@ -461,11 +486,13 @@ static void app_uart_process_rx_byte(uint8_t byte)
     app_uart_last_rx_byte_ms = HAL_GetTick();
     ++app_uart_rx_bytes;
 
+#if (APP_UART_DIRECT_SERIAL_MODE == 0U)
     if ((byte == (uint8_t)'>') && (app_uart_rx_used == 0U)) {
         APP_AiWB2_ProcessLine(">");
         ++app_uart_rx_lines;
         return;
     }
+#endif
 
     if ((byte == '\n') || (byte == '\r')) {
         if (app_uart_rx_used > 0U) {
@@ -574,7 +601,9 @@ static void app_uart_poll_tx(void)
 #else
     uint16_t frame_length = 0U;
     HAL_StatusTypeDef status;
+#if (APP_UART_DIRECT_SERIAL_MODE == 0U)
     uint32_t now_ms = HAL_GetTick();
+#endif
 
     app_uart_sync_tx_state();
 
@@ -585,6 +614,65 @@ static void app_uart_poll_tx(void)
     if (app_uart_control_initialized == 0U) {
         return;
     }
+
+#if (APP_UART_DIRECT_SERIAL_MODE != 0U)
+    /* 数传直连模式：跳过所有 AiWB2 socket 协议，直接 DMA 发送 */
+
+    if (app_uart_tx_busy != 0U) {
+        return;
+    }
+
+    if (app_uart_tx_pending_valid == 0U) {
+        if (osMessageQueueGet(uartTxQueueHandle, &app_uart_tx_pending_message, 0U, 0U) != osOK) {
+            return;
+        }
+        app_uart_tx_pending_valid = 1U;
+    }
+
+    if (app_uart_tx_pending_message.length == 0U) {
+        app_uart_tx_pending_valid = 0U;
+        return;
+    }
+
+    frame_length = app_uart_tx_pending_message.length;
+    if (frame_length > (uint16_t)sizeof(app_uart_tx_frame_buffer)) {
+        frame_length = (uint16_t)sizeof(app_uart_tx_frame_buffer);
+    }
+
+    memcpy(app_uart_tx_frame_buffer,
+           app_uart_tx_pending_message.text,
+           frame_length);
+
+    if (huart1.hdmatx == 0) {
+        status = BSP_UART_Transmit_USART1(app_uart_tx_frame_buffer,
+                                          frame_length,
+                                          100U);
+        if (status == HAL_OK) {
+            ++app_uart_tx_count;
+        } else {
+            ++app_uart_rx_errors;
+        }
+    } else {
+        app_uart_clean_tx_dma_buffer(frame_length);
+        status = HAL_UART_Transmit_DMA(&huart1,
+                                       app_uart_tx_frame_buffer,
+                                       frame_length);
+        if (status == HAL_OK) {
+            app_uart_tx_busy = 1U;
+            ++app_uart_tx_count;
+        } else if (status != HAL_BUSY) {
+            ++app_uart_rx_errors;
+        }
+    }
+
+    app_uart_tx_pending_valid = 0U;
+#if (APP_UART_TX_LED_ENABLED != 0U)
+    BSP_LED_On(LED_1);
+#endif
+    app_uart_tx_led_until_ms = HAL_GetTick() + APP_UART_TX_LED_PULSE_MS;
+
+#else
+    /* 原始 AiWB2 socket 发送协议 */
 
     if (app_uart_socket_tx_state == APP_UART_SOCKET_TX_WAIT_PROMPT) {
         if (APP_AiWB2_TakeSocketSendPrompt() != 0U) {
@@ -724,7 +812,8 @@ static void app_uart_poll_tx(void)
     BSP_LED_On(LED_1);
 #endif
     app_uart_tx_led_until_ms = HAL_GetTick() + APP_UART_TX_LED_PULSE_MS;
-#endif
+#endif /* APP_UART_DIRECT_SERIAL_MODE */
+#endif /* APP_UART_DISABLE_USART1 */
 }
 
 static void app_uart_sync_tx_state(void)
@@ -793,27 +882,23 @@ void APP_UART_Task_Step(void)
 
     app_uart_poll_rx();
     APP_Task_MaintUART_Step();
+    APP_Rangefinder_Step();
     now_ms = HAL_GetTick();
     app_uart_flush_idle_line(now_ms);
+#if (APP_UART_DIRECT_SERIAL_MODE == 0U)
     APP_AiWB2_Tick();
+#endif
 
-    /* PC13 LED: 初始慢闪 → 透传快闪 */
-    {
-        static uint32_t led_toggle_ms;
-        uint32_t period_ms = ((APP_AiWB2_IsTransparent() != 0U) ||
-                              (APP_AiWB2_IsSocketReady() != 0U)) ? 120U : 500U;
-
-        if ((now_ms - led_toggle_ms) >= period_ms) {
-            led_toggle_ms = now_ms;
-            BSP_LED_Toggle(LED_RED);
-        }
-    }
+    APP_OpticalFlow_ServiceRecovery();
+    APP_LED_Task_Step();
 
     app_uart_ensure_control_ready();
     if ((app_uart_control_initialized != 0U)
+#if (APP_UART_DIRECT_SERIAL_MODE == 0U)
 #if (APP_UART_DIRECT_CONTROL_ENABLED == 0U)
         && ((APP_AiWB2_IsTransparent() != 0U) ||
             (APP_AiWB2_GetState() == APP_AIWB2_STATE_SOCKET_READY))
+#endif
 #endif
        ) {
         APP_Control_Tick();
@@ -958,6 +1043,14 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         APP_ELRS_OnRxEvent(Size);
         return;
     }
+    if (huart->Instance == USART2) {
+        BSP_OPTICAL_FLOW_OnUartRxEvent(huart, Size);
+        return;
+    }
+    if (huart->Instance == UART8) {
+        BSP_Rangefinder_OnUartRxEvent(huart, Size);
+        return;
+    }
     APP_UART_OnRxEvent(huart, Size);
 }
 
@@ -976,7 +1069,7 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-    BSP_GPS_OnUartRxCplt(huart);
+    BSP_OPTICAL_FLOW_OnUartRxCplt(huart);
     APP_MaintUART_OnRxCplt(huart);
 }
 
@@ -991,6 +1084,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
         return;
     }
     APP_UART_OnError(huart);
-    BSP_GPS_OnUartError(huart);
+    BSP_OPTICAL_FLOW_OnUartError(huart);
+    BSP_Rangefinder_OnUartError(huart);
     APP_MaintUART_OnError(huart);
 }

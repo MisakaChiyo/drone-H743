@@ -56,20 +56,9 @@ def test_vofa_stream_reports_imu_rate_and_interrupt_vs_poll_counts() -> None:
     assert "msg.imu_poll_ready_count = imu_poll_ready_count;" in freertos
     assert "msg.imu_irq_sample_rate_hz  = APP_SensorRateMeter_Update(&imu_irq_rate_meter," in freertos
     assert "msg.imu_poll_sample_rate_hz = APP_SensorRateMeter_Update(&imu_poll_rate_meter," in freertos
-    assert "#define VOFA_SEND_PERIOD_MS            20U" in freertos
-    assert "#define VOFA_DATA_SIZE 63U" in freertos
-    assert "uint64_t now_us = SVC_Timestamp_Us();" in freertos
-    assert "msg.imu_age_ms = (float)(now_us - msg.base.timestamp_us) * 0.001f;" in freertos
-    assert "vofa_data[10] = (float)(now_us / 1000ULL) * 0.001f;" in freertos
-    assert "vofa_data[11] = msg.imu_irq_sample_rate_hz;" in freertos
-    assert "vofa_data[12] = msg.imu_poll_sample_rate_hz;" in freertos
-    assert "vofa_data[13] = msg.imu_age_ms;" in freertos
-    assert "vofa_data[14] = msg.attitude_debug.roll_acc_deg;" in freertos
-    assert "vofa_data[16] = msg.attitude_debug.roll_gyro_deg;" in freertos
-    assert "vofa_data[20] = msg.attitude_debug.alpha;" in freertos
-    assert "vofa_data[21] = msg.attitude_debug.dt_ms;" in freertos
-    assert "vofa_data[31] = vofa_debug.acc_nav_m_s2[0];" in freertos
-    assert "vofa_data[62] = vofa_debug.vel_loop_active;" in freertos
+    assert "#define VOFA_SEND_PERIOD_MS            25U" in freertos
+    assert "#define VOFA_DATA_SIZE 24U" in freertos
+    assert "vofa_data[4] = (float)(SVC_Timestamp_Us() / 1000ULL) * 0.001f;" in freertos
 
 
 def test_message_task_does_not_consume_sensor_sample_queue() -> None:
@@ -144,6 +133,20 @@ def test_stabilizer_uses_boot_attitude_average_as_zero_point() -> None:
     assert "attitude.roll_rad = roll_control * STABILIZER_DEG_TO_RAD;" in freertos
     assert "attitude.pitch_rad = pitch_control * STABILIZER_DEG_TO_RAD;" in freertos
     assert "attitude.yaw_rad = yaw_control * STABILIZER_DEG_TO_RAD;" in freertos
+
+
+def test_gyro_bias_calibration_restarts_when_boot_motion_is_detected() -> None:
+    header = read("App/Inc/app_sensor.h")
+    source = read("App/Src/app_sensor.c")
+
+    assert "#define APP_SENSOR_GYRO_BIAS_MAX_STATIC_DPS 5.0f" in header
+    assert "fabsf(gx) > APP_SENSOR_GYRO_BIAS_MAX_STATIC_DPS" in source
+    assert "fabsf(gy) > APP_SENSOR_GYRO_BIAS_MAX_STATIC_DPS" in source
+    assert "fabsf(gz) > APP_SENSOR_GYRO_BIAS_MAX_STATIC_DPS" in source
+    assert "cal->sum[0] = 0.0f;" in source
+    assert "cal->sum[1] = 0.0f;" in source
+    assert "cal->sum[2] = 0.0f;" in source
+    assert "cal->count = 0U;" in source
 
 
 def test_nav_gravity_compensation_uses_absolute_attitude_not_boot_zero() -> None:

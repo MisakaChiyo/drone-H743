@@ -5,6 +5,7 @@
 #include "app_sensor.h"
 #include "app_gps.h"
 #include "app_mag.h"
+#include "app_optical_flow.h"
 #include "app_uart.h"
 #include "app_maint_uart.h"
 
@@ -26,6 +27,16 @@ void APP_Task_GPS_Init(void)
 void APP_Task_GPS_Step(void)
 {
     APP_GPS_Step();
+}
+
+void APP_Task_OpticalFlow_Init(void)
+{
+    APP_OpticalFlow_Init();
+}
+
+void APP_Task_OpticalFlow_Step(void)
+{
+    APP_OpticalFlow_Step();
 }
 
 void APP_Task_MAG_Init(void)

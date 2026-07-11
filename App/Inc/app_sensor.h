@@ -158,6 +158,7 @@ void APP_Sensor_LpfApply3f(APP_Sensor_Lpf lpf[3],
 /* ════════════════════════════════════════════════════════════════════════ */
 
 #define APP_SENSOR_GYRO_BIAS_SAMPLES 1000U
+#define APP_SENSOR_GYRO_BIAS_MAX_STATIC_DPS 5.0f
 
 typedef struct {
     float   sum[3];     /* 累加和                  */
