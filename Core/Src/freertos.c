@@ -49,16 +49,19 @@
  */
 #include "app_diag.h"
 #include "app_flight_log.h"
+#include "app_led.h"
 #include "app_sensor.h"
 #include "app_messages.h"
 #include "app_tasks.h"
 #include "app_ident.h"
+#include "app_servo_cal.h"
 #include <math.h>
 #include <string.h>
 
 #include "app_vofa.h"
 #include "app_elrs.h"
 #include "app_optical_flow.h"
+#include "app_rangefinder.h"
 #include "bsp_baro.h"
 #include "bsp_imu.h"
 #include "bsp_bus_servo.h"
@@ -121,6 +124,7 @@
 #define STABILIZER_XY_ACCEL_LIMIT_M_S2 1.20f     /* 水平速度目标斜率限制 [m/s^2]         */
 #define STABILIZER_XY_POS_ERR_MAX_M    0.35f     /* 速度意图积分后的虚拟位置误差限幅 [m] */
 #define STABILIZER_Z_REF_RANGE_M       0.25f     /* CH3 单向油门/升降参考范围 0..0.25m  */
+#define STABILIZER_ALT_HOLD_CORRECTION_LIMIT_US 80 /* 激光定高公共推力最大修正 [us] */
 #define STABILIZER_RC_DEADBAND_US      20        /* RC 摇杆死区 [μs]，中位 1500±20      */
 
 /*
@@ -153,7 +157,8 @@
   (STABILIZER_RC_THROTTLE_INPUT_LOW_US + \
    (((STABILIZER_RC_THROTTLE_INPUT_HIGH_US - STABILIZER_RC_THROTTLE_INPUT_LOW_US) * \
      STABILIZER_RC_STABILIZE_MIN_PERCENT) / 100U))
-#define STABILIZER_RC_LOSS_TIMEOUT_MS  150U
+#define STABILIZER_RC_LOSS_TIMEOUT_MS  500U
+#define STABILIZER_FLIGHT_LOG_TAIL_RECORDS 125U /* 250 Hz log tail, about 500 ms */
 #define STABILIZER_USE_RC_DIRECT_TILT_SERVO 0U   /* 0=自稳定控制器, 1=CH1/CH2 直控舵机调试 */
 #define STABILIZER_RC_DIRECT_TILT_LIMIT_RAD 0.261799395f /* 遥控直控调试最大 ±15° */
 
@@ -167,7 +172,7 @@
 #define STABILIZER_SERVO_REFRESH_MS    500U      /* 强制刷新间隔 [ms]（即使脉宽未变）    */
 #define STABILIZER_SERVO_DELTA_US      3U        /* 脉宽变化死区 [μs]（小于此值不发送）  */
 #define STABILIZER_ATTITUDE_ZERO_MS 1500U        /* 上电后姿态零偏采集时长 [ms]          */
-#define VOFA_SEND_PERIOD_MS            100U       /* VOFA 姿态诊断输出周期 50ms = 20Hz */
+#define VOFA_SEND_PERIOD_MS            25U       /* 57600 数传下 24-float VOFA 约 40Hz */
 
 /* USER CODE END PD */
 
@@ -300,12 +305,45 @@ static float stabilizer_clamp_f32(float value, float lo, float hi)
 
 static uint16_t stabilizer_mix_rc_base_with_ctrl(uint16_t rc_base_us,
                                                  uint16_t ctrl_us,
-                                                 uint16_t ctrl_avg_us)
+                                                 uint16_t ctrl_avg_us,
+                                                 int16_t altitude_correction_us)
 {
   int32_t pulse_us =
-    (int32_t)rc_base_us + (int32_t)ctrl_us - (int32_t)ctrl_avg_us;
+    (int32_t)rc_base_us + (int32_t)ctrl_us - (int32_t)ctrl_avg_us +
+    (int32_t)altitude_correction_us;
 
   return stabilizer_motor_pulse_clamp(pulse_us);
+}
+
+static int16_t stabilizer_compute_altitude_correction_us(uint16_t ctrl_avg_us,
+                                                         uint8_t range_valid)
+{
+  DRV_COAX_CTRL_Params params;
+  float hover_omega_rad_s;
+  uint16_t hover_pulse_us;
+  int32_t correction_us;
+
+  if (range_valid == 0U) {
+    return 0;
+  }
+
+  DRV_COAX_CTRL_GetParams(&params);
+  if ((params.thrust_coeff_n_per_rad2 <= 0.0f) ||
+      (params.mass_kg <= 0.0f) || (params.gravity_m_s2 <= 0.0f)) {
+    return 0;
+  }
+
+  hover_omega_rad_s = sqrtf((params.mass_kg * params.gravity_m_s2) /
+                            (2.0f * params.thrust_coeff_n_per_rad2));
+  hover_pulse_us = DRV_COAX_CTRL_OmegaToMotorPulse(hover_omega_rad_s);
+  correction_us = (int32_t)ctrl_avg_us - (int32_t)hover_pulse_us;
+  if (correction_us > STABILIZER_ALT_HOLD_CORRECTION_LIMIT_US) {
+    correction_us = STABILIZER_ALT_HOLD_CORRECTION_LIMIT_US;
+  }
+  if (correction_us < -STABILIZER_ALT_HOLD_CORRECTION_LIMIT_US) {
+    correction_us = -STABILIZER_ALT_HOLD_CORRECTION_LIMIT_US;
+  }
+  return (int16_t)correction_us;
 }
 
 static uint8_t stabilizer_rc_update_armed(const uint16_t ch[CRSF_CHANNEL_COUNT],
@@ -421,6 +459,9 @@ typedef struct {
   float nav_accel_lpf_alpha;
   float nav_velocity_leak_hz;
   float vel_loop_active;
+  float range_vertical_velocity_m_s;
+  float altitude_ref_m;
+  float altitude_correction_us;
 } StabilizerVofaDebug;
 
 typedef struct {
@@ -626,7 +667,7 @@ static void stabilizer_servo_record_target(const DRV_SERVO_MoveCmd moves[2])
 osThreadId_t StabilizerHandle;
 const osThreadAttr_t Stabilizer_attributes = {
   .name = "Stabilizer",
-  .stack_size = 512 * 4,
+  .stack_size = 2048 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for SensorTask */
@@ -812,6 +853,8 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
+  APP_Task_LED_Init();
+  APP_ServoCal_Init();
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -911,6 +954,7 @@ void StabilizerTask(void *argument)
   StabilizerVofaDebug vofa_debug = {0};
   uint32_t last_ctrl_model_ms = 0U;
   uint8_t flight_log_divider = 0U;
+  uint16_t flight_log_tail_records = 0U;
 #endif
 
 #if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
@@ -1091,11 +1135,23 @@ void StabilizerTask(void *argument)
         uint8_t rc_link_seen = 0U;
         uint16_t rc_throttle_motor_us = BSP_PWM_ESC_MIN_US;
         uint8_t rc_use_stabilized_motor_mix = 0U;
+        uint8_t rc_arm_switch_high = 0U;
+        uint8_t rc_arm_throttle_low = 0U;
+        uint8_t range_height_valid = 0U;
+        float range_height_m = 0.0f;
+        float range_velocity_m_s = 0.0f;
+        uint32_t range_sample_ms = 0U;
+        int16_t altitude_correction_us = 0;
+        APP_LED_ArmBlockReason led_arm_block_reason =
+          APP_LED_ARM_BLOCK_NO_RC;
+        APP_FlightLogMotorOutputReason motor_output_reason =
+          APP_FLIGHT_LOG_MOTOR_REASON_UNKNOWN;
         float ctrl_dt_sec = (float)STABILIZER_CONTROL_PERIOD_MS * 0.001f;
 #endif
         DRV_SERVO_MoveCmd moves[2];     /* [0]=servo 1 alpha/pitch, [1]=servo 2 beta/roll */
         uint8_t imu_control_valid = 0U;
         uint8_t ident_running = 0U;
+        uint8_t servo_cal_active = 0U;
 
         last_out_ms = now;
 
@@ -1111,11 +1167,20 @@ void StabilizerTask(void *argument)
         APP_ELRS_GetChannels(ch);       /* 读取 ELRS 遥控器 16 通道             */
         rc_link_ok = APP_ELRS_IsRcFresh(now, STABILIZER_RC_LOSS_TIMEOUT_MS);
         rc_link_seen = (APP_ELRS_GetLastRcMs() != 0U) ? 1U : 0U;
+        rc_arm_switch_high =
+          (ch[STABILIZER_RC_CH_ARM] > STABILIZER_RC_ARM_THRESHOLD_US) ? 1U : 0U;
+        rc_arm_throttle_low =
+          (ch[STABILIZER_RC_CH_THROTTLE_Z] <= STABILIZER_RC_THROTTLE_ARM_LOW_US) ? 1U : 0U;
         rc_armed = stabilizer_rc_update_armed(ch, rc_link_ok);
         rc_throttle_motor_us =
           stabilizer_rc_throttle_to_motor_pulse(ch[STABILIZER_RC_CH_THROTTLE_Z]);
         rc_use_stabilized_motor_mix =
           stabilizer_rc_use_stabilized_motor_mix(ch[STABILIZER_RC_CH_THROTTLE_Z]);
+        (void)APP_ServoCal_Step(ch, rc_link_ok, rc_arm_switch_high, now);
+        servo_cal_active = APP_ServoCal_IsActive();
+        if (servo_cal_active != 0U) {
+          rc_armed = 0U;
+        }
 #endif
         BSP_AiWB2_UpdateButton();       /* 更新 WiFi 模块按键状态                */
 
@@ -1133,6 +1198,27 @@ void StabilizerTask(void *argument)
 
         APP_Ident_Update(now);
         ident_running = APP_Ident_IsRunning();
+
+#if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
+        if (rc_link_seen == 0U) {
+          led_arm_block_reason = APP_LED_ARM_BLOCK_NO_RC;
+        } else if (rc_link_ok == 0U) {
+          led_arm_block_reason = APP_LED_ARM_BLOCK_RC_LOSS;
+        } else if (rc_armed == 0U) {
+          if ((rc_arm_switch_high != 0U) && (rc_arm_throttle_low == 0U)) {
+            led_arm_block_reason = APP_LED_ARM_BLOCK_THROTTLE_HIGH;
+          } else {
+            led_arm_block_reason = APP_LED_ARM_BLOCK_ARM_SWITCH;
+          }
+        } else if ((rc_use_stabilized_motor_mix != 0U) &&
+                   (imu_control_valid == 0U) &&
+                   (ident_running == 0U)) {
+          led_arm_block_reason = APP_LED_ARM_BLOCK_IMU;
+        } else {
+          led_arm_block_reason = APP_LED_ARM_BLOCK_NONE;
+        }
+        APP_LED_SetArmStatus(rc_armed, led_arm_block_reason);
+#endif
 
         if (ident_running != 0U) {
           uint16_t ident_alpha_us;
@@ -1186,15 +1272,24 @@ void StabilizerTask(void *argument)
           ctrl_out.omega_upper = 0.0f;
           ctrl_out.omega_lower = 0.0f;
 #else
+          range_height_valid =
+            APP_Rangefinder_GetHeightSample(&range_height_m,
+                                             &range_velocity_m_s,
+                                             &range_sample_ms);
+          (void)range_sample_ms;
           attitude.roll_rad = roll_control * STABILIZER_DEG_TO_RAD;
           attitude.pitch_rad = pitch_control * STABILIZER_DEG_TO_RAD;
           attitude.yaw_rad = yaw_control * STABILIZER_DEG_TO_RAD;
           attitude.x_m = 0.0f;
           attitude.y_m = 0.0f;
-          attitude.z_m = 0.0f;
+          attitude.z_m = -range_height_m;
           attitude.vx_m_s = velocity_state_x_m_s;
           attitude.vy_m_s = velocity_state_y_m_s;
-          attitude.vz_m_s = 0.0f;
+          attitude.vz_m_s = -range_velocity_m_s;
+          if (range_height_valid == 0U) {
+            attitude.z_m = 0.0f;
+            attitude.vz_m_s = 0.0f;
+          }
           attitude.gyro_x_rad_s = msg.imu.gyro_x_dps * STABILIZER_DEG_TO_RAD;
           attitude.gyro_y_rad_s = msg.imu.gyro_y_dps * STABILIZER_DEG_TO_RAD;
           attitude.gyro_z_rad_s = msg.imu.gyro_z_dps * STABILIZER_DEG_TO_RAD;
@@ -1320,12 +1415,32 @@ void StabilizerTask(void *argument)
             reference.x_m = position_ref_x_m;
             reference.y_m = position_ref_y_m;
           }
-          reference.z_m = stabilizer_rc_throttle_01(ch[STABILIZER_RC_CH_THROTTLE_Z]) *
+          reference.z_m = -stabilizer_rc_throttle_01(ch[STABILIZER_RC_CH_THROTTLE_Z]) *
                           STABILIZER_Z_REF_RANGE_M;
+          if (range_height_valid == 0U) {
+            reference.z_m = attitude.z_m;
+          }
           reference.yaw_rad = stabilizer_rc_normalized(ch[STABILIZER_RC_CH_YAW]) *
                               STABILIZER_YAW_REF_LIMIT_RAD;
 
           DRV_COAX_CTRL_Run(&attitude, &reference, &ctrl_out);
+
+          {
+            uint16_t ctrl_upper_us =
+              DRV_COAX_CTRL_OmegaToMotorPulse(ctrl_out.omega_upper);
+            uint16_t ctrl_lower_us =
+              DRV_COAX_CTRL_OmegaToMotorPulse(ctrl_out.omega_lower);
+            uint16_t ctrl_avg_us =
+              (uint16_t)(((uint32_t)ctrl_upper_us +
+                          (uint32_t)ctrl_lower_us) / 2U);
+
+            altitude_correction_us =
+              stabilizer_compute_altitude_correction_us(ctrl_avg_us,
+                                                         range_height_valid);
+          }
+          vofa_debug.range_vertical_velocity_m_s = range_velocity_m_s;
+          vofa_debug.altitude_ref_m = -reference.z_m;
+          vofa_debug.altitude_correction_us = (float)altitude_correction_us;
 
           moves[0].pulse_us = ctrl_out.servo_alpha_us;
           moves[1].pulse_us = ctrl_out.servo_beta_us;
@@ -1367,18 +1482,24 @@ void StabilizerTask(void *argument)
           APP_Ident_Observe(&ident_obs);
         }
 
-        stabilizer_servo_record_target(moves);
+        if (servo_cal_active == 0U) {
+          stabilizer_servo_record_target(moves);
 
-        /* Send only on change, with a 500 ms forced refresh, to avoid bus flooding. */
-        if (stabilizer_servo_should_send(moves, now) != 0U) {
-          if (BSP_BusServo_MoveManyAsync(moves, 2U,
+          /* Send only on change, with a 500 ms forced refresh, to avoid bus flooding. */
+          if (stabilizer_servo_should_send(moves, now) != 0U) {
+            if (BSP_BusServo_MoveManyAsync(moves, 2U,
                                          STABILIZER_SERVO_MOVE_TIME_MS) == DRV_SERVO_OK) {
-            stabilizer_servo_commit_sent(moves, now);
+              stabilizer_servo_commit_sent(moves, now);
+            }
           }
         }
 
 #if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
-        if ((rc_link_ok != 0U) && (rc_armed != 0U)) {
+        if (servo_cal_active != 0U) {
+          BSP_PWM_SetEscPulse(1, BSP_PWM_ESC_MIN_US);
+          BSP_PWM_SetEscPulse(2, BSP_PWM_ESC_MIN_US);
+          motor_output_reason = APP_FLIGHT_LOG_MOTOR_REASON_DISARMED_MIN;
+        } else if ((rc_link_ok != 0U) && (rc_armed != 0U)) {
           if ((rc_use_stabilized_motor_mix != 0U) &&
               (ident_running == 0U) &&
               (imu_control_valid != 0U)) {
@@ -1392,27 +1513,49 @@ void StabilizerTask(void *argument)
             BSP_PWM_SetEscPulse(1,
                                 stabilizer_mix_rc_base_with_ctrl(rc_throttle_motor_us,
                                                                  ctrl_upper_us,
-                                                                 ctrl_avg_us));
+                                                                 ctrl_avg_us,
+                                                                 altitude_correction_us));
             BSP_PWM_SetEscPulse(2,
                                 stabilizer_mix_rc_base_with_ctrl(rc_throttle_motor_us,
                                                                  ctrl_lower_us,
-                                                                 ctrl_avg_us));
+                                                                 ctrl_avg_us,
+                                                                 altitude_correction_us));
+            motor_output_reason = APP_FLIGHT_LOG_MOTOR_REASON_STABILIZED_MIX;
           } else {
             BSP_PWM_SetEscPulse(1, rc_throttle_motor_us);
             BSP_PWM_SetEscPulse(2, rc_throttle_motor_us);
+            if (ident_running != 0U) {
+              motor_output_reason = APP_FLIGHT_LOG_MOTOR_REASON_IDENT_DIRECT;
+            } else if ((rc_use_stabilized_motor_mix != 0U) &&
+                       (imu_control_valid == 0U)) {
+              motor_output_reason = APP_FLIGHT_LOG_MOTOR_REASON_IMU_INVALID_DIRECT;
+            } else {
+              motor_output_reason = APP_FLIGHT_LOG_MOTOR_REASON_DIRECT_THROTTLE;
+            }
           }
         } else if ((rc_link_ok != 0U) || (rc_link_seen == 0U)) {
           BSP_PWM_SetEscPulse(1, BSP_PWM_ESC_MIN_US);
           BSP_PWM_SetEscPulse(2, BSP_PWM_ESC_MIN_US);
+          motor_output_reason = (rc_link_seen == 0U) ?
+            APP_FLIGHT_LOG_MOTOR_REASON_NO_RC_SEEN_MIN :
+            APP_FLIGHT_LOG_MOTOR_REASON_DISARMED_MIN;
         } else
 #endif
         {
           BSP_PWM_DisableEsc(1);
           BSP_PWM_DisableEsc(2);
+#if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
+          motor_output_reason = APP_FLIGHT_LOG_MOTOR_REASON_RC_LOSS_DISABLE;
+#endif
         }
 #if (STABILIZER_USE_DIRECT_ANGLE_SERVO == 0U)
         if (flight_log_divider == 0U) {
           APP_FlightLogSnapshot flog_snapshot;
+          uint8_t flight_log_active =
+            ((rc_link_ok != 0U) &&
+             (rc_armed != 0U) &&
+             (rc_use_stabilized_motor_mix != 0U)) ? 1U : 0U;
+          uint8_t flight_log_should_record = flight_log_active;
 
           memset(&flog_snapshot, 0, sizeof(flog_snapshot));
           flog_snapshot.timestamp_us = msg.base.timestamp_us;
@@ -1435,6 +1578,14 @@ void StabilizerTask(void *argument)
           flog_snapshot.rc_link_ok = rc_link_ok;
           flog_snapshot.throttle_over_20 = rc_use_stabilized_motor_mix;
           flog_snapshot.imu_valid = imu_control_valid;
+          flog_snapshot.motor_output_reason = (uint8_t)motor_output_reason;
+          flog_snapshot.rc_link_seen = rc_link_seen;
+          flog_snapshot.arm_switch_high = rc_arm_switch_high;
+          flog_snapshot.arm_throttle_low = rc_arm_throttle_low;
+          flog_snapshot.arm_switch_seen_low = stabilizer_rc_switch_seen_low;
+          flog_snapshot.arm_switch_prev_high = stabilizer_rc_switch_prev_high;
+          flog_snapshot.imu_fault_latched = stabilizer_imu_fault_latched;
+          flog_snapshot.imu_fault_reason = (uint8_t)stabilizer_imu_fault_reason;
           memcpy(flog_snapshot.acc_nav_m_s2,
                  vofa_debug.acc_nav_m_s2,
                  sizeof(flog_snapshot.acc_nav_m_s2));
@@ -1465,16 +1616,15 @@ void StabilizerTask(void *argument)
             stabilizer_rc_throttle_01(ch[STABILIZER_RC_CH_THROTTLE_Z]) *
             STABILIZER_Z_REF_RANGE_M;
 
-          APP_FlightLog_Observe(&flog_snapshot,
-                                ((rc_link_ok != 0U) &&
-                                 (rc_armed != 0U) &&
-                                 (rc_use_stabilized_motor_mix != 0U)) ? 1U : 0U);
-        } else {
-          if ((rc_link_ok == 0U) ||
-              (rc_armed == 0U) ||
-              (rc_use_stabilized_motor_mix == 0U)) {
-            APP_FlightLog_Observe(NULL, 0U);
+          if (flight_log_active != 0U) {
+            flight_log_tail_records = STABILIZER_FLIGHT_LOG_TAIL_RECORDS;
+          } else if (flight_log_tail_records > 0U) {
+            flight_log_tail_records--;
+            flight_log_should_record = 1U;
           }
+
+          APP_FlightLog_Observe(flight_log_should_record ? &flog_snapshot : NULL,
+                                flight_log_should_record);
         }
         flight_log_divider ^= 1U;
 #endif
@@ -1847,39 +1997,21 @@ void BackgroundTask(void *argument)
   *   从 vofaLogQueue 取出姿态/传感器数据，按固定格式打包后
   *   通过 WiFi 透传发送到 VOFA 上位机进行实时可视化。
   *
-  * 发送数据帧（22 个 float，88 字节）：
+  * 发送数据帧（24 个 float，96 字节 + 4 字节帧尾）：
   *   [0]  roll      横滚角 [°]
   *   [1]  pitch     俯仰角 [°]
   *   [2]  yaw       偏航角 [°]
-  *   [3]  altitude  相对高度 [m]（基于气压计 + 地面气压基准）
-  *   [4]  ax        加速度 X [g]
-  *   [5]  ay        加速度 Y [g]
-  *   [6]  az        加速度 Z [g]
-  *   [7]  gx        陀螺仪 X [dps]
-  *   [8]  gy        陀螺仪 Y [dps]
-  *   [9]  gz        陀螺仪 Z [dps]
-  *   [10] time      时间戳 [s]
-  *   [11] imu_irq_hz  IMU 中断触发采样 Hz
-  *   [12] imu_poll_hz IMU ready 轮询兜底 Hz
-  *   [13] imu_age_ms  当前 VOFA 帧使用的 IMU 样本年龄 [ms]
-  *   [14] roll_acc    加速度瞬时 roll [deg]
-  *   [15] pitch_acc   加速度瞬时 pitch [deg]
-  *   [16] roll_gyro   本帧陀螺积分预测 roll [deg]
-  *   [17] pitch_gyro  本帧陀螺积分预测 pitch [deg]
-  *   [18] roll_res    roll_acc - roll_gyro [deg]
-  *   [19] pitch_res   pitch_acc - pitch_gyro [deg]
-  *   [20] cf_alpha    互补滤波陀螺权重
-  *   [21] att_dt_ms   姿态更新 dt [ms]
-  *
-  * 高度计算：
-  *   开机后前 50 帧（≈1 秒 @ 50Hz）累积气压计数据求均值
-  *   作为地面基准气压 p0，之后用标准气压高度公式实时计算。
-  *   气压值有效性检查：10kPa < p < 110kPa（排除传感器异常值）。
+  *   [3]  range_height 激光滤波高度 [m]，测距无效时为 0
+  *   [4]  time       时间戳 [s]
+  *   [5]  vel_est_x  融合后的 X 速度估计 [m/s]
+  *   [6]  vel_est_y  融合后的 Y 速度估计 [m/s]
+  *   [7..14]  姿态/位置控制参数滑块反馈
+  *   [15..23] 速度环参数滑块反馈
   *
   * vofaStreamActive 标志可由上位机远程控制，方便暂停 / 恢复数据流。
   *
   * 优先级 Low：可视化数据允许延迟或丢帧，不影响飞行安全。
-  * 周期 50Hz（osDelay(20)）：匹配 WiFi 透传模式的分包策略。
+  * 周期 40Hz（osDelay(25)）：100 字节帧约占 4000 B/s，保留命令响应余量。
   */
 /* USER CODE END Header_VOFA_task */
 void VOFA_task(void *argument)
@@ -1887,14 +2019,10 @@ void VOFA_task(void *argument)
   /* USER CODE BEGIN VOFA_task */
 
   APP_Sensor_SampleMessage msg;
-  #define VOFA_DATA_SIZE 63U
+  #define VOFA_DATA_SIZE 24U
   float vofa_data[VOFA_DATA_SIZE];
   StabilizerVofaDebug vofa_debug;
-
-  /* 地面气压平均 */
-  #define VOFA_P0_SAMPLES 50U
-  float  p0_sum = 0.0f;
-  uint32_t p0_cnt = 0U;
+  APP_RangefinderStatus range_status;
 
   for(;;)
   {
@@ -1913,100 +2041,39 @@ void VOFA_task(void *argument)
     if (osMessageQueueGet(vofaLogQueueHandle, &msg, 0U, 0U) == osOK) {
       /* ---- 组装 VOFA 数据帧 ---- */
 
-      /* 姿态角 */
-      vofa_data[0] = msg.roll_deg;             /* 横滚  °   */
-      vofa_data[1] = msg.pitch_deg;            /* 俯仰  °   */
-      vofa_data[2] = msg.yaw_deg;              /* 偏航  °   */
+      APP_Rangefinder_GetStatus(&range_status);
 
-      /*
-       * 高度：开机前 VOFA_P0_SAMPLES 帧做地面气压平均
-       * 气压值范围检查：10kPa ~ 110kPa（正常大气范围）
-       * 使用标准气压高度公式：h = 44330 × (1 - (p/p0)^0.190295)
-       */
-      if (p0_cnt < VOFA_P0_SAMPLES) {
-        if (msg.baro_pressure_pa > 10000.0f && msg.baro_pressure_pa < 110000.0f) {
-          p0_sum += msg.baro_pressure_pa;
-          p0_cnt++;
-        }
-        vofa_data[3] = 0.0f;
-      } else {
-        float p0 = p0_sum / (float)VOFA_P0_SAMPLES;
-        float ratio = msg.baro_pressure_pa / p0;
-        if (ratio > 0.0f) {
-          vofa_data[3] = 44330.0f * (1.0f - powf(ratio, 0.190295f));
-        } else {
-          vofa_data[3] = 0.0f;
-        }
-      }
-
-      /* 加速度原始值 [g] */
-      vofa_data[4] = msg.imu.accel_x_g;
-      vofa_data[5] = msg.imu.accel_y_g;
-      vofa_data[6] = msg.imu.accel_z_g;
-
-      /* 陀螺仪原始值 [dps]（已减零偏 + 低通滤波） */
-      vofa_data[7] = msg.imu.gyro_x_dps;
-      vofa_data[8] = msg.imu.gyro_y_dps;
-      vofa_data[9] = msg.imu.gyro_z_dps;
-
-      /* 时间戳 [s]（微秒硬件计数器 → 秒） */
-      uint64_t now_us = SVC_Timestamp_Us();
-      msg.imu_age_ms = (float)(now_us - msg.base.timestamp_us) * 0.001f;
-      vofa_data[10] = (float)(now_us / 1000ULL) * 0.001f;
-      vofa_data[11] = msg.imu_irq_sample_rate_hz;
-      vofa_data[12] = msg.imu_poll_sample_rate_hz;
-      vofa_data[13] = msg.imu_age_ms;
-      vofa_data[14] = msg.attitude_debug.roll_acc_deg;
-      vofa_data[15] = msg.attitude_debug.pitch_acc_deg;
-      vofa_data[16] = msg.attitude_debug.roll_gyro_deg;
-      vofa_data[17] = msg.attitude_debug.pitch_gyro_deg;
-      vofa_data[18] = msg.attitude_debug.roll_residual_deg;
-      vofa_data[19] = msg.attitude_debug.pitch_residual_deg;
-      vofa_data[20] = msg.attitude_debug.alpha;
-      vofa_data[21] = msg.attitude_debug.dt_ms;
-      (void)DRV_COAX_CTRL_GetParam("coax.roll_rate_kd", &vofa_data[22]);
-      (void)DRV_COAX_CTRL_GetParam("coax.pitch_rate_kd", &vofa_data[23]);
-      (void)DRV_COAX_CTRL_GetParam("coax.yaw_angle_kp", &vofa_data[24]);
-      (void)DRV_COAX_CTRL_GetParam("coax.yaw_rate_kd", &vofa_data[25]);
-      (void)DRV_COAX_CTRL_GetParam("coax.vel_x_kd", &vofa_data[26]);
-      (void)DRV_COAX_CTRL_GetParam("coax.vel_y_kd", &vofa_data[27]);
-      (void)DRV_COAX_CTRL_GetParam("coax.vel_z_kd", &vofa_data[28]);
-      (void)DRV_COAX_CTRL_GetParam("coax.accel_xy_limit_m_s2", &vofa_data[29]);
-      (void)DRV_COAX_CTRL_GetParam("coax.accel_z_limit_m_s2", &vofa_data[30]);
       stabilizer_vofa_debug_read(&vofa_debug);
-      vofa_data[31] = vofa_debug.acc_nav_m_s2[0];
-      vofa_data[32] = vofa_debug.acc_nav_m_s2[1];
-      vofa_data[33] = vofa_debug.acc_nav_m_s2[2];
-      vofa_data[34] = vofa_debug.vel_est_m_s[0];
-      vofa_data[35] = vofa_debug.vel_est_m_s[1];
-      vofa_data[36] = vofa_debug.vel_ref_m_s[0];
-      vofa_data[37] = vofa_debug.vel_ref_m_s[1];
-      vofa_data[38] = vofa_debug.vel_err_m_s[0];
-      vofa_data[39] = vofa_debug.vel_err_m_s[1];
-      vofa_data[40] = vofa_debug.vel_pid_out_m_s2[0];
-      vofa_data[41] = vofa_debug.vel_pid_out_m_s2[1];
-      vofa_data[42] = vofa_debug.vel_pid_p_m_s2[0];
-      vofa_data[43] = vofa_debug.vel_pid_i_m_s2[0];
-      vofa_data[44] = vofa_debug.vel_pid_d_m_s2[0];
-      vofa_data[45] = vofa_debug.vel_pid_p_m_s2[1];
-      vofa_data[46] = vofa_debug.vel_pid_i_m_s2[1];
-      vofa_data[47] = vofa_debug.vel_pid_d_m_s2[1];
-      vofa_data[48] = vofa_debug.servo_alpha_us;
-      vofa_data[49] = vofa_debug.servo_beta_us;
-      vofa_data[50] = vofa_debug.motor_upper_us;
-      vofa_data[51] = vofa_debug.motor_lower_us;
-      vofa_data[52] = vofa_debug.vel_loop_x_kp;
-      vofa_data[53] = vofa_debug.vel_loop_x_ki;
-      vofa_data[54] = vofa_debug.vel_loop_x_kd;
-      vofa_data[55] = vofa_debug.vel_loop_y_kp;
-      vofa_data[56] = vofa_debug.vel_loop_y_ki;
-      vofa_data[57] = vofa_debug.vel_loop_y_kd;
-      vofa_data[58] = vofa_debug.vel_loop_output_limit_m_s2;
-      vofa_data[59] = vofa_debug.vel_loop_i_limit_m_s2;
-      vofa_data[60] = vofa_debug.nav_accel_lpf_alpha;
-      vofa_data[61] = vofa_debug.nav_velocity_leak_hz;
-      vofa_data[62] = vofa_debug.vel_loop_active;
-      /* 63 floats + VOFA tail = 256 bytes, matching APP_UART_TX_TEXT_SIZE. */
+
+      vofa_data[0] = msg.roll_deg;
+      vofa_data[1] = msg.pitch_deg;
+      vofa_data[2] = msg.yaw_deg;
+
+      /* 激光测距高度 [m]；失效或超时立即输出 0，避免保留陈旧值。 */
+      vofa_data[3] = (range_status.valid != 0U) ?
+                     range_status.height_m : 0.0f;
+
+      vofa_data[4] = (float)(SVC_Timestamp_Us() / 1000ULL) * 0.001f;
+      vofa_data[5] = vofa_debug.vel_est_m_s[0];
+      vofa_data[6] = vofa_debug.vel_est_m_s[1];
+      (void)DRV_COAX_CTRL_GetParam("coax.roll_rate_kd", &vofa_data[7]);
+      (void)DRV_COAX_CTRL_GetParam("coax.pitch_rate_kd", &vofa_data[8]);
+      (void)DRV_COAX_CTRL_GetParam("coax.yaw_angle_kp", &vofa_data[9]);
+      (void)DRV_COAX_CTRL_GetParam("coax.yaw_rate_kd", &vofa_data[10]);
+      (void)DRV_COAX_CTRL_GetParam("coax.vel_x_kd", &vofa_data[11]);
+      (void)DRV_COAX_CTRL_GetParam("coax.vel_y_kd", &vofa_data[12]);
+      (void)DRV_COAX_CTRL_GetParam("coax.accel_xy_limit_m_s2", &vofa_data[13]);
+      (void)DRV_COAX_CTRL_GetParam("coax.accel_z_limit_m_s2", &vofa_data[14]);
+      (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_x_kp", &vofa_data[15]);
+      (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_y_kp", &vofa_data[16]);
+      (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_output_limit_m_s2", &vofa_data[17]);
+      (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_x_ki", &vofa_data[18]);
+      (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_y_ki", &vofa_data[19]);
+      (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_i_limit_m_s2", &vofa_data[20]);
+      (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_x_kd", &vofa_data[21]);
+      (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_y_kd", &vofa_data[22]);
+      (void)DRV_COAX_CTRL_GetParam("coax.vel_loop_enable", &vofa_data[23]);
+      /* 24 floats + VOFA tail = 100 bytes. */
       APP_VOFA_SendFloats(vofa_data, VOFA_DATA_SIZE);
     }
   }

@@ -25,6 +25,17 @@ typedef enum {
     APP_FLIGHT_LOG_CMD_ERROR,
 } APP_FlightLogCommandStatus;
 
+typedef enum {
+    APP_FLIGHT_LOG_MOTOR_REASON_UNKNOWN = 0,
+    APP_FLIGHT_LOG_MOTOR_REASON_STABILIZED_MIX = 1,
+    APP_FLIGHT_LOG_MOTOR_REASON_DIRECT_THROTTLE = 2,
+    APP_FLIGHT_LOG_MOTOR_REASON_DISARMED_MIN = 3,
+    APP_FLIGHT_LOG_MOTOR_REASON_NO_RC_SEEN_MIN = 4,
+    APP_FLIGHT_LOG_MOTOR_REASON_RC_LOSS_DISABLE = 5,
+    APP_FLIGHT_LOG_MOTOR_REASON_IDENT_DIRECT = 6,
+    APP_FLIGHT_LOG_MOTOR_REASON_IMU_INVALID_DIRECT = 7,
+} APP_FlightLogMotorOutputReason;
+
 typedef struct {
     uint64_t timestamp_us;
     uint32_t tick_ms;
@@ -44,6 +55,14 @@ typedef struct {
     uint8_t rc_link_ok;
     uint8_t throttle_over_20;
     uint8_t imu_valid;
+    uint8_t motor_output_reason;
+    uint8_t rc_link_seen;
+    uint8_t arm_switch_high;
+    uint8_t arm_throttle_low;
+    uint8_t arm_switch_seen_low;
+    uint8_t arm_switch_prev_high;
+    uint8_t imu_fault_latched;
+    uint8_t imu_fault_reason;
     float acc_nav_m_s2[3];
     float vel_est_m_s[3];
     float vel_ref_m_s[2];
@@ -82,6 +101,7 @@ void APP_FlightLog_Observe(const APP_FlightLogSnapshot *snapshot,
 void APP_FlightLog_GetStatus(APP_FlightLogStatus *status);
 APP_FlightLogCommandStatus APP_FlightLog_StartDump(void);
 APP_FlightLogCommandStatus APP_FlightLog_CancelDump(void);
+APP_FlightLogCommandStatus APP_FlightLog_TestFill(uint32_t sectors);
 uint8_t APP_FlightLog_IsExportActive(void);
 const char *APP_FlightLog_CommandStatusText(APP_FlightLogCommandStatus status);
 

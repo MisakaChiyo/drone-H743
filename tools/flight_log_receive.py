@@ -40,7 +40,19 @@ SECTOR_MAGIC = 0x31534C46
 RECORD_MAGIC = 0x31524C46
 EXPORT_BLOCK_MAGIC = 0x31424C46
 EXPORT_BLOCK_LAST = 0x0001
+EXPORT_PAYLOAD_MAX = 48
 TEXT_LOG_PREFIXES = ("FLOG ", "OK ", "ERR ", "BOOT ")
+
+MOTOR_REASON_NAMES = {
+    0: "unknown",
+    1: "stabilized_mix",
+    2: "direct_throttle",
+    3: "disarmed_min",
+    4: "no_rc_seen_min",
+    5: "rc_loss_disable",
+    6: "ident_direct",
+    7: "imu_invalid_direct",
+}
 
 PARAM_NAMES = [
     "pos_x_kp",
@@ -83,7 +95,8 @@ PARAM_NAMES = [
 SECTOR_HEADER_PREFIX = struct.Struct("<IHHIIIIIIIIQII")
 PARAMS_STRUCT = struct.Struct("<" + "f" * len(PARAM_NAMES))
 EXPORT_HEADER = struct.Struct("<IHHIIHHI")
-RECORD_STRUCT = struct.Struct("<IHHIIQII" + "h" * 7 + "f" * 7 + "f" * 3 + "H" * 8 + "H" * 5 + "B" * 4 + "f" * 41 + "I")
+EXPORT_BLOCK_MAGIC_BYTES = struct.pack("<I", EXPORT_BLOCK_MAGIC)
+RECORD_STRUCT = struct.Struct("<IHHIIQII" + "h" * 7 + "f" * 7 + "f" * 3 + "H" * 8 + "H" * 5 + "B" * 12 + "f" * 41 + "I")
 RECORD_SIZE = RECORD_STRUCT.size
 
 
@@ -136,6 +149,9 @@ class ReceiveResult:
     records: int
     sectors: int
     errors: list[str] = field(default_factory=list)
+    good_bytes: int = 0
+    missing_bytes: int = 0
+    complete: bool = False
 
 
 def crc32(data: bytes) -> int:
@@ -146,6 +162,18 @@ def crc32(data: bytes) -> int:
             mask = -(crc & 1) & 0xFFFFFFFF
             crc = ((crc >> 1) ^ (0xEDB88320 & mask)) & 0xFFFFFFFF
     return (~crc) & 0xFFFFFFFF
+
+
+def whiten_byte(offset: int) -> int:
+    x = (offset + 0xA5A5A5A5) & 0xFFFFFFFF
+    x ^= x >> 7
+    x = (x * 0x045D9F3B) & 0xFFFFFFFF
+    x ^= x >> 11
+    return x & 0xFF | 0x01
+
+
+def xor_whiten(data: bytes, offset: int) -> bytes:
+    return bytes(byte ^ whiten_byte(offset + index) for index, byte in enumerate(data))
 
 
 def parse_key_values(line: str) -> dict[str, str]:
@@ -211,6 +239,7 @@ def read_until_end(
     received: int,
     expected_total: int,
     log: callable | None = None,
+    require_counts: bool = True,
 ) -> ExportEnd:
     while True:
         line = port.readline()
@@ -227,7 +256,7 @@ def read_until_end(
             end = parse_end_line(end_line)
             if end.reason != "done":
                 raise FlightLogError(f"export ended with reason={end.reason or 'unknown'}")
-            if end.sent != received or end.total != expected_total:
+            if require_counts and (end.sent != received or end.total != expected_total):
                 raise FlightLogError(
                     f"export end mismatch sent={end.sent} total={end.total} "
                     f"received={received} expected={expected_total}"
@@ -257,11 +286,120 @@ def read_export_block(port: BinaryIO) -> ExportBlock:
         raise FlightLogError(f"bad block magic 0x{magic:08X}")
     if version != 1 or header_size != EXPORT_HEADER.size:
         raise FlightLogError("unsupported export block version/header")
+    if length > EXPORT_PAYLOAD_MAX:
+        raise FlightLogError(f"bad block length {length}")
     payload = read_exact(port, length)
     actual_crc = crc32(payload)
     if actual_crc != payload_crc:
         raise FlightLogError(f"crc mismatch at block {seq}: 0x{actual_crc:08X} != 0x{payload_crc:08X}")
     return ExportBlock(seq=seq, offset=offset, payload=payload, flags=flags, crc32=payload_crc)
+
+
+def parse_export_block_line(line: str) -> ExportBlock:
+    if not line.startswith("FLOG BLK"):
+        raise FlightLogError(f"expected FLOG BLK, got {line!r}")
+    fields = parse_key_values(line)
+    try:
+        seq = int(fields["seq"], 0)
+        offset = int(fields["offset"], 0)
+        length = int(fields["len"], 0)
+        flags = int(fields["flags"], 0)
+        payload_crc = int(fields["crc"], 16)
+        payload = xor_whiten(bytes.fromhex(fields["data"]), offset)
+    except (KeyError, ValueError) as exc:
+        raise FlightLogError(f"bad FLOG BLK line: {line!r}") from exc
+    if length > EXPORT_PAYLOAD_MAX:
+        raise FlightLogError(f"bad FLOG BLK length {length}")
+    if len(payload) != length:
+        raise FlightLogError(f"FLOG BLK length mismatch seq={seq}")
+    actual_crc = crc32(payload)
+    if actual_crc != payload_crc:
+        raise FlightLogError(
+            f"crc mismatch at block {seq}: 0x{actual_crc:08X} != 0x{payload_crc:08X}"
+        )
+    return ExportBlock(seq=seq, offset=offset, payload=payload, flags=flags, crc32=payload_crc)
+
+
+def read_export_item_resync(
+    port: BinaryIO,
+    errors: list[str],
+    log: callable | None = None,
+) -> ExportBlock | ExportEnd:
+    line = bytearray()
+    magic_window = bytearray()
+
+    while True:
+        byte = port.read(1)
+        if not byte:
+            raise FlightLogError("timeout waiting for export block")
+
+        line.extend(byte)
+        magic_window.extend(byte)
+        if len(magic_window) > len(EXPORT_BLOCK_MAGIC_BYTES):
+            del magic_window[0 : len(magic_window) - len(EXPORT_BLOCK_MAGIC_BYTES)]
+
+        if bytes(magic_window) == EXPORT_BLOCK_MAGIC_BYTES:
+            header_tail = read_exact(port, EXPORT_HEADER.size - len(EXPORT_BLOCK_MAGIC_BYTES))
+            header_bytes = EXPORT_BLOCK_MAGIC_BYTES + header_tail
+            magic, version, header_size, seq, offset, length, flags, payload_crc = EXPORT_HEADER.unpack(header_bytes)
+            line.clear()
+            magic_window.clear()
+
+            if magic != EXPORT_BLOCK_MAGIC:
+                errors.append(f"resync skipped bad block magic 0x{magic:08X}")
+                continue
+            if version != 1 or header_size != EXPORT_HEADER.size:
+                errors.append(
+                    f"resync skipped bad block header seq={seq} version={version} header_size={header_size}"
+                )
+                continue
+            if length > EXPORT_PAYLOAD_MAX:
+                errors.append(f"resync skipped bad block length seq={seq} length={length}")
+                continue
+
+            payload = read_exact(port, length)
+            actual_crc = crc32(payload)
+            if actual_crc != payload_crc:
+                errors.append(
+                    f"crc mismatch at block {seq} offset={offset}: "
+                    f"0x{actual_crc:08X} != 0x{payload_crc:08X}"
+                )
+                continue
+
+            return ExportBlock(seq=seq, offset=offset, payload=payload, flags=flags, crc32=payload_crc)
+
+        if byte == b"\n":
+            text = line.decode("ascii", errors="replace").strip()
+            line.clear()
+            magic_window.clear()
+            if not text:
+                continue
+            error_line = find_status_line(text, "FLOG ERROR")
+            if error_line is not None:
+                log_text_line(log, error_line)
+                raise FlightLogError(error_line)
+            end_line = find_status_line(text, "FLOG END")
+            if end_line is not None:
+                log_text_line(log, end_line)
+                return parse_end_line(end_line)
+            block_line = find_status_line(text, "FLOG BLK")
+            if block_line is not None:
+                try:
+                    return parse_export_block_line(block_line)
+                except FlightLogError as exc:
+                    errors.append(str(exc))
+                    continue
+            begin_line = find_status_line(text, "FLOG BEGIN")
+            if begin_line is not None:
+                errors.append("skipped duplicate FLOG BEGIN while waiting for binary block")
+                log_text_line(log, begin_line)
+                continue
+            log_text_line(log, text)
+            continue
+
+        if len(line) > 512:
+            errors.append(f"discarded {len(line)} bytes while resyncing export stream")
+            line.clear()
 
 
 def parse_sector_header(data: bytes, offset: int) -> dict[str, object] | None:
@@ -331,9 +469,25 @@ def parse_record(record_bytes: bytes) -> dict[str, object] | None:
     for name in ("throttle_us", "servo_alpha_us", "servo_beta_us", "motor_upper_us", "motor_lower_us"):
         row[name] = values[i]
         i += 1
-    for name in ("rc_armed", "rc_link_ok", "throttle_over_20", "imu_valid"):
+    for name in (
+        "rc_armed",
+        "rc_link_ok",
+        "throttle_over_20",
+        "imu_valid",
+        "motor_output_reason",
+        "rc_link_seen",
+        "arm_switch_high",
+        "arm_throttle_low",
+        "arm_switch_seen_low",
+        "arm_switch_prev_high",
+        "imu_fault_latched",
+        "imu_fault_reason",
+    ):
         row[name] = values[i]
         i += 1
+    row["motor_output_reason_name"] = MOTOR_REASON_NAMES.get(
+        int(row["motor_output_reason"]), "unknown"
+    )
     for prefix, count in (
         ("acc_nav_m_s2", 3),
         ("vel_est_m_s", 3),
@@ -406,6 +560,30 @@ def parse_flash_image(data: bytes) -> tuple[list[dict[str, object]], list[dict[s
     return sectors, records, errors
 
 
+def mark_range(coverage: bytearray, start: int, length: int) -> int:
+    end = min(start + length, len(coverage))
+    newly_seen = 0
+    for index in range(start, end):
+        if coverage[index] == 0:
+            coverage[index] = 1
+            newly_seen += 1
+    return newly_seen
+
+
+def missing_ranges(coverage: bytearray) -> list[dict[str, int]]:
+    ranges: list[dict[str, int]] = []
+    index = 0
+    while index < len(coverage):
+        if coverage[index] != 0:
+            index += 1
+            continue
+        start = index
+        while index < len(coverage) and coverage[index] == 0:
+            index += 1
+        ranges.append({"offset": start, "length": index - start})
+    return ranges
+
+
 def write_csv(path: Path, records: list[dict[str, object]]) -> None:
     if records:
         fieldnames = list(records[0].keys())
@@ -441,42 +619,65 @@ def receive_dump(
 
     begin = read_until_begin(port, log)
     total = begin.total
-    received = 0
+    image = bytearray(b"\xFF" * total)
+    coverage = bytearray(total)
+    good_bytes = 0
     blocks = 0
-    expected_seq = 0
+    last_seq: int | None = None
+    end: ExportEnd | None = None
     errors: list[str] = []
 
-    with bin_path.open("wb") as f:
-        while received < total:
+    try:
+        while end is None:
             if should_cancel is not None and should_cancel():
                 port.write(b"FLOG CANCEL\r\n")
                 raise FlightLogError("cancelled")
-            block = read_export_block(port)
-            if block.seq != expected_seq:
-                raise FlightLogError(f"unexpected block seq {block.seq}, expected {expected_seq}")
-            if block.offset != received:
-                raise FlightLogError(f"unexpected block offset {block.offset}, expected {received}")
-            f.write(block.payload)
-            received += len(block.payload)
-            blocks += 1
-            expected_seq += 1
-            if progress:
-                progress(received, total)
-            if block.flags & EXPORT_BLOCK_LAST:
+
+            item = read_export_item_resync(port, errors, log)
+            if isinstance(item, ExportEnd):
+                end = item
                 break
 
-    if received != total:
-        raise FlightLogError(f"incomplete export: received {received} of {total} bytes")
+            block = item
+            if last_seq is not None and block.seq != (last_seq + 1):
+                errors.append(f"block seq gap: got {block.seq}, expected {last_seq + 1}")
+            last_seq = block.seq
 
-    end = read_until_end(port, received, total, log)
-    image = bin_path.read_bytes()
+            block_end = block.offset + len(block.payload)
+            if block.offset >= total or block_end > total:
+                errors.append(
+                    f"skipped out-of-range block seq={block.seq} "
+                    f"offset={block.offset} length={len(block.payload)} total={total}"
+                )
+                continue
+
+            image[block.offset:block_end] = block.payload
+            good_bytes += mark_range(coverage, block.offset, len(block.payload))
+            blocks += 1
+            if progress:
+                progress(good_bytes, total)
+            if block.flags & EXPORT_BLOCK_LAST:
+                end = read_until_end(port, good_bytes, total, log, require_counts=False)
+                break
+    except FlightLogError as exc:
+        errors.append(str(exc))
+        if blocks == 0:
+            raise
+
+    bin_path.write_bytes(bytes(image))
+    missing = missing_ranges(coverage)
     sectors, records, parse_errors = parse_flash_image(image)
     errors.extend(parse_errors)
     write_csv(csv_path, records)
+    complete = (end is not None) and (good_bytes == total) and (len(missing) == 0)
     meta = {
         "begin": begin.fields,
-        "end": end.fields,
-        "total_bytes": received,
+        "end": end.fields if end is not None else None,
+        "complete": complete,
+        "total_bytes": total,
+        "good_bytes": good_bytes,
+        "missing_bytes": total - good_bytes,
+        "missing_ranges": missing,
         "blocks": blocks,
         "sectors": sectors,
         "record_count": len(records),
@@ -488,8 +689,26 @@ def receive_dump(
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if log:
-        log(f"saved {bin_path.name}, {csv_path.name}, {meta_path.name}")
-    return ReceiveResult(bin_path, csv_path, meta_path, received, blocks, len(records), len(sectors), errors)
+        if complete:
+            log(f"saved {bin_path.name}, {csv_path.name}, {meta_path.name}")
+        else:
+            log(
+                f"saved partial {bin_path.name}, {csv_path.name}, {meta_path.name} "
+                f"good={good_bytes}/{total}"
+            )
+    return ReceiveResult(
+        bin_path,
+        csv_path,
+        meta_path,
+        total,
+        blocks,
+        len(records),
+        len(sectors),
+        errors,
+        good_bytes=good_bytes,
+        missing_bytes=total - good_bytes,
+        complete=complete,
+    )
 
 
 class FlightLogGui:

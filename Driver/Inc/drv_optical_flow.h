@@ -81,6 +81,7 @@ typedef struct {
     uint8_t config_ab_ok;
     uint8_t config_missing_table;
     uint8_t config_ab_response[3];
+    uint8_t config_bb_response[3];
     uint32_t config_errors;
     uint32_t config_last_error;
     uint32_t config_last_hal_status;

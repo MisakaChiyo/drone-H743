@@ -18,7 +18,7 @@
 #define APP_FLIGHT_LOG_SECTOR_MAGIC       0x31534C46UL /* FLS1 */
 #define APP_FLIGHT_LOG_RECORD_MAGIC       0x31524C46UL /* FLR1 */
 #define APP_FLIGHT_LOG_EXPORT_BLOCK_MAGIC 0x31424C46UL /* FLB1 */
-#define APP_FLIGHT_LOG_VERSION            1U
+#define APP_FLIGHT_LOG_VERSION            2U
 #define APP_FLIGHT_LOG_EXPORT_VERSION     1U
 #define APP_FLIGHT_LOG_REGION_SIZE \
     (APP_FLIGHT_LOG_REGION_END_EXCL - APP_FLIGHT_LOG_REGION_START)
@@ -26,8 +26,10 @@
     (APP_FLIGHT_LOG_REGION_SIZE / APP_FLASH_SERVICE_SECTOR_SIZE)
 #define APP_FLIGHT_LOG_QUEUE_CAPACITY     32U
 #define APP_FLIGHT_LOG_WRITE_BATCH_RECORDS 4U
-#define APP_FLIGHT_LOG_EXPORT_PAYLOAD_MAX 224U
+#define APP_FLIGHT_LOG_EXPORT_PAYLOAD_MAX 48U
 #define APP_FLIGHT_LOG_EXPORT_FLAG_LAST   0x0001U
+#define APP_FLIGHT_LOG_TESTFILL_MAX_SECTORS 64U
+#define APP_FLIGHT_LOG_EXPORT_BLOCK_GAP_MS 40U
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -72,6 +74,14 @@ typedef struct __attribute__((packed)) {
     uint8_t rc_link_ok;
     uint8_t throttle_over_20;
     uint8_t imu_valid;
+    uint8_t motor_output_reason;
+    uint8_t rc_link_seen;
+    uint8_t arm_switch_high;
+    uint8_t arm_throttle_low;
+    uint8_t arm_switch_seen_low;
+    uint8_t arm_switch_prev_high;
+    uint8_t imu_fault_latched;
+    uint8_t imu_fault_reason;
     float acc_nav_m_s2[3];
     float vel_est_m_s[3];
     float vel_ref_m_s[2];
@@ -99,7 +109,7 @@ typedef struct __attribute__((packed)) {
 
 _Static_assert(sizeof(APP_FlightLogSectorHeader) == APP_FLIGHT_LOG_SECTOR_HEADER_SIZE,
                "flight log sector header must stay 256 bytes");
-_Static_assert(sizeof(APP_FlightLogRecord) == 284U,
+_Static_assert(sizeof(APP_FlightLogRecord) == 292U,
                "flight log record must match tools/flight_log_receive.py");
 _Static_assert(sizeof(APP_FlightLogExportBlockHeader) == 24U,
                "flight log export header must match tools/flight_log_receive.py");
@@ -120,6 +130,11 @@ static uint32_t flight_log_queue_head;
 static uint32_t flight_log_queue_tail;
 static uint32_t flight_log_queue_count;
 static APP_FlightLogRecord flight_log_batch[APP_FLIGHT_LOG_WRITE_BATCH_RECORDS];
+static APP_FlightLogSectorHeader flight_log_test_header;
+static APP_FlightLogSectorHeader flight_log_test_verify_header;
+static APP_FlightLogSnapshot flight_log_test_snapshot;
+static APP_FlightLogRecord flight_log_test_record;
+static APP_FlightLogRecord flight_log_test_verify_record;
 static uint16_t flight_log_sector_order[APP_FLIGHT_LOG_SECTOR_COUNT];
 static uint32_t flight_log_sector_order_seq[APP_FLIGHT_LOG_SECTOR_COUNT];
 static uint32_t flight_log_next_sector_index;
@@ -129,6 +144,7 @@ static uint32_t flight_log_record_sequence;
 static uint32_t flight_log_export_sector_pos;
 static uint32_t flight_log_export_sector_offset;
 static uint32_t flight_log_export_seq;
+static uint32_t flight_log_export_next_ms;
 static uint8_t flight_log_flush_requested;
 static uint8_t flight_log_export_pending;
 static uint8_t flight_log_export_restore_vofa;
@@ -198,6 +214,45 @@ static uint8_t flight_log_queue_printf(const char *format, ...)
     }
 
     return flight_log_queue_message((const uint8_t *)line, (uint16_t)written);
+}
+
+static char flight_log_hex_digit(uint8_t value)
+{
+    value &= 0x0FU;
+    return (char)((value < 10U) ? ('0' + value) : ('A' + (value - 10U)));
+}
+
+static uint8_t flight_log_whiten_byte(uint32_t offset)
+{
+    uint32_t x = offset + 0xA5A5A5A5UL;
+
+    x ^= (x >> 7U);
+    x *= 0x45D9F3BUL;
+    x ^= (x >> 11U);
+    return (uint8_t)(x | 0x01U);
+}
+
+static uint16_t flight_log_hex_encode(char *dst,
+                                      uint16_t dst_size,
+                                      const uint8_t *src,
+                                      uint16_t src_size,
+                                      uint32_t src_offset)
+{
+    uint16_t needed = (uint16_t)(src_size * 2U);
+
+    if ((dst == NULL) || (src == NULL) || (dst_size < needed)) {
+        return 0U;
+    }
+
+    for (uint16_t index = 0U; index < src_size; ++index) {
+        uint8_t encoded = (uint8_t)(src[index] ^
+                                    flight_log_whiten_byte(src_offset + index));
+
+        dst[index * 2U] = flight_log_hex_digit((uint8_t)(encoded >> 4U));
+        dst[(index * 2U) + 1U] = flight_log_hex_digit(encoded);
+    }
+
+    return needed;
 }
 
 static uint8_t flight_log_sector_header_valid(APP_FlightLogSectorHeader *header)
@@ -384,6 +439,14 @@ static void flight_log_record_from_snapshot(APP_FlightLogRecord *record,
     record->rc_link_ok = snapshot->rc_link_ok;
     record->throttle_over_20 = snapshot->throttle_over_20;
     record->imu_valid = snapshot->imu_valid;
+    record->motor_output_reason = snapshot->motor_output_reason;
+    record->rc_link_seen = snapshot->rc_link_seen;
+    record->arm_switch_high = snapshot->arm_switch_high;
+    record->arm_throttle_low = snapshot->arm_throttle_low;
+    record->arm_switch_seen_low = snapshot->arm_switch_seen_low;
+    record->arm_switch_prev_high = snapshot->arm_switch_prev_high;
+    record->imu_fault_latched = snapshot->imu_fault_latched;
+    record->imu_fault_reason = snapshot->imu_fault_reason;
     memcpy(record->acc_nav_m_s2, snapshot->acc_nav_m_s2, sizeof(record->acc_nav_m_s2));
     memcpy(record->vel_est_m_s, snapshot->vel_est_m_s, sizeof(record->vel_est_m_s));
     memcpy(record->vel_ref_m_s, snapshot->vel_ref_m_s, sizeof(record->vel_ref_m_s));
@@ -549,12 +612,13 @@ static APP_FlightLogCommandStatus flight_log_start_export_from_background(void)
     flight_log_export_sector_pos = 0U;
     flight_log_export_sector_offset = 0U;
     flight_log_export_seq = 0U;
+    flight_log_export_next_ms = 0U;
     flight_log_export_cancel_requested = 0U;
     vofaStreamActive = 0U;
 
-    if (flight_log_queue_printf("FLOG BEGIN version=%u block_magic=0x%08lX total=%lu "
+    if (flight_log_queue_printf("FLOG BEGIN version=%u block_magic=0x%08lX encoding=xorhex total=%lu "
                                 "sectors=%lu sector_size=%u header_size=%u "
-                                "record_size=%u log_rate=%u baud=%u session=%lu\r\n",
+                                "record_size=%u log_rate=%u baud=%u session=%lu payload=%u\r\n",
                                 (unsigned int)APP_FLIGHT_LOG_EXPORT_VERSION,
                                 (unsigned long)APP_FLIGHT_LOG_EXPORT_BLOCK_MAGIC,
                                 (unsigned long)flight_log_status.export_total_bytes,
@@ -564,7 +628,8 @@ static APP_FlightLogCommandStatus flight_log_start_export_from_background(void)
                                 (unsigned int)sizeof(APP_FlightLogRecord),
                                 (unsigned int)APP_FLIGHT_LOG_RATE_HZ,
                                 (unsigned int)APP_FLIGHT_LOG_EXPORT_BAUD,
-                                (unsigned long)flight_log_status.session_id) == 0U) {
+                                (unsigned long)flight_log_status.session_id,
+                                (unsigned int)APP_FLIGHT_LOG_EXPORT_PAYLOAD_MAX) == 0U) {
         return APP_FLIGHT_LOG_CMD_BUSY;
     }
 
@@ -577,13 +642,15 @@ static APP_FlightLogCommandStatus flight_log_start_export_from_background(void)
 static void flight_log_export_step(void)
 {
     uint8_t payload[APP_FLIGHT_LOG_EXPORT_PAYLOAD_MAX];
-    uint8_t frame[sizeof(APP_FlightLogExportBlockHeader) +
-                  APP_FLIGHT_LOG_EXPORT_PAYLOAD_MAX];
-    APP_FlightLogExportBlockHeader header;
+    char frame[APP_UART_TX_TEXT_SIZE];
     uint32_t remaining;
     uint32_t physical_sector;
     uint32_t address;
+    uint32_t payload_crc;
+    uint16_t flags;
     uint16_t chunk;
+    uint16_t used;
+    int written;
     APP_FlashService_Status st;
 
     if (flight_log_status.export_active == 0U) {
@@ -602,6 +669,10 @@ static void flight_log_export_step(void)
     }
 
     if ((uartTxQueueHandle != NULL) && (osMessageQueueGetSpace(uartTxQueueHandle) == 0U)) {
+        return;
+    }
+    if ((flight_log_export_next_ms != 0U) &&
+        ((int32_t)(HAL_GetTick() - flight_log_export_next_ms) < 0)) {
         return;
     }
 
@@ -629,7 +700,11 @@ static void flight_log_export_step(void)
 
     address = flight_log_sector_address(physical_sector) +
               flight_log_export_sector_offset;
-    st = APP_FlashService_ReadDataFast(address, payload, chunk);
+    /*
+     * USART1 export is link-speed limited, so a blocking SPI read is fast enough
+     * and avoids aborting the dump when a background DMA completion event is lost.
+     */
+    st = APP_FlashService_ReadData(address, payload, chunk);
     flight_log_status.last_flash_status = (uint32_t)st;
     if (st != APP_FLASH_SERVICE_OK) {
         (void)flight_log_queue_printf("FLOG ERROR export_read status=%lu offset=%lu\r\n",
@@ -639,26 +714,45 @@ static void flight_log_export_step(void)
         return;
     }
 
-    header.magic = APP_FLIGHT_LOG_EXPORT_BLOCK_MAGIC;
-    header.version = APP_FLIGHT_LOG_EXPORT_VERSION;
-    header.header_size = sizeof(header);
-    header.seq = flight_log_export_seq;
-    header.offset = flight_log_status.export_bytes_sent;
-    header.length = chunk;
-    header.flags =
+    payload_crc = flight_log_crc32(payload, chunk);
+    flags =
         ((flight_log_status.export_bytes_sent + chunk) >=
          flight_log_status.export_total_bytes) ? APP_FLIGHT_LOG_EXPORT_FLAG_LAST : 0U;
-    header.payload_crc32 = flight_log_crc32(payload, chunk);
 
-    memcpy(frame, &header, sizeof(header));
-    memcpy(frame + sizeof(header), payload, chunk);
-    if (flight_log_queue_message(frame, (uint16_t)(sizeof(header) + chunk)) == 0U) {
+    written = snprintf(frame,
+                       sizeof(frame),
+                       "FLOG BLK seq=%lu offset=%lu len=%u flags=%u crc=%08lX data=",
+                       (unsigned long)flight_log_export_seq,
+                       (unsigned long)flight_log_status.export_bytes_sent,
+                       (unsigned int)chunk,
+                       (unsigned int)flags,
+                       (unsigned long)payload_crc);
+    if ((written <= 0) || ((uint32_t)written >= sizeof(frame))) {
+        (void)flight_log_export_finish("format");
+        return;
+    }
+    used = (uint16_t)written;
+    written = (int)flight_log_hex_encode(&frame[used],
+                                         (uint16_t)(sizeof(frame) - used - 2U),
+                                         payload,
+                                         chunk,
+                                         flight_log_status.export_bytes_sent);
+    if (written <= 0) {
+        (void)flight_log_export_finish("format");
+        return;
+    }
+    used = (uint16_t)(used + (uint16_t)written);
+    frame[used++] = '\r';
+    frame[used++] = '\n';
+
+    if (flight_log_queue_message((const uint8_t *)frame, used) == 0U) {
         return;
     }
 
     flight_log_export_seq++;
     flight_log_status.export_bytes_sent += chunk;
     flight_log_export_sector_offset += chunk;
+    flight_log_export_next_ms = HAL_GetTick() + APP_FLIGHT_LOG_EXPORT_BLOCK_GAP_MS;
 }
 
 void APP_FlightLog_Init(void)
@@ -799,6 +893,160 @@ APP_FlightLogCommandStatus APP_FlightLog_CancelDump(void)
     }
 
     flight_log_export_cancel_requested = 1U;
+    return APP_FLIGHT_LOG_CMD_OK;
+}
+
+APP_FlightLogCommandStatus APP_FlightLog_TestFill(uint32_t sectors)
+{
+    APP_FlashService_Status st;
+    uint32_t erase_probe;
+    uint32_t records_per_sector =
+        (APP_FLASH_SERVICE_SECTOR_SIZE - APP_FLIGHT_LOG_SECTOR_HEADER_SIZE) /
+        sizeof(APP_FlightLogRecord);
+
+    if (flight_log_status.initialized == 0U) {
+        APP_FlightLog_Init();
+    }
+    if (flight_log_status.recording != 0U) {
+        return APP_FLIGHT_LOG_CMD_RECORDING;
+    }
+    if ((flight_log_status.export_active != 0U) ||
+        (flight_log_export_pending != 0U)) {
+        return APP_FLIGHT_LOG_CMD_BUSY;
+    }
+    if (sectors == 0U) {
+        sectors = 1U;
+    }
+    if (sectors > APP_FLIGHT_LOG_SECTOR_COUNT) {
+        sectors = APP_FLIGHT_LOG_SECTOR_COUNT;
+    }
+    if (sectors > APP_FLIGHT_LOG_TESTFILL_MAX_SECTORS) {
+        sectors = APP_FLIGHT_LOG_TESTFILL_MAX_SECTORS;
+    }
+
+    flight_log_clear_record_queue();
+    memset(flight_log_sector_order, 0, sizeof(flight_log_sector_order));
+    memset(flight_log_sector_order_seq, 0, sizeof(flight_log_sector_order_seq));
+    flight_log_status.used_sectors = 0U;
+    flight_log_status.used_bytes = 0U;
+    flight_log_status.total_records = 0U;
+    flight_log_status.dropped_records = 0U;
+    flight_log_status.sector_open = 0U;
+    flight_log_status.sector_seq = 1U;
+    flight_log_record_sequence = 0U;
+    flight_log_status.session_id =
+        (uint32_t)(HAL_GetTick() ^ (uint32_t)SVC_Timestamp_Us() ^ 0xF10A7E57UL);
+
+    memset(&flight_log_test_snapshot, 0, sizeof(flight_log_test_snapshot));
+    flight_log_test_snapshot.imu_raw.accel_z = 16384;
+    flight_log_test_snapshot.imu.accel_z_g = 1.0f;
+    flight_log_test_snapshot.rc_armed = 1U;
+    flight_log_test_snapshot.rc_link_ok = 1U;
+    flight_log_test_snapshot.throttle_over_20 = 1U;
+    flight_log_test_snapshot.imu_valid = 1U;
+    flight_log_test_snapshot.motor_output_reason = APP_FLIGHT_LOG_MOTOR_REASON_STABILIZED_MIX;
+    flight_log_test_snapshot.rc_link_seen = 1U;
+    flight_log_test_snapshot.arm_switch_high = 1U;
+    flight_log_test_snapshot.arm_throttle_low = 1U;
+
+    for (uint32_t sector = 0U; sector < sectors; ++sector) {
+        uint32_t address = flight_log_sector_address(sector);
+
+        st = APP_FlashService_EraseSector(address);
+        flight_log_status.last_flash_status = (uint32_t)st;
+        if (st != APP_FLASH_SERVICE_OK) {
+            flight_log_scan_existing();
+            return APP_FLIGHT_LOG_CMD_ERROR;
+        }
+
+        st = APP_FlashService_ReadData(address,
+                                       (uint8_t *)&erase_probe,
+                                       sizeof(erase_probe));
+        flight_log_status.last_flash_status = (uint32_t)st;
+        if ((st != APP_FLASH_SERVICE_OK) || (erase_probe != 0xFFFFFFFFUL)) {
+            flight_log_status.last_flash_status = (uint32_t)APP_FLASH_SERVICE_ERROR;
+            flight_log_scan_existing();
+            return APP_FLIGHT_LOG_CMD_ERROR;
+        }
+
+        flight_log_fill_sector_header(&flight_log_test_header, sector);
+        st = APP_FlashService_WriteData(address,
+                                        (const uint8_t *)&flight_log_test_header,
+                                        sizeof(flight_log_test_header));
+        flight_log_status.last_flash_status = (uint32_t)st;
+        if (st != APP_FLASH_SERVICE_OK) {
+            flight_log_scan_existing();
+            return APP_FLIGHT_LOG_CMD_ERROR;
+        }
+
+        st = APP_FlashService_ReadData(address,
+                                       (uint8_t *)&flight_log_test_verify_header,
+                                       sizeof(flight_log_test_verify_header));
+        flight_log_status.last_flash_status = (uint32_t)st;
+        if ((st != APP_FLASH_SERVICE_OK) ||
+            (flight_log_sector_header_valid(&flight_log_test_verify_header) == 0U)) {
+            flight_log_status.last_flash_status = (uint32_t)APP_FLASH_SERVICE_ERROR;
+            flight_log_scan_existing();
+            return APP_FLIGHT_LOG_CMD_ERROR;
+        }
+
+        for (uint32_t index = 0U; index < records_per_sector; ++index) {
+            uint32_t record_address = address +
+                                      APP_FLIGHT_LOG_SECTOR_HEADER_SIZE +
+                                      (index * sizeof(flight_log_test_record));
+
+            flight_log_test_snapshot.timestamp_us =
+                ((uint64_t)sector * 1000000ULL) + ((uint64_t)index * 4000ULL);
+            flight_log_test_snapshot.tick_ms = (sector * 1000U) + (index * 4U);
+            flight_log_test_snapshot.imu_sequence = flight_log_record_sequence + 1U;
+            flight_log_test_snapshot.roll_deg = (float)sector;
+            flight_log_test_snapshot.pitch_deg = (float)index;
+            flight_log_test_snapshot.yaw_deg = (float)(sector + index);
+            for (uint32_t ch = 0U; ch < 8U; ++ch) {
+                flight_log_test_snapshot.rc_channels[ch] =
+                    (uint16_t)(1000U + (ch * 50U));
+            }
+            flight_log_test_snapshot.throttle_us = 1300U;
+            flight_log_test_snapshot.servo_alpha_us = 1500U;
+            flight_log_test_snapshot.servo_beta_us = 1500U;
+            flight_log_test_snapshot.motor_upper_us = 1300U;
+            flight_log_test_snapshot.motor_lower_us = 1300U;
+            flight_log_test_snapshot.z_ref_m = 0.1f;
+
+            flight_log_record_from_snapshot(&flight_log_test_record,
+                                            &flight_log_test_snapshot);
+            st = APP_FlashService_WriteData(record_address,
+                                            (const uint8_t *)&flight_log_test_record,
+                                            sizeof(flight_log_test_record));
+            flight_log_status.last_flash_status = (uint32_t)st;
+            if (st != APP_FLASH_SERVICE_OK) {
+                flight_log_scan_existing();
+                return APP_FLIGHT_LOG_CMD_ERROR;
+            }
+            st = APP_FlashService_ReadData(record_address,
+                                           (uint8_t *)&flight_log_test_verify_record,
+                                           sizeof(flight_log_test_verify_record));
+            flight_log_status.last_flash_status = (uint32_t)st;
+            if ((st != APP_FLASH_SERVICE_OK) ||
+                (memcmp(&flight_log_test_verify_record,
+                        &flight_log_test_record,
+                        sizeof(flight_log_test_record)) != 0)) {
+                flight_log_status.last_flash_status = (uint32_t)APP_FLASH_SERVICE_ERROR;
+                flight_log_scan_existing();
+                return APP_FLIGHT_LOG_CMD_ERROR;
+            }
+            flight_log_status.total_records++;
+        }
+
+        flight_log_order_insert((uint16_t)sector, flight_log_status.sector_seq);
+        flight_log_status.sector_seq++;
+    }
+
+    flight_log_next_sector_index = sectors % APP_FLIGHT_LOG_SECTOR_COUNT;
+    flight_log_current_sector_index = 0U;
+    flight_log_sector_write_offset = APP_FLIGHT_LOG_SECTOR_HEADER_SIZE;
+    flight_log_status.sector_open = 0U;
+    flight_log_status.used_bytes = flight_log_used_bytes();
     return APP_FLIGHT_LOG_CMD_OK;
 }
 

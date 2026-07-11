@@ -264,7 +264,7 @@ void APP_Sensor_LpfApply3f(APP_Sensor_Lpf lpf[3],
 /* ════════════════════════════════════════════════════════════════════════ */
 /*  陀螺仪零偏校准                                                        */
 /*                                                                        */
-/*  采集 APP_SENSOR_GYRO_BIAS_SAMPLES(1000) 个样本做均值 = 零偏            */
+/*  静止采集 APP_SENSOR_GYRO_BIAS_SAMPLES(1000) 个样本做均值 = 零偏        */
 /* ════════════════════════════════════════════════════════════════════════ */
 
 uint8_t APP_Sensor_CalibrateGyroBias(float gx, float gy, float gz,
@@ -273,6 +273,16 @@ uint8_t APP_Sensor_CalibrateGyroBias(float gx, float gy, float gz,
     if (cal == NULL) return 0U;
 
     if (cal->ready) return 0U;
+
+    if ((fabsf(gx) > APP_SENSOR_GYRO_BIAS_MAX_STATIC_DPS) ||
+        (fabsf(gy) > APP_SENSOR_GYRO_BIAS_MAX_STATIC_DPS) ||
+        (fabsf(gz) > APP_SENSOR_GYRO_BIAS_MAX_STATIC_DPS)) {
+        cal->sum[0] = 0.0f;
+        cal->sum[1] = 0.0f;
+        cal->sum[2] = 0.0f;
+        cal->count = 0U;
+        return 0U;
+    }
 
     cal->sum[0] += gx;
     cal->sum[1] += gy;

@@ -66,6 +66,16 @@ DRV_GD25Q32_Status DRV_GD25Q32_ReleaseFromPowerDown(DRV_GD25Q32_Device *dev);
 DRV_GD25Q32_Status DRV_GD25Q32_ReadJedecId(DRV_GD25Q32_Device *dev,
                                        DRV_GD25Q32_JedecId *jedec_id);
 DRV_GD25Q32_Status DRV_GD25Q32_ReadStatus1(DRV_GD25Q32_Device *dev, uint8_t *status1);
+DRV_GD25Q32_Status DRV_GD25Q32_ReadStatus2(DRV_GD25Q32_Device *dev, uint8_t *status2);
+DRV_GD25Q32_Status DRV_GD25Q32_ReadStatus3(DRV_GD25Q32_Device *dev, uint8_t *status3);
+DRV_GD25Q32_Status DRV_GD25Q32_WriteEnableProbe(DRV_GD25Q32_Device *dev,
+                                                uint8_t *status_before,
+                                                uint8_t *status_after);
+DRV_GD25Q32_Status DRV_GD25Q32_ClearProtection(DRV_GD25Q32_Device *dev,
+                                               uint8_t *status1_before,
+                                               uint8_t *status2_before,
+                                               uint8_t *status1_after,
+                                               uint8_t *status2_after);
 DRV_GD25Q32_Status DRV_GD25Q32_ReadData(DRV_GD25Q32_Device *dev, uint32_t address,
                                     uint8_t *data, uint32_t length);
 DRV_GD25Q32_Status DRV_GD25Q32_ReadDataFast(DRV_GD25Q32_Device *dev, uint32_t address,

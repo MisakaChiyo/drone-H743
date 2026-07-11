@@ -87,6 +87,68 @@ APP_FlashService_Status APP_FlashService_ReadStatus1(uint8_t *status1)
     return status;
 }
 
+APP_FlashService_Status APP_FlashService_ReadStatus2(uint8_t *status2)
+{
+    APP_FlashService_Status status;
+
+    flash_service_bind();
+    status = flash_service_lock();
+    if (status == DRV_GD25Q32_OK) {
+        status = DRV_GD25Q32_ReadStatus2(&flash_device, status2);
+        flash_service_unlock();
+    }
+    return status;
+}
+
+APP_FlashService_Status APP_FlashService_ReadStatus3(uint8_t *status3)
+{
+    APP_FlashService_Status status;
+
+    flash_service_bind();
+    status = flash_service_lock();
+    if (status == DRV_GD25Q32_OK) {
+        status = DRV_GD25Q32_ReadStatus3(&flash_device, status3);
+        flash_service_unlock();
+    }
+    return status;
+}
+
+APP_FlashService_Status APP_FlashService_WriteEnableProbe(uint8_t *status_before,
+                                                          uint8_t *status_after)
+{
+    APP_FlashService_Status status;
+
+    flash_service_bind();
+    status = flash_service_lock();
+    if (status == DRV_GD25Q32_OK) {
+        status = DRV_GD25Q32_WriteEnableProbe(&flash_device,
+                                              status_before,
+                                              status_after);
+        flash_service_unlock();
+    }
+    return status;
+}
+
+APP_FlashService_Status APP_FlashService_ClearProtection(uint8_t *status1_before,
+                                                         uint8_t *status2_before,
+                                                         uint8_t *status1_after,
+                                                         uint8_t *status2_after)
+{
+    APP_FlashService_Status status;
+
+    flash_service_bind();
+    status = flash_service_lock();
+    if (status == DRV_GD25Q32_OK) {
+        status = DRV_GD25Q32_ClearProtection(&flash_device,
+                                             status1_before,
+                                             status2_before,
+                                             status1_after,
+                                             status2_after);
+        flash_service_unlock();
+    }
+    return status;
+}
+
 APP_FlashService_Status APP_FlashService_ReadData(uint32_t address, uint8_t *data, uint32_t length)
 {
     APP_FlashService_Status status;

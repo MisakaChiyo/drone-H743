@@ -1,0 +1,89 @@
+{
+  "port": "COM10",
+  "baud": 57600,
+  "duration_s": 5.038551092147827,
+  "frames": 197,
+  "average_frame_hz": 39.098541703190925,
+  "text_lines": 1,
+  "dropped_or_noise_bytes": 0,
+  "csv": "captures\\vofa_compact_fixed_20260711_115357.csv",
+  "text_log": "captures\\vofa_compact_fixed_20260711_115357_text.txt",
+  "raw_bin": null,
+  "channel_names": [
+    "roll_deg",
+    "pitch_deg",
+    "yaw_deg",
+    "range_height_m",
+    "fc_time_s",
+    "vel_est_x_m_s",
+    "vel_est_y_m_s",
+    "coax_roll_rate_kd",
+    "coax_pitch_rate_kd",
+    "coax_yaw_angle_kp",
+    "coax_yaw_rate_kd",
+    "coax_vel_x_kd",
+    "coax_vel_y_kd",
+    "coax_accel_xy_limit_m_s2",
+    "coax_accel_z_limit_m_s2",
+    "vel_loop_x_kp",
+    "vel_loop_y_kp",
+    "vel_loop_output_limit_m_s2",
+    "vel_loop_x_ki",
+    "vel_loop_y_ki",
+    "vel_loop_i_limit_m_s2",
+    "vel_loop_x_kd",
+    "vel_loop_y_kd",
+    "vel_loop_enable"
+  ],
+  "tuning_stats": {
+    "roll_deg": {
+      "count": 197,
+      "min": -0.011005640029907227,
+      "max": 0.006622791290283203,
+      "mean": 0.00037687774842160606,
+      "max_abs": 0.011005640029907227
+    },
+    "pitch_deg": {
+      "count": 197,
+      "min": -0.1474766731262207,
+      "max": -0.09557294845581055,
+      "mean": -0.12680358451029977,
+      "max_abs": 0.1474766731262207
+    },
+    "yaw_deg": {
+      "count": 197,
+      "min": 1.1363099813461304,
+      "max": 1.1448158025741577,
+      "mean": 1.140619030458673,
+      "max_abs": 1.1448158025741577
+    },
+    "range_height_m": {
+      "count": 197,
+      "min": 0.04999999329447746,
+      "max": 0.04999999329447746,
+      "mean": 0.04999999329447746,
+      "max_abs": 0.04999999329447746
+    },
+    "vel_est_x_m_s": {
+      "count": 197,
+      "min": -9.88285755738616e-05,
+      "max": 7.08690204191953e-05,
+      "mean": -2.728460925252909e-06,
+      "max_abs": 9.88285755738616e-05
+    },
+    "vel_est_y_m_s": {
+      "count": 197,
+      "min": -8.492918277624995e-05,
+      "max": 8.485279977321625e-05,
+      "mean": 7.1786404858929874e-06,
+      "max_abs": 8.492918277624995e-05
+    }
+  },
+  "notes": [
+    "34/35 are fused velocity estimates.",
+    "36/37 are velocity references.",
+    "38/39 are velocity errors.",
+    "40/41 are velocity-loop outputs.",
+    "61/62 are raw optical-flow velocities."
+  ]
+}

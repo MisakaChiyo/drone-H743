@@ -141,6 +141,8 @@ def test_optical_flow_sources_are_wired_into_firmware() -> None:
     assert "FLOW?" in control
     assert "APP_OpticalFlow_Report();" in control
     assert "FLOW PINGAB" in control
+    assert "FLOW XCV rx_len hex..." in control
+    assert "BSP_OPTICAL_FLOW_TransceiveRaw" in control
     assert "BSP_OPTICAL_FLOW_TransmitRaw" in control
     assert "APP_Task_OpticalFlow_Init();" in freertos
     assert "APP_Task_OpticalFlow_Step();" in freertos
@@ -171,7 +173,26 @@ def test_velocity_source_prefers_flow_and_falls_back_to_imu() -> None:
     assert "flow_ctx.height_valid == 0U" in app_flow
 
 
-def test_optical_flow_mount_rotation_and_fixed_height_are_applied_in_app_layer() -> None:
+def test_optical_flow_fault_recovery_runs_outside_sensor_step() -> None:
+    freertos = read("Core/Src/freertos.c")
+    app_uart = read("App/Src/app_uart.c")
+    app_flow = read("App/Src/app_optical_flow.c")
+    app_flow_header = read("App/Inc/app_optical_flow.h")
+
+    assert "APP_OPTICAL_FLOW_HEALTH_RETRYING" in app_flow_header
+    assert "APP_OPTICAL_FLOW_HEALTH_FAILED" in app_flow_header
+    assert "void APP_OpticalFlow_ServiceRecovery(void);" in app_flow_header
+    assert "#define APP_FLOW_FAST_RETRY_LIMIT" in app_flow
+    assert "#define APP_FLOW_FAILED_RETRY_MS" in app_flow
+    assert "static void app_optical_flow_try_init" in app_flow
+    assert "APP_OpticalFlow_ServiceRecovery();" in app_uart
+    assert "APP_OpticalFlow_ServiceRecovery();" not in freertos
+    assert "status->health = flow_ctx.health;" in app_flow
+    assert "status->init_attempts = flow_ctx.init_attempts;" in app_flow
+    assert "status->recovery_count = flow_ctx.recovery_count;" in app_flow
+
+
+def test_optical_flow_mount_rotation_and_range_height_are_applied_in_app_layer() -> None:
     app_flow = read("App/Src/app_optical_flow.c")
     header = read("App/Inc/app_optical_flow.h")
 
@@ -183,10 +204,11 @@ def test_optical_flow_mount_rotation_and_fixed_height_are_applied_in_app_layer()
     assert "body_vy_m_s = APP_FLOW_MOUNT_SIN_45 * sensor_vx_m_s +" in app_flow
     assert "flow_ctx.vx_m_s = -body_vx_m_s;" in app_flow
     assert "flow_ctx.vy_m_s = -body_vy_m_s;" in app_flow
-    assert "APP_FLOW_FIXED_HEIGHT_M      0.06f" in app_flow
     assert "APP_FLOW_HEIGHT_LPF_ALPHA" in app_flow
-    assert "flow_ctx.height_m = APP_FLOW_FIXED_HEIGHT_M;" in app_flow
-    assert "flow_ctx.height_raw_m = APP_FLOW_FIXED_HEIGHT_M;" in app_flow
+    assert "APP_OpticalFlow_UpdateHeightFromRange" in app_flow
+    assert "flow_ctx.height_m = height_m;" in app_flow
+    assert "flow_ctx.height_raw_m = raw_height_m;" in app_flow
+    assert "flow_ctx.height_valid = valid;" in app_flow
     assert "(void)pressure_pa;" in app_flow
     assert "(void)fresh;" in app_flow
     assert "powf(" not in app_flow
@@ -230,6 +252,12 @@ def test_lc307_initialization_protocol_is_explicit_and_does_not_reuse_lc306_tabl
     assert "LC307_CMD_DD" in driver
     assert "LC307_CONFIG_DELAY_MS      100U" in driver
     assert "LC307_CONFIG_AB_RETRIES" in driver
+    assert "LC307_CONFIG_BB_RETRIES" in driver
+    assert "LC307_CONFIG_BB_TIMEOUT_MS" in driver
+    assert "LC307_CONFIG_RESET_MS" in driver
+    assert "LC307_STATUS_SCAN_MAX" in driver
+    assert "window[0] = window[1];" in driver
+    assert "for (uint32_t attempt = 0U; attempt < LC307_CONFIG_BB_RETRIES; ++attempt)" in driver
     assert "lc307_config_table" in driver
     assert "sizeof(lc307_config_table)" in driver
     assert "{0x12U, 0x80U}" in driver
@@ -237,6 +265,30 @@ def test_lc307_initialization_protocol_is_explicit_and_does_not_reuse_lc306_tabl
     assert "cfg_missing" in app
     assert "missing_tbl" in app
     assert "ab_rx=%02X,%02X,%02X" in app
+    assert "bb_rx=%02X,%02X,%02X" in app
+
+
+def test_lc307_config_failure_does_not_report_clean_initialization() -> None:
+    driver = read("Driver/Src/drv_optical_flow.c")
+    app = read("App/Src/app_optical_flow.c")
+
+    assert "LC307_DRAIN_BYTE_MAX" in driver
+    assert "flow_lc307_drain_rx(dev);" in driver
+    assert "return (dev->config_status == DRV_OPTICAL_FLOW_CONFIG_OK) ?" in driver
+    assert "DRV_OPTICAL_FLOW_OK : DRV_OPTICAL_FLOW_ERROR;" in driver
+    assert "BSP_OPTICAL_FLOW_GetStatus(&bsp_status);" in app
+    assert "flow_ctx.initialized = bsp_status.initialized;" in app
+
+
+def test_lc307_init_accepts_already_streaming_module_before_reconfiguring() -> None:
+    driver = read("Driver/Src/drv_optical_flow.c")
+
+    assert "LC307_STREAM_PROBE_MS      500U" in driver
+    assert "LC307_STREAM_PROBE_FRAMES  2U" in driver
+    assert "static uint8_t flow_lc307_probe_stream" in driver
+    assert "(void)DRV_OPTICAL_FLOW_ConsumeByte(dev, byte);" in driver
+    assert "dev->config_status = DRV_OPTICAL_FLOW_CONFIG_OK;" in driver
+    assert "} else {\n        flow_lc307_configure(dev);\n    }" in driver
 
 
 def test_optical_flow_bus_provides_lc307_config_timing_hooks() -> None:

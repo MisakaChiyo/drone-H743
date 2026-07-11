@@ -205,12 +205,6 @@ static uint8_t coax_ctrl_param_value_valid(const DRV_COAX_CTRL_ParamEntry *entry
     if ((entry->offset == offsetof(DRV_COAX_CTRL_Params, accel_xy_limit_m_s2)) ||
         (entry->offset == offsetof(DRV_COAX_CTRL_Params, accel_z_limit_m_s2)) ||
         (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_enable)) ||
-        (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_x_kp)) ||
-        (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_x_ki)) ||
-        (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_x_kd)) ||
-        (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_y_kp)) ||
-        (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_y_ki)) ||
-        (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_y_kd)) ||
         (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_output_limit_m_s2)) ||
         (entry->offset == offsetof(DRV_COAX_CTRL_Params, vel_loop_i_limit_m_s2)) ||
         (entry->offset == offsetof(DRV_COAX_CTRL_Params, yaw_rate_limit_rad_s))) {
@@ -278,34 +272,34 @@ void DRV_COAX_CTRL_GetDefaultParams(DRV_COAX_CTRL_Params *params)
     params->pos_x_kp = 2.2f;
     params->pos_y_kp = 2.2f;
     params->pos_z_kp = 3.8f;
-    params->vel_x_kd = 2.5f;
-    params->vel_y_kd = 2.5f;
-    params->vel_z_kd = 3.1f;
+    params->vel_x_kd = 0.0f;
+    params->vel_y_kd = 0.0f;
+    params->vel_z_kd = 0.0f;
     params->rotation_error_gain = 0.5f;
-    params->accel_xy_limit_m_s2 = 3.0f;
+    params->accel_xy_limit_m_s2 = 4.0f;
     params->accel_z_limit_m_s2 = 2.5f;
     params->vel_loop_enable = 1.0f;
-    params->vel_loop_x_kp = 1.2f;
+    params->vel_loop_x_kp = 4.95f;
     params->vel_loop_x_ki = 0.0f;
     params->vel_loop_x_kd = 0.0f;
-    params->vel_loop_y_kp = 1.2f;
+    params->vel_loop_y_kp = 4.81f;
     params->vel_loop_y_ki = 0.0f;
     params->vel_loop_y_kd = 0.0f;
-    params->vel_loop_output_limit_m_s2 = 1.2f;
-    params->vel_loop_i_limit_m_s2 = 0.4f;
+    params->vel_loop_output_limit_m_s2 = 2.91f;
+    params->vel_loop_i_limit_m_s2 = 0.0f;
     params->mass_kg = DRV_AIRFRAME_MASS_KG;
     params->gravity_m_s2 = DRV_AIRFRAME_GRAVITY_M_S2;
     params->min_total_force_n = DRV_AIRFRAME_WEIGHT_N;
     params->max_total_force_n = DRV_AIRFRAME_MAX_TOTAL_FORCE_N;
     params->tilt_lever_arm_m = 0.18f;
     params->roll_angle_kp = 0.0f;
-    params->roll_rate_kd = -0.12f;
+    params->roll_rate_kd = -0.5f;
     params->pitch_angle_kp = 0.0f;
-    params->pitch_rate_kd = -0.12f;
+    params->pitch_rate_kd = -0.5f;
 
     params->tilt_limit_rad = DRV_COAX_CTRL_TILT_LIMIT_RAD;
-    params->yaw_angle_kp = 0.8f;
-    params->yaw_rate_kd = 1.0f;
+    params->yaw_angle_kp = 1.0f;
+    params->yaw_rate_kd = 0.15f;
     params->yaw_rate_limit_rad_s = 1.04719758f;
     params->yaw_inertia = 0.52f;
     params->thrust_coeff_n_per_rad2 = 3.0e-5f;

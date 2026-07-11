@@ -27,7 +27,8 @@ def test_flight_log_uses_app_flash_service_only() -> None:
 
     assert "App/Src/app_flight_log.c" in cmake
     assert "APP_FlashService_ReadData" in source
-    assert "APP_FlashService_ReadDataFast" in source
+    assert "APP_FlashService_ReadDataFast" not in source
+    assert "USART1 export is link-speed limited" in source
     assert "APP_FlashService_EraseSector" in source
     assert "APP_FlashService_WriteData" in source
     assert "BSP_Flash" not in source
@@ -41,9 +42,12 @@ def test_stabilizer_records_snapshots_without_direct_flash_access() -> None:
     drv_source = read("Driver/Src/drv_coax_ctrl.c")
 
     assert '#include "app_flight_log.h"' in freertos
-    assert "APP_FlightLog_Observe(&flog_snapshot" in freertos
+    assert "APP_FlightLog_Observe(flight_log_should_record ? &flog_snapshot : NULL" in freertos
     assert "DRV_COAX_CTRL_GetLastDebug(&flog_snapshot.ctrl_debug);" in freertos
     assert "flight_log_divider ^= 1U;" in freertos
+    assert "STABILIZER_FLIGHT_LOG_TAIL_RECORDS" in freertos
+    assert "flog_snapshot.motor_output_reason" in freertos
+    assert "APP_FLIGHT_LOG_MOTOR_REASON_RC_LOSS_DISABLE" in freertos
     assert "msg.raw_imu              = raw;" in freertos
     assert "APP_FlashService_" not in freertos
     assert "typedef struct {\n    float pos_p_m_s2[3];" in drv_header
@@ -70,8 +74,10 @@ def test_flog_commands_and_vofa_export_gate_are_reachable() -> None:
     assert "FLOG?" in control
     assert "FLOG DUMP" in control
     assert "FLOG CANCEL" in control
+    assert "FLOG TESTFILL" in control
     assert "APP_FlightLog_StartDump()" in control
     assert "APP_FlightLog_CancelDump()" in control
+    assert "APP_FlightLog_TestFill(sectors)" in control
     assert '(strcmp(line, "FLOG?") == 0)' in aiwb2
     assert '(aiwb2_starts_with(line, "FLOG ") != 0U)' in aiwb2
     assert "APP_FlightLog_IsExportActive() != 0U" in freertos
@@ -79,6 +85,7 @@ def test_flog_commands_and_vofa_export_gate_are_reachable() -> None:
     assert "Sensor_Data:0\\r\\n" in script
     assert "FLOG DUMP\\r\\n" in script
     assert "DEFAULT_BAUD = 57600" in script
+    assert "MOTOR_REASON_NAMES" in script
 
 
 def test_export_begin_and_end_lines_are_not_dropped_on_full_uart_queue() -> None:

@@ -7,10 +7,13 @@
 #include <string.h>
 
 #define APP_FLOW_TIMEOUT_MS          100U
+#define APP_FLOW_STARTUP_GRACE_MS    1500U
+#define APP_FLOW_RETRY_INTERVAL_MS   1000U
+#define APP_FLOW_FAILED_RETRY_MS     5000U
+#define APP_FLOW_FAST_RETRY_LIMIT    5U
 #define APP_FLOW_MIN_DT_US          1000U
 #define APP_FLOW_MAX_DT_US          100000U
-#define APP_FLOW_FIXED_HEIGHT_M      0.06f
-#define APP_FLOW_HEIGHT_LPF_ALPHA   0.00f
+#define APP_FLOW_HEIGHT_LPF_ALPHA   0.35f
 #define APP_FLOW_MOUNT_COS_45       0.70710678118f
 #define APP_FLOW_MOUNT_SIN_45       0.70710678118f
 
@@ -24,32 +27,72 @@ typedef struct {
     float vx_m_s;
     float vy_m_s;
     uint8_t velocity_valid;
+    APP_OPTICAL_FLOW_Health health;
+    uint32_t init_attempts;
+    uint32_t recovery_count;
+    uint32_t last_init_attempt_ms;
+    uint32_t last_good_ms;
     BSP_OPTICAL_FLOW_Status bsp_status;
 } APP_OpticalFlow_Context;
 
 static APP_OpticalFlow_Context flow_ctx;
 
-void APP_OpticalFlow_Init(void)
+static void app_optical_flow_reset_height(void)
+{
+    flow_ctx.velocity_source = APP_OPTICAL_FLOW_VEL_SOURCE_IMU;
+    flow_ctx.height_m = 0.0f;
+    flow_ctx.height_raw_m = 0.0f;
+    flow_ctx.height_valid = 0U;
+}
+
+static void app_optical_flow_try_init(uint32_t now_ms)
 {
     BSP_OPTICAL_FLOW_StatusCode status;
+    BSP_OPTICAL_FLOW_Status bsp_status;
+
+    flow_ctx.last_init_attempt_ms = now_ms;
+    flow_ctx.init_attempts++;
+    status = BSP_OPTICAL_FLOW_Init();
+    BSP_OPTICAL_FLOW_GetStatus(&bsp_status);
+    flow_ctx.init_status = (int32_t)status;
+    flow_ctx.bsp_status = bsp_status;
+    flow_ctx.initialized = bsp_status.initialized;
+    flow_ctx.velocity_valid = 0U;
+    flow_ctx.velocity_source = APP_OPTICAL_FLOW_VEL_SOURCE_IMU;
+    if (status == DRV_OPTICAL_FLOW_OK) {
+        flow_ctx.health = APP_OPTICAL_FLOW_HEALTH_STARTING;
+    } else {
+        flow_ctx.health = (flow_ctx.initialized != 0U) ?
+                          APP_OPTICAL_FLOW_HEALTH_STARTING :
+                          APP_OPTICAL_FLOW_HEALTH_RETRYING;
+    }
+}
+
+void APP_OpticalFlow_Init(void)
+{
+    uint32_t now = HAL_GetTick();
 
     memset(&flow_ctx, 0, sizeof(flow_ctx));
-    flow_ctx.velocity_source = APP_OPTICAL_FLOW_VEL_SOURCE_IMU;
-    flow_ctx.height_m = APP_FLOW_FIXED_HEIGHT_M;
-    flow_ctx.height_raw_m = APP_FLOW_FIXED_HEIGHT_M;
-    flow_ctx.height_valid = 1U;
-    status = BSP_OPTICAL_FLOW_Init();
-    flow_ctx.init_status = (int32_t)status;
-    flow_ctx.initialized = (status == DRV_OPTICAL_FLOW_OK) ? 1U : 0U;
+    app_optical_flow_reset_height();
+    flow_ctx.health = APP_OPTICAL_FLOW_HEALTH_STARTING;
+    app_optical_flow_try_init(now);
 }
 
 void APP_OpticalFlow_UpdateHeightFromPressure(float pressure_pa, uint8_t fresh)
 {
     (void)pressure_pa;
     (void)fresh;
-    flow_ctx.height_m = APP_FLOW_FIXED_HEIGHT_M;
-    flow_ctx.height_raw_m = APP_FLOW_FIXED_HEIGHT_M;
-    flow_ctx.height_valid = 1U;
+}
+
+void APP_OpticalFlow_UpdateHeightFromRange(float height_m,
+                                           float raw_height_m,
+                                           uint8_t valid,
+                                           uint32_t sample_ms)
+{
+    (void)sample_ms;
+    flow_ctx.height_m = height_m;
+    flow_ctx.height_raw_m = raw_height_m;
+    flow_ctx.height_valid = valid;
 }
 
 void APP_OpticalFlow_Step(void)
@@ -63,6 +106,14 @@ void APP_OpticalFlow_Step(void)
     float sensor_vy_m_s;
     float body_vx_m_s;
     float body_vy_m_s;
+
+    if (flow_ctx.initialized == 0U) {
+        flow_ctx.health =
+            (flow_ctx.init_attempts > APP_FLOW_FAST_RETRY_LIMIT) ?
+            APP_OPTICAL_FLOW_HEALTH_FAILED :
+            APP_OPTICAL_FLOW_HEALTH_RETRYING;
+        return;
+    }
 
     BSP_OPTICAL_FLOW_Service();
     BSP_OPTICAL_FLOW_GetStatus(&flow_ctx.bsp_status);
@@ -80,6 +131,17 @@ void APP_OpticalFlow_Step(void)
         (frame->integration_timespan_us < APP_FLOW_MIN_DT_US) ||
         (frame->integration_timespan_us > APP_FLOW_MAX_DT_US) ||
         (flow_ctx.height_valid == 0U)) {
+        uint32_t good_age_ms = (flow_ctx.last_good_ms != 0U) ?
+                               (now - flow_ctx.last_good_ms) :
+                               (now - flow_ctx.last_init_attempt_ms);
+        if (good_age_ms > APP_FLOW_STARTUP_GRACE_MS) {
+            flow_ctx.health =
+                (flow_ctx.init_attempts > APP_FLOW_FAST_RETRY_LIMIT) ?
+                APP_OPTICAL_FLOW_HEALTH_FAILED :
+                APP_OPTICAL_FLOW_HEALTH_RETRYING;
+        } else {
+            flow_ctx.health = APP_OPTICAL_FLOW_HEALTH_STARTING;
+        }
         return;
     }
 
@@ -96,6 +158,32 @@ void APP_OpticalFlow_Step(void)
     flow_ctx.vx_m_s = -body_vx_m_s;
     flow_ctx.vy_m_s = -body_vy_m_s;
     flow_ctx.velocity_valid = 1U;
+    flow_ctx.last_good_ms = now;
+    flow_ctx.health = APP_OPTICAL_FLOW_HEALTH_OK;
+}
+
+void APP_OpticalFlow_ServiceRecovery(void)
+{
+    uint32_t now = HAL_GetTick();
+    uint32_t interval_ms;
+    uint8_t needs_recovery;
+
+    needs_recovery =
+        ((flow_ctx.health == APP_OPTICAL_FLOW_HEALTH_RETRYING) ||
+         (flow_ctx.health == APP_OPTICAL_FLOW_HEALTH_FAILED)) ? 1U : 0U;
+    if (needs_recovery == 0U) {
+        return;
+    }
+
+    interval_ms = (flow_ctx.health == APP_OPTICAL_FLOW_HEALTH_FAILED) ?
+                  APP_FLOW_FAILED_RETRY_MS :
+                  APP_FLOW_RETRY_INTERVAL_MS;
+    if ((now - flow_ctx.last_init_attempt_ms) < interval_ms) {
+        return;
+    }
+
+    flow_ctx.recovery_count++;
+    app_optical_flow_try_init(now);
 }
 
 uint8_t APP_OpticalFlow_GetVelocity(float *vx_m_s, float *vy_m_s)
@@ -168,6 +256,9 @@ void APP_OpticalFlow_GetStatus(APP_OPTICAL_FLOW_Status *status)
     memset(status, 0, sizeof(*status));
     status->initialized = flow_ctx.initialized;
     status->init_status = flow_ctx.init_status;
+    status->health = flow_ctx.health;
+    status->init_attempts = flow_ctx.init_attempts;
+    status->recovery_count = flow_ctx.recovery_count;
     status->valid = frame->valid;
     status->version = frame->version;
     status->velocity_valid = flow_ctx.velocity_valid;
@@ -188,6 +279,9 @@ void APP_OpticalFlow_GetStatus(APP_OPTICAL_FLOW_Status *status)
     status->config_ab_response[0] = flow_ctx.bsp_status.config_ab_response[0];
     status->config_ab_response[1] = flow_ctx.bsp_status.config_ab_response[1];
     status->config_ab_response[2] = flow_ctx.bsp_status.config_ab_response[2];
+    status->config_bb_response[0] = flow_ctx.bsp_status.config_bb_response[0];
+    status->config_bb_response[1] = flow_ctx.bsp_status.config_bb_response[1];
+    status->config_bb_response[2] = flow_ctx.bsp_status.config_bb_response[2];
     status->config_errors = flow_ctx.bsp_status.config_errors;
     status->config_last_error = flow_ctx.bsp_status.config_last_error;
     status->config_last_hal_status = flow_ctx.bsp_status.config_last_hal_status;
@@ -239,9 +333,12 @@ void APP_OpticalFlow_Report(void)
     height_raw_mm = (int32_t)(status.height_raw_m * 1000.0f);
     vx_mm_s = (int32_t)(status.vx_m_s * 1000.0f);
     vy_mm_s = (int32_t)(status.vy_m_s * 1000.0f);
-    APP_Control_QueueText("FLOW ok=%u init=%ld baud=%lu bytes=%lu frames=%lu valid=0x%02X ver=%u age_ms=%lu source=%s vel_valid=%u\r\n",
+    APP_Control_QueueText("FLOW ok=%u init=%ld health=%u attempts=%lu recover=%lu baud=%lu bytes=%lu frames=%lu valid=0x%02X ver=%u age_ms=%lu source=%s vel_valid=%u\r\n",
                           (unsigned int)status.initialized,
                           (long)status.init_status,
+                          (unsigned int)status.health,
+                          (unsigned long)status.init_attempts,
+                          (unsigned long)status.recovery_count,
                           (unsigned long)status.baud_rate,
                           (unsigned long)status.bytes,
                           (unsigned long)status.frames,
@@ -250,7 +347,7 @@ void APP_OpticalFlow_Report(void)
                           (unsigned long)status.age_ms,
                           APP_OpticalFlow_VelSourceName(status.velocity_source),
                           (unsigned int)status.velocity_valid);
-    APP_Control_QueueText("FLOW cfg=%s attempted=%u ab_ok=%u missing_tbl=%u ab_rx=%02X,%02X,%02X hal=%lu bb=%lu/%lu bb_ok=%lu cfg_err=%lu cfg_last=%lu\r\n",
+    APP_Control_QueueText("FLOW cfg=%s attempted=%u ab_ok=%u missing_tbl=%u ab_rx=%02X,%02X,%02X bb_rx=%02X,%02X,%02X hal=%lu bb=%lu/%lu bb_ok=%lu cfg_err=%lu cfg_last=%lu\r\n",
                           flow_config_status_name(status.config_status),
                           (unsigned int)status.config_attempted,
                           (unsigned int)status.config_ab_ok,
@@ -258,6 +355,9 @@ void APP_OpticalFlow_Report(void)
                           (unsigned int)status.config_ab_response[0],
                           (unsigned int)status.config_ab_response[1],
                           (unsigned int)status.config_ab_response[2],
+                          (unsigned int)status.config_bb_response[0],
+                          (unsigned int)status.config_bb_response[1],
+                          (unsigned int)status.config_bb_response[2],
                           (unsigned long)status.config_last_hal_status,
                           (unsigned long)status.config_bb_sent,
                           (unsigned long)status.config_bb_expected,

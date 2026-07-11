@@ -73,6 +73,9 @@ void BSP_OPTICAL_FLOW_GetStatus(BSP_OPTICAL_FLOW_Status *status)
     status->config_ab_response[0] = flow_dev.config_ab_response[0];
     status->config_ab_response[1] = flow_dev.config_ab_response[1];
     status->config_ab_response[2] = flow_dev.config_ab_response[2];
+    status->config_bb_response[0] = flow_dev.config_bb_response[0];
+    status->config_bb_response[1] = flow_dev.config_bb_response[1];
+    status->config_bb_response[2] = flow_dev.config_bb_response[2];
     status->config_errors = flow_dev.config_errors;
     status->config_last_error = flow_dev.config_last_error;
     status->config_last_hal_status = flow_dev.config_last_hal_status;

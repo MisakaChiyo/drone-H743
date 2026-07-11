@@ -8,6 +8,7 @@
 #include "app_gps.h"
 #include "app_ident.h"
 #include "app_optical_flow.h"
+#include "app_rangefinder.h"
 #include "app_sensor.h"
 #include "app_mag.h"
 #include "app_maint_uart.h"
@@ -191,6 +192,7 @@ static void app_control_queue_proto_text(uint16_t function, const char *format, 
 static void app_control_handle_flight_log(char **tokens, uint32_t count);
 static void app_control_dispatch_tokens(char **tokens, uint32_t count, uint8_t emit_ack);
 static uint32_t app_control_tokenize(char *buffer, char **tokens, uint32_t max_tokens);
+static uint8_t app_control_parse_u32(const char *text, uint32_t *value);
 static uint8_t app_control_payload_to_line(const uint8_t *payload,
                                            uint16_t payload_length,
                                            char *buffer,
@@ -469,7 +471,23 @@ static void app_control_handle_flight_log(char **tokens, uint32_t count)
         return;
     }
 
-    APP_Control_QueueText("ERR usage FLOG? | FLOG DUMP | FLOG CANCEL\r\n");
+    if ((count >= 2U) && (strcmp(tokens[0], "FLOG") == 0) &&
+        (strcmp(tokens[1], "TESTFILL") == 0)) {
+        uint32_t sectors = 15U;
+
+        if ((count >= 3U) && (app_control_parse_u32(tokens[2], &sectors) == 0U)) {
+            APP_Control_QueueText("ERR usage FLOG TESTFILL [sectors]\r\n");
+            return;
+        }
+
+        cmd_status = APP_FlightLog_TestFill(sectors);
+        APP_Control_QueueText("FLOG TESTFILL %s sectors=%lu\r\n",
+                              APP_FlightLog_CommandStatusText(cmd_status),
+                              (unsigned long)sectors);
+        return;
+    }
+
+    APP_Control_QueueText("ERR usage FLOG? | FLOG DUMP | FLOG CANCEL | FLOG TESTFILL [sectors]\r\n");
 }
 
 static uint8_t app_control_payload_to_line(const uint8_t *payload,
@@ -1272,6 +1290,167 @@ static void app_control_flash_bench_read(char **tokens, uint32_t count)
                                  (unsigned long)crc);
 }
 
+static void app_control_flash_wren_probe(void)
+{
+    uint8_t before = 0U;
+    uint8_t after = 0U;
+    APP_FlashService_Status status =
+        APP_FlashService_WriteEnableProbe(&before, &after);
+
+    app_control_queue_proto_text(APP_PROTO_MSG_FLASH_BENCH,
+                                 "FLASH wren st=%u before=0x%02X after=0x%02X wel=%u busy=%u\r\n",
+                                 (unsigned int)status,
+                                 (unsigned int)before,
+                                 (unsigned int)after,
+                                 (unsigned int)((after & 0x02U) != 0U),
+                                 (unsigned int)((after & 0x01U) != 0U));
+}
+
+static void app_control_flash_status_regs(void)
+{
+    uint8_t sr1 = 0U;
+    uint8_t sr2 = 0U;
+    uint8_t sr3 = 0U;
+    APP_FlashService_Status st1 = APP_FlashService_ReadStatus1(&sr1);
+    APP_FlashService_Status st2 = APP_FlashService_ReadStatus2(&sr2);
+    APP_FlashService_Status st3 = APP_FlashService_ReadStatus3(&sr3);
+
+    app_control_queue_proto_text(APP_PROTO_MSG_FLASH_BENCH,
+                                 "FLASH sr st=%u/%u/%u sr1=0x%02X sr2=0x%02X sr3=0x%02X wip=%u wel=%u bp=0x%02X cmp=%u qe=%u srp=%u%u\r\n",
+                                 (unsigned int)st1,
+                                 (unsigned int)st2,
+                                 (unsigned int)st3,
+                                 (unsigned int)sr1,
+                                 (unsigned int)sr2,
+                                 (unsigned int)sr3,
+                                 (unsigned int)((sr1 & 0x01U) != 0U),
+                                 (unsigned int)((sr1 & 0x02U) != 0U),
+                                 (unsigned int)((sr1 >> 2U) & 0x1FU),
+                                 (unsigned int)((sr2 & 0x40U) != 0U),
+                                 (unsigned int)((sr2 & 0x02U) != 0U),
+                                 (unsigned int)((sr2 & 0x01U) != 0U),
+                                 (unsigned int)((sr1 & 0x80U) != 0U));
+}
+
+static void app_control_flash_unprotect(void)
+{
+    uint8_t sr1_before = 0U;
+    uint8_t sr2_before = 0U;
+    uint8_t sr1_after = 0U;
+    uint8_t sr2_after = 0U;
+    APP_FlashService_Status status =
+        APP_FlashService_ClearProtection(&sr1_before,
+                                         &sr2_before,
+                                         &sr1_after,
+                                         &sr2_after);
+
+    app_control_queue_proto_text(APP_PROTO_MSG_FLASH_BENCH,
+                                 "FLASH unprotect st=%u sr1_before=0x%02X sr2_before=0x%02X sr1_after=0x%02X sr2_after=0x%02X bp_after=0x%02X cmp_after=%u\r\n",
+                                 (unsigned int)status,
+                                 (unsigned int)sr1_before,
+                                 (unsigned int)sr2_before,
+                                 (unsigned int)sr1_after,
+                                 (unsigned int)sr2_after,
+                                 (unsigned int)((sr1_after >> 2U) & 0x1FU),
+                                 (unsigned int)((sr2_after & 0x40U) != 0U));
+}
+
+static void app_control_flash_scratch_test(char **tokens, uint32_t count)
+{
+    const uint32_t length = APP_FLASH_SERVICE_PAGE_SIZE;
+    uint32_t address;
+    uint32_t erase_kb;
+    APP_FlashService_Status erase_status;
+    APP_FlashService_Status write_status = APP_FLASH_SERVICE_ERROR;
+    APP_FlashService_Status read_status;
+    APP_FlashService_Status sr_status;
+    uint8_t status1 = 0U;
+    uint32_t ff_count = 0U;
+    uint32_t crc = 0U;
+    int match = 0;
+
+    if (!app_control_token_u32(tokens,
+                               count,
+                               3U,
+                               APP_CONTROL_FLASH_SCRATCH_ADDR,
+                               &address) ||
+        !app_control_token_u32(tokens, count, 4U, 4U, &erase_kb) ||
+        (address > (APP_FLASH_SERVICE_SIZE_BYTES - APP_FLASH_SERVICE_SECTOR_SIZE))) {
+        APP_Control_QueueText("ERR usage FLASH SCRATCH TEST [addr] [erase_kb 4|32|64]\r\n");
+        return;
+    }
+    if (erase_kb == 64U) {
+        if (((address % APP_FLASH_SERVICE_BLOCK64K_SIZE) != 0U) ||
+            (address > (APP_FLASH_SERVICE_SIZE_BYTES - APP_FLASH_SERVICE_BLOCK64K_SIZE))) {
+            APP_Control_QueueText("ERR flash scratch addr align for 64K erase\r\n");
+            return;
+        }
+        erase_status = APP_FlashService_EraseBlock64K(address);
+    } else if (erase_kb == 32U) {
+        if (((address % APP_FLASH_SERVICE_BLOCK32K_SIZE) != 0U) ||
+            (address > (APP_FLASH_SERVICE_SIZE_BYTES - APP_FLASH_SERVICE_BLOCK32K_SIZE))) {
+            APP_Control_QueueText("ERR flash scratch addr align for 32K erase\r\n");
+            return;
+        }
+        erase_status = APP_FlashService_EraseBlock32K(address);
+    } else if (erase_kb == 4U) {
+        if ((address % APP_FLASH_SERVICE_SECTOR_SIZE) != 0U) {
+            APP_Control_QueueText("ERR flash scratch addr align for 4K erase\r\n");
+            return;
+        }
+        erase_status = APP_FlashService_EraseSector(address);
+    } else {
+        APP_Control_QueueText("ERR usage FLASH SCRATCH TEST [addr] [erase_kb 4|32|64]\r\n");
+        return;
+    }
+
+    read_status = APP_FlashService_ReadData(address, control_flash_buf_a, length);
+    if (read_status == APP_FLASH_SERVICE_OK) {
+        for (uint32_t index = 0U; index < length; ++index) {
+            if (control_flash_buf_a[index] == 0xFFU) {
+                ++ff_count;
+            }
+        }
+    }
+
+    if ((erase_status == APP_FLASH_SERVICE_OK) &&
+        (read_status == APP_FLASH_SERVICE_OK) &&
+        (ff_count == length)) {
+        for (uint32_t index = 0U; index < length; ++index) {
+            control_flash_buf_b[index] =
+                (uint8_t)(0xA5U ^ (uint8_t)index ^ (uint8_t)(index >> 3U));
+        }
+        write_status = APP_FlashService_WriteData(address,
+                                                  control_flash_buf_b,
+                                                  length);
+        read_status = APP_FlashService_ReadData(address,
+                                                control_flash_buf_a,
+                                                length);
+        if ((write_status == APP_FLASH_SERVICE_OK) &&
+            (read_status == APP_FLASH_SERVICE_OK)) {
+            match = memcmp(control_flash_buf_a, control_flash_buf_b, length);
+            crc = app_control_crc32(control_flash_buf_a, length);
+        }
+    }
+
+    sr_status = APP_FlashService_ReadStatus1(&status1);
+    app_control_queue_proto_text(APP_PROTO_MSG_FLASH_BENCH,
+                                 "FLASH scratch_test addr=0x%06lX len=%lu erase_kb=%lu erase_st=%u read_st=%u ff=%lu write_st=%u match=%u crc=0x%08lX sr_st=%u sr1=0x%02X\r\n",
+                                 (unsigned long)address,
+                                 (unsigned long)length,
+                                 (unsigned long)erase_kb,
+                                 (unsigned int)erase_status,
+                                 (unsigned int)read_status,
+                                 (unsigned long)ff_count,
+                                 (unsigned int)write_status,
+                                 (unsigned int)((match == 0) &&
+                                                (write_status == APP_FLASH_SERVICE_OK) &&
+                                                (read_status == APP_FLASH_SERVICE_OK)),
+                                 (unsigned long)crc,
+                                 (unsigned int)sr_status,
+                                 (unsigned int)status1);
+}
+
 static void app_control_handle_flash(char **tokens, uint32_t count)
 {
     if (count < 2U) {
@@ -1285,13 +1464,26 @@ static void app_control_handle_flash(char **tokens, uint32_t count)
                (count >= 3U) &&
                (strcmp(tokens[2], "READ") == 0)) {
         app_control_flash_bench_read(tokens, count);
+    } else if ((strcmp(tokens[1], "SR?") == 0) ||
+               (strcmp(tokens[1], "STATUS?") == 0)) {
+        app_control_flash_status_regs();
+    } else if ((strcmp(tokens[1], "WREN?") == 0) ||
+               (strcmp(tokens[1], "WEL?") == 0)) {
+        app_control_flash_wren_probe();
+    } else if ((strcmp(tokens[1], "UNPROTECT") == 0) ||
+               (strcmp(tokens[1], "UNLOCK") == 0)) {
+        app_control_flash_unprotect();
+    } else if ((strcmp(tokens[1], "SCRATCH") == 0) &&
+               (count >= 3U) &&
+               (strcmp(tokens[2], "TEST") == 0)) {
+        app_control_flash_scratch_test(tokens, count);
     } else if (strcmp(tokens[1], "SCRATCH?") == 0) {
         app_control_queue_proto_text(APP_PROTO_MSG_FLASH_BENCH,
                                      "FLASH scratch addr=0x%06lX size=%lu note=reserved_test_sector\r\n",
                                      (unsigned long)APP_CONTROL_FLASH_SCRATCH_ADDR,
                                      (unsigned long)4096UL);
     } else {
-        APP_Control_QueueText("ERR usage FLASH VERIFY|BENCH READ|SCRATCH?\r\n");
+        APP_Control_QueueText("ERR usage FLASH VERIFY|BENCH READ|SR?|WREN?|UNPROTECT|SCRATCH?|SCRATCH TEST\r\n");
     }
 }
 
@@ -2882,7 +3074,7 @@ static void app_control_handle_flow(char **tokens, uint32_t count)
     BSP_OPTICAL_FLOW_StatusCode status;
 
     if ((count == 1U) || ((count >= 2U) && (strcmp(tokens[1], "?") == 0))) {
-        APP_Control_QueueText("ERR usage FLOW TX hex... | FLOW RX [max] | FLOW PINGAB\r\n");
+        APP_Control_QueueText("ERR usage FLOW TX hex... | FLOW RX [max] | FLOW XCV rx_len hex... | FLOW PINGAB\r\n");
         return;
     }
 
@@ -2914,6 +3106,47 @@ static void app_control_handle_flow(char **tokens, uint32_t count)
         }
         rx_count = BSP_OPTICAL_FLOW_ReceiveRaw(rx_bytes, (uint16_t)max_rx, 100U);
         APP_Control_QueueText("FLOW RX n=%u data=%02X,%02X,%02X,%02X,%02X,%02X,%02X,%02X\r\n",
+                              (unsigned int)rx_count,
+                              (unsigned int)((rx_count > 0U) ? rx_bytes[0] : 0U),
+                              (unsigned int)((rx_count > 1U) ? rx_bytes[1] : 0U),
+                              (unsigned int)((rx_count > 2U) ? rx_bytes[2] : 0U),
+                              (unsigned int)((rx_count > 3U) ? rx_bytes[3] : 0U),
+                              (unsigned int)((rx_count > 4U) ? rx_bytes[4] : 0U),
+                              (unsigned int)((rx_count > 5U) ? rx_bytes[5] : 0U),
+                              (unsigned int)((rx_count > 6U) ? rx_bytes[6] : 0U),
+                              (unsigned int)((rx_count > 7U) ? rx_bytes[7] : 0U));
+        return;
+    }
+
+    if (strcmp(tokens[1], "XCV") == 0) {
+        uint32_t max_rx;
+
+        if ((count < 4U) || ((count - 3U) > APP_CONTROL_FLOW_RAW_MAX_BYTES)) {
+            APP_Control_QueueText("ERR usage FLOW XCV rx_len hex... max=%u\r\n",
+                                  (unsigned int)APP_CONTROL_FLOW_RAW_MAX_BYTES);
+            return;
+        }
+
+        max_rx = strtoul(tokens[2], NULL, 0);
+        if ((max_rx == 0U) || (max_rx > sizeof(rx_bytes))) {
+            APP_Control_QueueText("ERR usage FLOW XCV rx_len 1..16 hex...\r\n");
+            return;
+        }
+
+        tx_count = count - 3U;
+        for (uint32_t i = 0U; i < tx_count; ++i) {
+            if (app_control_parse_hex_byte(tokens[i + 3U], &tx_bytes[i]) == 0U) {
+                APP_Control_QueueText("ERR flow hex %s\r\n", tokens[i + 3U]);
+                return;
+            }
+        }
+
+        status = BSP_OPTICAL_FLOW_TransceiveRaw(tx_bytes, (uint16_t)tx_count,
+                                                rx_bytes, (uint16_t)max_rx,
+                                                &rx_count, 100U);
+        APP_Control_QueueText("FLOW XCV st=%ld tx_n=%lu rx_n=%u data=%02X,%02X,%02X,%02X,%02X,%02X,%02X,%02X\r\n",
+                              (long)status,
+                              (unsigned long)tx_count,
                               (unsigned int)rx_count,
                               (unsigned int)((rx_count > 0U) ? rx_bytes[0] : 0U),
                               (unsigned int)((rx_count > 1U) ? rx_bytes[1] : 0U),
@@ -3038,6 +3271,8 @@ static uint8_t app_control_handle_pid_slider_line(const char *line)
         { "vel_z_kd",       "coax.vel_z_kd"       },
         { "accel_xy",       "coax.accel_xy_limit_m_s2" },
         { "accel_z",        "coax.accel_z_limit_m_s2"  },
+        { "accel_xy_limit_m_s2", "coax.accel_xy_limit_m_s2" },
+        { "accel_z_limit_m_s2",  "coax.accel_z_limit_m_s2"  },
         { "vel_loop_enable", "coax.vel_loop_enable" },
         { "vel_loop_x_kp",  "coax.vel_loop_x_kp" },
         { "vel_loop_x_ki",  "coax.vel_loop_x_ki" },
@@ -3358,6 +3593,8 @@ static void app_control_dispatch_tokens(char **tokens, uint32_t count, uint8_t e
         APP_OpticalFlow_Report();
     } else if (strcmp(tokens[0], "FLOW") == 0) {
         app_control_handle_flow(tokens, count);
+    } else if (strcmp(tokens[0], "RANGE?") == 0) {
+        APP_Rangefinder_Report();
     } else if (strcmp(tokens[0], "GPS?") == 0) {
         APP_GPS_Report();
     } else if (strcmp(tokens[0], "MAG?") == 0) {

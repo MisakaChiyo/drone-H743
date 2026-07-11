@@ -6,6 +6,16 @@
 #define LC307_CONFIG_DELAY_MS      100U
 #define LC307_CONFIG_TIMEOUT_MS    100U
 #define LC307_CONFIG_AB_RETRIES    3U
+#define LC307_CONFIG_BB_TIMEOUT_MS 50U
+#define LC307_CONFIG_BB_RETRIES    5U
+#define LC307_CONFIG_BB_GAP_MS     5U
+#define LC307_CONFIG_RESET_MS      50U
+#define LC307_STATUS_SCAN_MAX      32U
+#define LC307_STATUS_BYTE_TIMEOUT_MS 5U
+#define LC307_DRAIN_BYTE_MAX       96U
+#define LC307_DRAIN_TIMEOUT_MS     2U
+#define LC307_STREAM_PROBE_MS      500U
+#define LC307_STREAM_PROBE_FRAMES  2U
 #define LC307_CMD_AA               0xAAU
 #define LC307_CMD_AB               0xABU
 #define LC307_CMD_BB               0xBBU
@@ -256,33 +266,130 @@ static void flow_abort_rx(DRV_OPTICAL_FLOW_Device *dev)
     dev->rx_active = 0U;
 }
 
+static void flow_lc307_drain_rx(DRV_OPTICAL_FLOW_Device *dev)
+{
+    if ((dev == NULL) || (dev->bus.huart == NULL)) {
+        return;
+    }
+
+    for (uint32_t index = 0U; index < LC307_DRAIN_BYTE_MAX; ++index) {
+        uint8_t byte = 0U;
+        HAL_StatusTypeDef status =
+            HAL_UART_Receive(dev->bus.huart, &byte, 1U, LC307_DRAIN_TIMEOUT_MS);
+        dev->config_last_hal_status = (uint32_t)status;
+        if (status != HAL_OK) {
+            dev->bus.huart->ErrorCode = HAL_UART_ERROR_NONE;
+            break;
+        }
+    }
+}
+
+static uint8_t flow_lc307_probe_stream(DRV_OPTICAL_FLOW_Device *dev,
+                                       uint32_t probe_ms,
+                                       uint32_t min_frames)
+{
+    uint32_t start_ms;
+    uint32_t start_frames;
+
+    if ((dev == NULL) || (dev->bus.huart == NULL)) {
+        return 0U;
+    }
+
+    flow_reset_parser(dev);
+    start_ms = HAL_GetTick();
+    start_frames = dev->frames;
+
+    while ((HAL_GetTick() - start_ms) < probe_ms) {
+        uint8_t byte = 0U;
+        HAL_StatusTypeDef status =
+            HAL_UART_Receive(dev->bus.huart,
+                             &byte,
+                             1U,
+                             LC307_STATUS_BYTE_TIMEOUT_MS);
+
+        dev->config_last_hal_status = (uint32_t)status;
+        if (status == HAL_TIMEOUT) {
+            continue;
+        }
+        if (status != HAL_OK) {
+            dev->last_uart_error = dev->bus.huart->ErrorCode;
+            __HAL_UART_CLEAR_FLAG(dev->bus.huart, UART_CLEAR_OREF | UART_CLEAR_NEF |
+                                             UART_CLEAR_PEF | UART_CLEAR_FEF);
+            dev->bus.huart->ErrorCode = HAL_UART_ERROR_NONE;
+            continue;
+        }
+
+        (void)DRV_OPTICAL_FLOW_ConsumeByte(dev, byte);
+        if (((dev->frames - start_frames) >= min_frames) &&
+            (dev->latest.valid == DRV_OPTICAL_FLOW_VALID)) {
+            flow_reset_parser(dev);
+            return 1U;
+        }
+    }
+
+    flow_reset_parser(dev);
+    return 0U;
+}
+
 static uint8_t flow_lc307_expect_status(DRV_OPTICAL_FLOW_Device *dev,
                                         uint8_t command,
-                                        uint8_t *capture)
+                                        uint8_t *capture,
+                                        uint32_t timeout_ms)
 {
-    uint8_t response[3] = {0U, 0U, 0U};
-    HAL_StatusTypeDef status;
+    uint8_t window[3] = {0U, 0U, 0U};
+    uint32_t received = 0U;
+    uint32_t effective_timeout = (timeout_ms != 0U) ? timeout_ms :
+                                 flow_timeout_ms(dev);
+    uint32_t start_ms = HAL_GetTick();
 
-    status = HAL_UART_Receive(dev->bus.huart, response, sizeof(response),
-                              flow_timeout_ms(dev));
-    dev->config_last_hal_status = (uint32_t)status;
     if (capture != NULL) {
-        capture[0] = response[0];
-        capture[1] = response[1];
-        capture[2] = response[2];
+        capture[0] = 0U;
+        capture[1] = 0U;
+        capture[2] = 0U;
     }
 
-    if (status != HAL_OK) {
-        dev->last_uart_error = dev->bus.huart->ErrorCode;
-        return 0U;
+    for (uint32_t index = 0U; index < LC307_STATUS_SCAN_MAX; ++index) {
+        uint8_t byte = 0U;
+        HAL_StatusTypeDef status =
+            HAL_UART_Receive(dev->bus.huart,
+                             &byte,
+                             1U,
+                             LC307_STATUS_BYTE_TIMEOUT_MS);
+
+        dev->config_last_hal_status = (uint32_t)status;
+        if (status == HAL_TIMEOUT) {
+            if ((HAL_GetTick() - start_ms) >= effective_timeout) {
+                return 0U;
+            }
+            continue;
+        }
+        if (status != HAL_OK) {
+            dev->last_uart_error = dev->bus.huart->ErrorCode;
+            return 0U;
+        }
+
+        window[0] = window[1];
+        window[1] = window[2];
+        window[2] = byte;
+        if (received < 3U) {
+            received++;
+        }
+
+        if (capture != NULL) {
+            capture[0] = window[0];
+            capture[1] = window[1];
+            capture[2] = window[2];
+        }
+
+        if ((received >= 3U) &&
+            (window[0] == command) &&
+            (window[1] == 0x00U) &&
+            (window[2] == (uint8_t)(window[0] ^ window[1]))) {
+            return 1U;
+        }
     }
 
-    if ((response[0] != command) || (response[1] != 0x00U) ||
-        (response[2] != (uint8_t)(response[0] ^ response[1]))) {
-        return 0U;
-    }
-
-    return 1U;
+    return 0U;
 }
 
 static uint8_t flow_lc307_transmit(DRV_OPTICAL_FLOW_Device *dev,
@@ -308,8 +415,10 @@ static void flow_lc307_configure(DRV_OPTICAL_FLOW_Device *dev)
     dev->config_bb_expected = table_count;
 
     flow_delay_ms(dev, LC307_CONFIG_DELAY_MS);
+    flow_lc307_drain_rx(dev);
 
     for (uint32_t attempt = 0U; attempt < LC307_CONFIG_AB_RETRIES; ++attempt) {
+        flow_lc307_drain_rx(dev);
         __HAL_UART_CLEAR_FLAG(dev->bus.huart, UART_CLEAR_OREF | UART_CLEAR_NEF |
                                            UART_CLEAR_PEF | UART_CLEAR_FEF);
         dev->bus.huart->ErrorCode = HAL_UART_ERROR_NONE;
@@ -326,7 +435,8 @@ static void flow_lc307_configure(DRV_OPTICAL_FLOW_Device *dev)
         }
 
         if (flow_lc307_expect_status(dev, LC307_CMD_AB,
-                                     dev->config_ab_response) != 0U) {
+                                     dev->config_ab_response,
+                                     flow_timeout_ms(dev)) != 0U) {
             dev->config_ab_ok = 1U;
             break;
         }
@@ -355,21 +465,45 @@ static void flow_lc307_configure(DRV_OPTICAL_FLOW_Device *dev)
                       lc307_config_table[i].value)
         };
 
-        if (flow_lc307_transmit(dev, bb_command, sizeof(bb_command)) == 0U) {
-            dev->config_errors++;
-            dev->config_bb_errors++;
-            dev->config_last_error = LC307_ERR_BB_TX;
-            return;
-        }
-        dev->config_bb_sent++;
+        uint8_t bb_ok = 0U;
+        for (uint32_t attempt = 0U; attempt < LC307_CONFIG_BB_RETRIES; ++attempt) {
+            flow_lc307_drain_rx(dev);
+            __HAL_UART_CLEAR_FLAG(dev->bus.huart, UART_CLEAR_OREF | UART_CLEAR_NEF |
+                                               UART_CLEAR_PEF | UART_CLEAR_FEF);
+            dev->bus.huart->ErrorCode = HAL_UART_ERROR_NONE;
 
-        if (flow_lc307_expect_status(dev, LC307_CMD_BB, NULL) == 0U) {
+            if (flow_lc307_transmit(dev, bb_command, sizeof(bb_command)) == 0U) {
+                dev->config_errors++;
+                dev->config_bb_errors++;
+                dev->config_last_error = LC307_ERR_BB_TX;
+                return;
+            }
+            dev->config_bb_sent++;
+
+            if (flow_lc307_expect_status(dev, LC307_CMD_BB,
+                                         dev->config_bb_response,
+                                         LC307_CONFIG_BB_TIMEOUT_MS) != 0U) {
+                dev->config_bb_ok++;
+                bb_ok = 1U;
+                break;
+            }
+
+            flow_delay_ms(dev, LC307_CONFIG_BB_GAP_MS);
+        }
+
+        if (bb_ok == 0U) {
             dev->config_errors++;
             dev->config_bb_errors++;
             dev->config_last_error = LC307_ERR_BB_RX;
             return;
         }
-        dev->config_bb_ok++;
+
+        if ((lc307_config_table[i].reg == 0x12U) &&
+            (lc307_config_table[i].value == 0x80U)) {
+            flow_delay_ms(dev, LC307_CONFIG_RESET_MS);
+        } else {
+            flow_delay_ms(dev, LC307_CONFIG_BB_GAP_MS);
+        }
     }
 
     if (flow_lc307_transmit(dev, &dd_command, 1U) == 0U) {
@@ -487,10 +621,17 @@ DRV_OPTICAL_FLOW_Status DRV_OPTICAL_FLOW_Init(DRV_OPTICAL_FLOW_Device *dev,
         return DRV_OPTICAL_FLOW_ERROR;
     }
 
-    flow_lc307_configure(dev);
+    if (flow_lc307_probe_stream(dev,
+                                LC307_STREAM_PROBE_MS,
+                                LC307_STREAM_PROBE_FRAMES) != 0U) {
+        dev->config_status = DRV_OPTICAL_FLOW_CONFIG_OK;
+    } else {
+        flow_lc307_configure(dev);
+    }
     dev->initialized = 1U;
     flow_restart_rx(dev);
-    return DRV_OPTICAL_FLOW_OK;
+    return (dev->config_status == DRV_OPTICAL_FLOW_CONFIG_OK) ?
+           DRV_OPTICAL_FLOW_OK : DRV_OPTICAL_FLOW_ERROR;
 }
 
 void DRV_OPTICAL_FLOW_Service(DRV_OPTICAL_FLOW_Device *dev)

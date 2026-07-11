@@ -3,8 +3,12 @@
 #include "app_aiwb2.h"
 #include "app_control.h"
 #include "app_elrs.h"
+#include "app_led.h"
 #include "app_maint_uart.h"
+#include "app_optical_flow.h"
+#include "app_rangefinder.h"
 #include "bsp_optical_flow.h"
+#include "bsp_rangefinder.h"
 #include "app_tasks.h"
 #include "bsp_aiwb2_power.h"
 #include "bsp_led.h"
@@ -377,6 +381,7 @@ void APP_UART_Task_Init(void)
     BSP_AiWB2_SetEnabled(0U);  /* 数传模式：关闭 WiFi 模块电源 */
 #endif
     APP_Task_MaintUART_Init();
+    APP_Rangefinder_Init();
     app_uart_prepare_tx_dma();
     app_uart_start_rx_dma();
 #endif
@@ -877,27 +882,15 @@ void APP_UART_Task_Step(void)
 
     app_uart_poll_rx();
     APP_Task_MaintUART_Step();
+    APP_Rangefinder_Step();
     now_ms = HAL_GetTick();
     app_uart_flush_idle_line(now_ms);
 #if (APP_UART_DIRECT_SERIAL_MODE == 0U)
     APP_AiWB2_Tick();
 #endif
 
-    /* PC13 LED: 数传直连模式快闪，WiFi 模式初始慢闪 → 透传快闪 */
-    {
-        static uint32_t led_toggle_ms;
-#if (APP_UART_DIRECT_SERIAL_MODE != 0U)
-        uint32_t period_ms = 120U;
-#else
-        uint32_t period_ms = ((APP_AiWB2_IsTransparent() != 0U) ||
-                              (APP_AiWB2_IsSocketReady() != 0U)) ? 120U : 500U;
-#endif
-
-        if ((now_ms - led_toggle_ms) >= period_ms) {
-            led_toggle_ms = now_ms;
-            BSP_LED_Toggle(LED_RED);
-        }
-    }
+    APP_OpticalFlow_ServiceRecovery();
+    APP_LED_Task_Step();
 
     app_uart_ensure_control_ready();
     if ((app_uart_control_initialized != 0U)
@@ -1054,6 +1047,10 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         BSP_OPTICAL_FLOW_OnUartRxEvent(huart, Size);
         return;
     }
+    if (huart->Instance == UART8) {
+        BSP_Rangefinder_OnUartRxEvent(huart, Size);
+        return;
+    }
     APP_UART_OnRxEvent(huart, Size);
 }
 
@@ -1088,5 +1085,6 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     }
     APP_UART_OnError(huart);
     BSP_OPTICAL_FLOW_OnUartError(huart);
+    BSP_Rangefinder_OnUartError(huart);
     APP_MaintUART_OnError(huart);
 }

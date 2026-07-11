@@ -12,9 +12,19 @@ typedef enum {
     APP_OPTICAL_FLOW_VEL_SOURCE_FLOW = 1
 } APP_OPTICAL_FLOW_VelSource;
 
+typedef enum {
+    APP_OPTICAL_FLOW_HEALTH_STARTING = 0,
+    APP_OPTICAL_FLOW_HEALTH_OK = 1,
+    APP_OPTICAL_FLOW_HEALTH_RETRYING = 2,
+    APP_OPTICAL_FLOW_HEALTH_FAILED = 3
+} APP_OPTICAL_FLOW_Health;
+
 typedef struct {
     uint8_t initialized;
     int32_t init_status;
+    APP_OPTICAL_FLOW_Health health;
+    uint32_t init_attempts;
+    uint32_t recovery_count;
     uint8_t valid;
     uint8_t version;
     uint8_t velocity_valid;
@@ -33,6 +43,7 @@ typedef struct {
     uint8_t config_ab_ok;
     uint8_t config_missing_table;
     uint8_t config_ab_response[3];
+    uint8_t config_bb_response[3];
     uint32_t config_errors;
     uint32_t config_last_error;
     uint32_t config_last_hal_status;
@@ -65,7 +76,12 @@ typedef struct {
 
 void APP_OpticalFlow_Init(void);
 void APP_OpticalFlow_Step(void);
+void APP_OpticalFlow_ServiceRecovery(void);
 void APP_OpticalFlow_UpdateHeightFromPressure(float pressure_pa, uint8_t fresh);
+void APP_OpticalFlow_UpdateHeightFromRange(float height_m,
+                                           float raw_height_m,
+                                           uint8_t valid,
+                                           uint32_t sample_ms);
 uint8_t APP_OpticalFlow_GetVelocity(float *vx_m_s, float *vy_m_s);
 uint8_t APP_OpticalFlow_GetVelocitySample(float *vx_m_s,
                                           float *vy_m_s,
