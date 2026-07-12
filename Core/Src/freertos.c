@@ -50,6 +50,7 @@
 #include "app_diag.h"
 #include "app_flight_log.h"
 #include "app_led.h"
+#include "app_nav_estimator.h"
 #include "app_sensor.h"
 #include "app_messages.h"
 #include "app_tasks.h"
@@ -70,12 +71,16 @@
 #include "drv_airframe_model.h"
 #include "drv_coax_ctrl.h"
 #include "drv_imu_nav.h"
+#include "drv_nav_ekf.h"
 
 #define STABILIZER_SERVO_MOVE_TIME_MS 0U
 #define STABILIZER_NAV_ACCEL_LPF_ALPHA 0.94f
 #define STABILIZER_NAV_VEL_LEAK_HZ 0.25f
-#define STABILIZER_FLOW_VEL_LPF_ALPHA 0.15f
-#define STABILIZER_FLOW_CORRECTION_GAIN 0.08f
+#define STABILIZER_NAV_EKF_FLOW_NOISE_M_S 0.25f
+#define STABILIZER_NAV_EKF_IMU_BRIDGE_TIMEOUT_MS 80U
+#define STABILIZER_NAV_EKF_FLOW_LOST_DECAY_HZ 8.0f
+#define STABILIZER_NAV_EKF_CONTROL_TIMEOUT_MS 150U
+#define STABILIZER_NAV_EKF_CONTROL_MAX_SPEED_M_S 1.50f
 
 /* USER CODE END Includes */
 
@@ -160,7 +165,7 @@
 #define STABILIZER_RC_LOSS_TIMEOUT_MS  500U
 #define STABILIZER_FLIGHT_LOG_TAIL_RECORDS 125U /* 250 Hz log tail, about 500 ms */
 #define STABILIZER_USE_RC_DIRECT_TILT_SERVO 0U   /* 0=自稳定控制器, 1=CH1/CH2 直控舵机调试 */
-#define STABILIZER_RC_DIRECT_TILT_LIMIT_RAD 0.261799395f /* 遥控直控调试最大 ±15° */
+#define STABILIZER_RC_DIRECT_TILT_LIMIT_RAD 0.523598776f /* 遥控直控调试最大 ±30° */
 
 /*
  * ============================================================================
@@ -472,81 +477,108 @@ typedef struct {
 
 typedef struct {
   float vel_m_s[2];
-  float flow_lpf_m_s[2];
-  uint8_t initialized;
-  uint8_t flow_lpf_valid;
-  uint32_t last_flow_sample_ms;
+  DRV_NAV_EKF_State ekf;
+  DRV_NAV_EKF_Diagnostics diagnostics;
 } StabilizerVelocityEstimatorState;
 
 static StabilizerVofaDebug stabilizer_vofa_debug;
 
 static void stabilizer_velocity_estimator_reset(StabilizerVelocityEstimatorState *state)
 {
+  DRV_NAV_EKF_Config config;
+
   if (state == NULL) {
     return;
   }
 
-  state->vel_m_s[0] = 0.0f;
-  state->vel_m_s[1] = 0.0f;
-  state->flow_lpf_m_s[0] = 0.0f;
-  state->flow_lpf_m_s[1] = 0.0f;
-  state->initialized = 0U;
-  state->flow_lpf_valid = 0U;
-  state->last_flow_sample_ms = 0U;
+  DRV_NAV_EKF_DefaultConfig(&config);
+  config.flow_noise_m_s = STABILIZER_NAV_EKF_FLOW_NOISE_M_S;
+  DRV_NAV_EKF_Reset(&state->ekf, &config);
+  DRV_NAV_EKF_GetDiagnostics(&state->ekf, &state->diagnostics);
+  APP_NavEstimator_PublishVelocityEKF(&state->diagnostics);
+  state->vel_m_s[0] = state->diagnostics.vel_m_s[0];
+  state->vel_m_s[1] = state->diagnostics.vel_m_s[1];
 }
 
-static void stabilizer_velocity_estimator_step(StabilizerVelocityEstimatorState *state,
-                                               float acc_x_m_s2,
-                                               float acc_y_m_s2,
-                                               float imu_vx_m_s,
-                                               float imu_vy_m_s,
-                                               float flow_vx_m_s,
-                                               float flow_vy_m_s,
-                                               uint8_t flow_valid,
-                                               uint32_t flow_sample_ms,
-                                               float dt_sec)
+static uint8_t stabilizer_velocity_estimator_step(StabilizerVelocityEstimatorState *state,
+                                                  float acc_x_m_s2,
+                                                  float acc_y_m_s2,
+                                                  float imu_vx_m_s,
+                                                  float imu_vy_m_s,
+                                                  float flow_vx_m_s,
+                                                  float flow_vy_m_s,
+                                                  uint8_t flow_valid,
+                                                  uint32_t flow_sample_ms,
+                                                  float dt_sec)
 {
-  uint8_t new_flow_sample = 0U;
+  uint8_t flow_accepted;
+  uint8_t imu_bridge_ok = 0U;
+  uint32_t now_ms = HAL_GetTick();
 
   if (state == NULL) {
-    return;
+    return 0U;
   }
 
   if (dt_sec <= 0.0f) {
     dt_sec = SENSOR_IMU_DEFAULT_DT_SEC;
   }
 
-  if (state->initialized == 0U) {
-    state->vel_m_s[0] = imu_vx_m_s;
-    state->vel_m_s[1] = imu_vy_m_s;
-    state->initialized = 1U;
+  (void)imu_vx_m_s;
+  (void)imu_vy_m_s;
+  if ((state->diagnostics.flow_update_count != 0U) &&
+      (state->diagnostics.last_flow_update_ms != 0U) &&
+      ((now_ms - state->diagnostics.last_flow_update_ms) <=
+       STABILIZER_NAV_EKF_IMU_BRIDGE_TIMEOUT_MS)) {
+    imu_bridge_ok = 1U;
   }
 
-  state->vel_m_s[0] += acc_x_m_s2 * dt_sec;
-  state->vel_m_s[1] += acc_y_m_s2 * dt_sec;
+  if (imu_bridge_ok != 0U) {
+    DRV_NAV_EKF_Predict(&state->ekf, acc_x_m_s2, acc_y_m_s2, dt_sec);
+  } else {
+    float decay = 1.0f - (STABILIZER_NAV_EKF_FLOW_LOST_DECAY_HZ * dt_sec);
+    decay = stabilizer_clamp_f32(decay, 0.0f, 1.0f);
+    state->ekf.vel_m_s[0] *= decay;
+    state->ekf.vel_m_s[1] *= decay;
+    state->ekf.accel_bias_m_s2[0] = 0.0f;
+    state->ekf.accel_bias_m_s2[1] = 0.0f;
+  }
+  flow_accepted = DRV_NAV_EKF_FuseFlow(&state->ekf,
+                                       flow_vx_m_s,
+                                       flow_vy_m_s,
+                                       flow_valid,
+                                       flow_sample_ms,
+                                       STABILIZER_NAV_EKF_FLOW_NOISE_M_S);
+  DRV_NAV_EKF_GetDiagnostics(&state->ekf, &state->diagnostics);
+  APP_NavEstimator_PublishVelocityEKF(&state->diagnostics);
+  state->vel_m_s[0] = state->diagnostics.vel_m_s[0];
+  state->vel_m_s[1] = state->diagnostics.vel_m_s[1];
+  return flow_accepted;
+}
 
-  if ((flow_valid != 0U) && (flow_sample_ms != state->last_flow_sample_ms)) {
-    new_flow_sample = 1U;
-    state->last_flow_sample_ms = flow_sample_ms;
+static uint8_t stabilizer_velocity_estimator_control_ok(
+  const StabilizerVelocityEstimatorState *state,
+  uint32_t now_ms)
+{
+  float vx;
+  float vy;
+
+  if ((state == NULL) ||
+      (state->diagnostics.initialized == 0U) ||
+      (state->diagnostics.flow_update_count == 0U) ||
+      (state->diagnostics.last_flow_update_ms == 0U) ||
+      ((now_ms - state->diagnostics.last_flow_update_ms) >
+       STABILIZER_NAV_EKF_CONTROL_TIMEOUT_MS)) {
+    return 0U;
   }
 
-  if (new_flow_sample != 0U) {
-    if (state->flow_lpf_valid == 0U) {
-      state->flow_lpf_m_s[0] = flow_vx_m_s;
-      state->flow_lpf_m_s[1] = flow_vy_m_s;
-      state->flow_lpf_valid = 1U;
-    } else {
-      state->flow_lpf_m_s[0] += STABILIZER_FLOW_VEL_LPF_ALPHA *
-                                (flow_vx_m_s - state->flow_lpf_m_s[0]);
-      state->flow_lpf_m_s[1] += STABILIZER_FLOW_VEL_LPF_ALPHA *
-                                (flow_vy_m_s - state->flow_lpf_m_s[1]);
-    }
-
-    state->vel_m_s[0] += STABILIZER_FLOW_CORRECTION_GAIN *
-                         (state->flow_lpf_m_s[0] - state->vel_m_s[0]);
-    state->vel_m_s[1] += STABILIZER_FLOW_CORRECTION_GAIN *
-                         (state->flow_lpf_m_s[1] - state->vel_m_s[1]);
+  vx = state->diagnostics.vel_m_s[0];
+  vy = state->diagnostics.vel_m_s[1];
+  if ((fabsf(vx) > STABILIZER_NAV_EKF_CONTROL_MAX_SPEED_M_S) ||
+      (fabsf(vy) > STABILIZER_NAV_EKF_CONTROL_MAX_SPEED_M_S)) {
+    return 0U;
   }
+
+  return 1U;
 }
 
 static void stabilizer_velocity_pid_reset(StabilizerVelocityPidState *state)
@@ -1070,20 +1102,23 @@ void StabilizerTask(void *argument)
             APP_OpticalFlow_GetVelocitySample(&flow_vx_m_s,
                                               &flow_vy_m_s,
                                               &flow_sample_ms);
+          uint8_t flow_accepted = 0U;
 
-          stabilizer_velocity_estimator_step(&vel_estimator,
-                                             nav_state.acc_nav_m_s2[0],
-                                             nav_state.acc_nav_m_s2[1],
-                                             velocity_imu_x_m_s,
-                                             velocity_imu_y_m_s,
-                                             flow_vx_m_s,
-                                             flow_vy_m_s,
-                                             flow_valid,
-                                             flow_sample_ms,
-                                             dt_sec);
+          flow_accepted = stabilizer_velocity_estimator_step(&vel_estimator,
+                                                             nav_state.acc_nav_m_s2[0],
+                                                             nav_state.acc_nav_m_s2[1],
+                                                             velocity_imu_x_m_s,
+                                                             velocity_imu_y_m_s,
+                                                             flow_vx_m_s,
+                                                             flow_vy_m_s,
+                                                             flow_valid,
+                                                             flow_sample_ms,
+                                                             dt_sec);
           velocity_state_x_m_s = vel_estimator.vel_m_s[0];
           velocity_state_y_m_s = vel_estimator.vel_m_s[1];
-          if (flow_valid == 0U) {
+          if (flow_accepted != 0U) {
+            APP_OpticalFlow_SetVelocitySource(APP_OPTICAL_FLOW_VEL_SOURCE_FLOW);
+          } else {
             APP_OpticalFlow_SetVelocitySource(APP_OPTICAL_FLOW_VEL_SOURCE_IMU);
           }
         }
@@ -1277,14 +1312,20 @@ void StabilizerTask(void *argument)
                                              &range_velocity_m_s,
                                              &range_sample_ms);
           (void)range_sample_ms;
+          {
+            uint8_t velocity_control_ok =
+              stabilizer_velocity_estimator_control_ok(&vel_estimator, now);
+
           attitude.roll_rad = roll_control * STABILIZER_DEG_TO_RAD;
           attitude.pitch_rad = pitch_control * STABILIZER_DEG_TO_RAD;
           attitude.yaw_rad = yaw_control * STABILIZER_DEG_TO_RAD;
           attitude.x_m = 0.0f;
           attitude.y_m = 0.0f;
           attitude.z_m = -range_height_m;
-          attitude.vx_m_s = velocity_state_x_m_s;
-          attitude.vy_m_s = velocity_state_y_m_s;
+          attitude.vx_m_s = (velocity_control_ok != 0U) ?
+                            velocity_state_x_m_s : 0.0f;
+          attitude.vy_m_s = (velocity_control_ok != 0U) ?
+                            velocity_state_y_m_s : 0.0f;
           attitude.vz_m_s = -range_velocity_m_s;
           if (range_height_valid == 0U) {
             attitude.z_m = 0.0f;
@@ -1341,7 +1382,8 @@ void StabilizerTask(void *argument)
             vofa_debug.vel_loop_output_limit_m_s2 = vel_loop_output_limit_m_s2;
             vofa_debug.vel_loop_i_limit_m_s2 = vel_loop_i_limit_m_s2;
 
-            if (vel_loop_enable >= 0.5f) {
+            if ((vel_loop_enable >= 0.5f) &&
+                (velocity_control_ok != 0U)) {
               position_ref_x_m = 0.0f;
               position_ref_y_m = 0.0f;
               reference.ax_m_s2 =
@@ -1376,14 +1418,8 @@ void StabilizerTask(void *argument)
             } else {
               stabilizer_velocity_pid_reset(&vel_pid_x);
               stabilizer_velocity_pid_reset(&vel_pid_y);
-              reference.ax_m_s2 =
-                stabilizer_clamp_f32((vel_ref_x_m_s - velocity_state_x_m_s) / ctrl_dt_sec,
-                                     -STABILIZER_XY_ACCEL_LIMIT_M_S2,
-                                      STABILIZER_XY_ACCEL_LIMIT_M_S2);
-              reference.ay_m_s2 =
-                stabilizer_clamp_f32((vel_ref_y_m_s - velocity_state_y_m_s) / ctrl_dt_sec,
-                                     -STABILIZER_XY_ACCEL_LIMIT_M_S2,
-                                      STABILIZER_XY_ACCEL_LIMIT_M_S2);
+              reference.ax_m_s2 = 0.0f;
+              reference.ay_m_s2 = 0.0f;
               vofa_debug.vel_pid_p_m_s2[0] = 0.0f;
               vofa_debug.vel_pid_i_m_s2[0] = 0.0f;
               vofa_debug.vel_pid_d_m_s2[0] = 0.0f;
@@ -1441,6 +1477,7 @@ void StabilizerTask(void *argument)
           vofa_debug.range_vertical_velocity_m_s = range_velocity_m_s;
           vofa_debug.altitude_ref_m = -reference.z_m;
           vofa_debug.altitude_correction_us = (float)altitude_correction_us;
+          }
 
           moves[0].pulse_us = ctrl_out.servo_alpha_us;
           moves[1].pulse_us = ctrl_out.servo_beta_us;

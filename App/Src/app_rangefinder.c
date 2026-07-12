@@ -11,6 +11,7 @@
 #define APP_RANGEFINDER_TIMEOUT_MS       100U
 #define APP_RANGEFINDER_MIN_DISTANCE_M   0.02f
 #define APP_RANGEFINDER_MAX_DISTANCE_M  12.0f
+#define APP_RANGEFINDER_MIN_STRENGTH     80U
 #define APP_RANGEFINDER_HEIGHT_ALPHA     0.35f
 #define APP_RANGEFINDER_VELOCITY_ALPHA   0.20f
 #define APP_RANGEFINDER_MAX_VELOCITY_M_S 5.0f
@@ -61,11 +62,15 @@ void APP_Rangefinder_Step(void)
 
     if (bsp_status.frames != range_ctx.processed_frames) {
         float raw_distance_m = (float)bsp_status.latest.distance_cm * 0.01f;
-        uint8_t sample_valid =
+        uint8_t distance_valid =
             ((raw_distance_m >= APP_RANGEFINDER_MIN_DISTANCE_M) &&
-             (raw_distance_m <= APP_RANGEFINDER_MAX_DISTANCE_M) &&
-             (bsp_status.latest.strength != 0U) &&
+             (raw_distance_m <= APP_RANGEFINDER_MAX_DISTANCE_M)) ? 1U : 0U;
+        uint8_t strength_valid =
+            ((bsp_status.latest.strength >= APP_RANGEFINDER_MIN_STRENGTH) &&
              (bsp_status.latest.strength != 0xFFFFU)) ? 1U : 0U;
+        uint8_t sample_valid =
+            ((distance_valid != 0U) &&
+             (strength_valid != 0U)) ? 1U : 0U;
 
         range_ctx.processed_frames = bsp_status.frames;
         range_ctx.status.distance_cm = bsp_status.latest.distance_cm;
@@ -100,13 +105,21 @@ void APP_Rangefinder_Step(void)
             range_ctx.previous_sample_ms = bsp_status.latest.received_ms;
             range_ctx.status.valid = 1U;
         } else {
-            range_ctx.status.valid = 0U;
+            if ((range_ctx.previous_sample_ms == 0U) ||
+                ((now - range_ctx.previous_sample_ms) > APP_RANGEFINDER_TIMEOUT_MS)) {
+                range_ctx.status.valid = 0U;
+            }
+            range_ctx.status.rejected_samples++;
+            if (strength_valid == 0U) {
+                range_ctx.status.strength_rejects++;
+            }
         }
     }
 
     range_ctx.status.age_ms = (range_ctx.status.sample_ms != 0U) ?
                            (now - range_ctx.status.sample_ms) : 0xFFFFFFFFUL;
-    if (range_ctx.status.age_ms > APP_RANGEFINDER_TIMEOUT_MS) {
+    if ((range_ctx.previous_sample_ms == 0U) ||
+        ((now - range_ctx.previous_sample_ms) > APP_RANGEFINDER_TIMEOUT_MS)) {
         range_ctx.status.valid = 0U;
         range_ctx.status.vertical_velocity_m_s = 0.0f;
     }
@@ -148,7 +161,7 @@ void APP_Rangefinder_Report(void)
     APP_RangefinderStatus status;
 
     APP_Rangefinder_GetStatus(&status);
-    APP_Control_QueueText("RANGE ok=%u init=%u age_ms=%lu dist_cm=%u raw_mm=%ld height_mm=%ld vz_mm_s=%ld strength=%u temp_cdeg=%ld frames=%lu bytes=%lu cksum=%lu frame_err=%lu rst=%lu dma_evt=%lu uerr=%lu last_err=0x%lX\r\n",
+    APP_Control_QueueText("RANGE ok=%u init=%u age_ms=%lu dist_cm=%u raw_mm=%ld height_mm=%ld vz_mm_s=%ld strength=%u min_strength=%u rej=%lu strength_rej=%lu step_rej=%lu temp_cdeg=%ld frames=%lu bytes=%lu cksum=%lu frame_err=%lu rst=%lu dma_evt=%lu uerr=%lu last_err=0x%lX\r\n",
                           (unsigned int)status.valid,
                           (unsigned int)status.initialized,
                           (unsigned long)status.age_ms,
@@ -157,6 +170,10 @@ void APP_Rangefinder_Report(void)
                           (long)(status.height_m * 1000.0f),
                           (long)(status.vertical_velocity_m_s * 1000.0f),
                           (unsigned int)status.strength,
+                          (unsigned int)APP_RANGEFINDER_MIN_STRENGTH,
+                          (unsigned long)status.rejected_samples,
+                          (unsigned long)status.strength_rejects,
+                          (unsigned long)status.step_rejects,
                           (long)(status.temperature_c * 100.0f),
                           (unsigned long)status.frames,
                           (unsigned long)status.bytes,

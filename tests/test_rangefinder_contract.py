@@ -109,7 +109,7 @@ def test_rangefinder_feeds_flow_scale_and_altitude_control() -> None:
 
     assert "APP_OpticalFlow_UpdateHeightFromRange" in rangefinder
     assert "APP_Rangefinder_GetHeightSample" in freertos
-    assert "flow_ctx.height_m = height_m;" in flow
+    assert "flow_ctx.height_m = app_flow_sensor_height_from_range(height_m);" in flow
     assert "flow_ctx.height_raw_m = raw_height_m;" in flow
     assert "flow_ctx.height_valid = valid;" in flow
     assert "attitude.z_m = -range_height_m;" in freertos
@@ -118,6 +118,25 @@ def test_rangefinder_feeds_flow_scale_and_altitude_control() -> None:
     assert "STABILIZER_ALT_HOLD_CORRECTION_LIMIT_US 80" in freertos
     assert "altitude_correction_us = 0;" in freertos
     assert "range_height_valid" in freertos
+
+
+def test_rangefinder_filters_weak_samples_without_step_change_gating() -> None:
+    header = read("App/Inc/app_rangefinder.h")
+    source = read("App/Src/app_rangefinder.c")
+
+    assert "#define APP_RANGEFINDER_MIN_STRENGTH     80U" in source
+    assert "bsp_status.latest.strength >= APP_RANGEFINDER_MIN_STRENGTH" in source
+    assert "rangefinder_sample_plausible" not in source
+    assert "APP_RANGEFINDER_NEAR_GROUND_STEP_M" not in source
+    assert "APP_RANGEFINDER_STEP_RATE_M_S" not in source
+    assert "uint32_t rejected_samples;" in header
+    assert "uint32_t strength_rejects;" in header
+    assert "uint32_t step_rejects;" in header
+    assert "min_strength=%u" in source
+    assert "strength_rej=%lu" in source
+    assert "step_rej=%lu" in source
+    assert "range_ctx.status.valid = 0U;" in source
+    assert "now - range_ctx.previous_sample_ms" in source
 
 
 def test_vofa_channel_three_reports_rangefinder_height_without_changing_frame_size() -> None:

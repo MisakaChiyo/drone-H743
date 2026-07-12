@@ -13,6 +13,7 @@
 #include "app_mag.h"
 #include "app_maint_uart.h"
 #include "app_messages.h"
+#include "app_nav_estimator.h"
 #include "app_proto.h"
 #include "app_tasks.h"
 #include "app_uart.h"
@@ -41,7 +42,7 @@
 #include <string.h>
 
 #define APP_CONTROL_CFG_MAGIC       0x44524346UL
-#define APP_CONTROL_CFG_VERSION     5U
+#define APP_CONTROL_CFG_VERSION     7U
 #define APP_CONTROL_CFG_ADDRESS     (APP_FLASH_SERVICE_SIZE_BYTES - 4096UL)
 #define APP_CONTROL_MAX_LINE        128U
 #define APP_CONTROL_HEARTBEAT_ENABLED 0U
@@ -156,6 +157,9 @@ typedef struct {
     DRV_COAX_CTRL_Params coax_params;
     uint32_t checksum;
 } APP_ControlFlashRecordV5;
+
+typedef APP_ControlFlashRecordV5 APP_ControlFlashRecordV6;
+typedef APP_ControlFlashRecordV5 APP_ControlFlashRecordV7;
 
 static APP_ControlConfig control_config;
 #if (APP_CONTROL_HEARTBEAT_ENABLED != 0U)
@@ -286,7 +290,16 @@ static const char *app_control_flash_stage(const APP_Flash_Status *status)
 
 static uint8_t app_control_baro_ok(const APP_Baro_Status *status)
 {
-    return ((status != NULL) && (status->init_status == 0)) ? 1U : 0U;
+    uint8_t id_ok;
+
+    if ((status == NULL) || (status->init_status != 0)) {
+        return 0U;
+    }
+
+    id_ok = ((status->product_id == BSP_SPL06_ID_VALUE) ||
+             (status->split_id == BSP_SPL06_ID_VALUE) ||
+             (status->txrx_id == BSP_SPL06_ID_VALUE)) ? 1U : 0U;
+    return id_ok;
 }
 
 static const char *app_control_baro_stage(const APP_Baro_Status *status)
@@ -305,6 +318,12 @@ static const char *app_control_baro_stage(const APP_Baro_Status *status)
 
     if (status->init_status != 0) {
         return "init";
+    }
+
+    if ((status->product_id != BSP_SPL06_ID_VALUE) &&
+        (status->split_id != BSP_SPL06_ID_VALUE) &&
+        (status->txrx_id != BSP_SPL06_ID_VALUE)) {
+        return "who_id";
     }
 
     return "ready";
@@ -974,6 +993,19 @@ static void app_control_apply_new_coax_param_defaults(DRV_COAX_CTRL_Params *para
     params->vel_loop_y_kd = defaults.vel_loop_y_kd;
     params->vel_loop_output_limit_m_s2 = defaults.vel_loop_output_limit_m_s2;
     params->vel_loop_i_limit_m_s2 = defaults.vel_loop_i_limit_m_s2;
+}
+
+static void app_control_apply_v7_safety_defaults(DRV_COAX_CTRL_Params *params)
+{
+    DRV_COAX_CTRL_Params defaults;
+
+    if (params == NULL) {
+        return;
+    }
+
+    DRV_COAX_CTRL_GetDefaultParams(&defaults);
+    params->tilt_limit_rad = defaults.tilt_limit_rad;
+    app_control_force_airframe_params(params);
 }
 
 static void app_control_migrate_coax_params_v4(const APP_ControlCoaxParamsV4 *legacy,
@@ -1952,6 +1984,20 @@ static void app_control_report_status(void)
     APP_IMU_Status imu_status;
     APP_OPTICAL_FLOW_Status flow_status;
     APP_MAG_Status mag_status;
+    DRV_NAV_EKF_Diagnostics ekf_diag;
+    int32_t ekf_nis_milli;
+    int32_t ekf_gate_milli;
+    int32_t ekf_innov_x_mm_s;
+    int32_t ekf_innov_y_mm_s;
+    int32_t ekf_noise_mm_s;
+    int32_t ekf_vx_mm_s;
+    int32_t ekf_vy_mm_s;
+    int32_t ekf_bias_x_mm_s2;
+    int32_t ekf_bias_y_mm_s2;
+    int32_t ekf_p0_u;
+    int32_t ekf_p1_u;
+    int32_t ekf_p2_u;
+    int32_t ekf_p3_u;
     uint32_t uart_rx_bytes = 0U;
     uint32_t uart_rx_lines = 0U;
     uint32_t uart_rx_overflows = 0U;
@@ -1965,6 +2011,20 @@ static void app_control_report_status(void)
     APP_IMU_GetStatus(&imu_status);
     APP_OpticalFlow_GetStatus(&flow_status);
     APP_MAG_GetStatus(&mag_status);
+    APP_NavEstimator_GetVelocityEKF(&ekf_diag);
+    ekf_nis_milli = (int32_t)(ekf_diag.last_nis * 1000.0f);
+    ekf_gate_milli = (int32_t)(ekf_diag.last_gate_nis * 1000.0f);
+    ekf_innov_x_mm_s = (int32_t)(ekf_diag.last_innovation_m_s[0] * 1000.0f);
+    ekf_innov_y_mm_s = (int32_t)(ekf_diag.last_innovation_m_s[1] * 1000.0f);
+    ekf_noise_mm_s = (int32_t)(ekf_diag.last_flow_noise_m_s * 1000.0f);
+    ekf_vx_mm_s = (int32_t)(ekf_diag.vel_m_s[0] * 1000.0f);
+    ekf_vy_mm_s = (int32_t)(ekf_diag.vel_m_s[1] * 1000.0f);
+    ekf_bias_x_mm_s2 = (int32_t)(ekf_diag.accel_bias_m_s2[0] * 1000.0f);
+    ekf_bias_y_mm_s2 = (int32_t)(ekf_diag.accel_bias_m_s2[1] * 1000.0f);
+    ekf_p0_u = (int32_t)(ekf_diag.covariance_diag[0] * 1000000.0f);
+    ekf_p1_u = (int32_t)(ekf_diag.covariance_diag[1] * 1000000.0f);
+    ekf_p2_u = (int32_t)(ekf_diag.covariance_diag[2] * 1000000.0f);
+    ekf_p3_u = (int32_t)(ekf_diag.covariance_diag[3] * 1000000.0f);
     APP_UART_GetStats(&uart_rx_bytes,
                       &uart_rx_lines,
                       &uart_rx_overflows,
@@ -2097,6 +2157,25 @@ static void app_control_report_status(void)
                                  (double)flow_status.vx_m_s,
                                  (double)flow_status.vy_m_s,
                                  APP_OpticalFlow_VelSourceName(flow_status.velocity_source));
+    APP_Control_QueueText("STATUS ekf init=%u pred=%lu upd=%lu rej=%lu skip=%lu nis_milli=%ld gate_milli=%ld innov_mm_s=%ld,%ld noise_mm_s=%ld vx_mm_s=%ld vy_mm_s=%ld bias_mm_s2=%ld,%ld p_u=%ld,%ld,%ld,%ld\r\n",
+                          (unsigned int)ekf_diag.initialized,
+                          (unsigned long)ekf_diag.predict_count,
+                          (unsigned long)ekf_diag.flow_update_count,
+                          (unsigned long)ekf_diag.flow_reject_count,
+                          (unsigned long)ekf_diag.flow_skip_count,
+                          (long)ekf_nis_milli,
+                          (long)ekf_gate_milli,
+                          (long)ekf_innov_x_mm_s,
+                          (long)ekf_innov_y_mm_s,
+                          (long)ekf_noise_mm_s,
+                          (long)ekf_vx_mm_s,
+                          (long)ekf_vy_mm_s,
+                          (long)ekf_bias_x_mm_s2,
+                          (long)ekf_bias_y_mm_s2,
+                          (long)ekf_p0_u,
+                          (long)ekf_p1_u,
+                          (long)ekf_p2_u,
+                          (long)ekf_p3_u);
     app_control_queue_proto_text(APP_PROTO_MSG_MAG_RECORD,
                                  "STATUS mag init=%u st=%ld type=%s addr=0x%02X who=0x%02X n=%lu raw=%d,%d,%d mgauss=%ld,%ld,%ld\r\n",
                                  (unsigned int)mag_status.initialized,
@@ -2148,7 +2227,7 @@ static void app_control_report_uart_stats(uint32_t rx_bytes,
 
 static APP_FlashService_Status app_control_load_config(void)
 {
-    APP_ControlFlashRecordV5 record;
+    APP_ControlFlashRecordV7 record;
     APP_FlashService_Status status;
     uint32_t checksum;
 
@@ -2172,6 +2251,19 @@ static APP_FlashService_Status app_control_load_config(void)
         }
         control_config = record.config;
         DRV_COAX_CTRL_SetParams(&record.coax_params);
+    } else if (((record.version == 5U) || (record.version == 6U)) &&
+               (record.size == (sizeof(record.config) + sizeof(record.coax_params)))) {
+        DRV_COAX_CTRL_Params migrated_params;
+
+        checksum = app_control_checksum((const uint8_t *)&record.config,
+                                        record.size);
+        if (checksum != record.checksum) {
+            return APP_FLASH_SERVICE_ERROR;
+        }
+        control_config = record.config;
+        migrated_params = record.coax_params;
+        app_control_apply_v7_safety_defaults(&migrated_params);
+        DRV_COAX_CTRL_SetParams(&migrated_params);
     } else if (((record.version == 3U) || (record.version == 4U)) &&
                (record.size == (sizeof(APP_ControlConfig) + sizeof(APP_ControlCoaxParamsV4)))) {
         const APP_ControlFlashRecordV4 *legacy =
@@ -2234,7 +2326,7 @@ static APP_FlashService_Status app_control_load_config(void)
 
 static APP_FlashService_Status app_control_save_config(void)
 {
-    APP_ControlFlashRecordV5 record;
+    APP_ControlFlashRecordV7 record;
     APP_FlashService_Status status;
 
     memset(&record, 0xFF, sizeof(record));

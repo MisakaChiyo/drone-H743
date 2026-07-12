@@ -9,7 +9,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#define DRV_COAX_CTRL_TILT_LIMIT_RAD 0.174533f
+#define DRV_COAX_CTRL_TILT_LIMIT_RAD 0.523599f
 #define DRV_COAX_CTRL_PI 3.141592654f
 #define DRV_COAX_CTRL_SERVO_TRAVEL_RAD \
     (DRV_COAX_CTRL_SERVO_TRAVEL_DEG * DRV_COAX_CTRL_PI / 180.0f)
@@ -276,7 +276,7 @@ void DRV_COAX_CTRL_GetDefaultParams(DRV_COAX_CTRL_Params *params)
     params->vel_y_kd = 0.0f;
     params->vel_z_kd = 0.0f;
     params->rotation_error_gain = 0.5f;
-    params->accel_xy_limit_m_s2 = 4.0f;
+    params->accel_xy_limit_m_s2 = 5.66f;
     params->accel_z_limit_m_s2 = 2.5f;
     params->vel_loop_enable = 1.0f;
     params->vel_loop_x_kp = 4.95f;

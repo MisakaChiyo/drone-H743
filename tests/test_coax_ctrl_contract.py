@@ -20,11 +20,11 @@ def test_servo_beta_direction_matches_current_hardware_wrapper() -> None:
     assert "DRV_COAX_CTRL_SERVO_BETA_SIGN" not in generated
 
 
-def test_tilt_limit_is_ten_degrees_in_wrapper_and_generated_controller() -> None:
+def test_tilt_limit_is_thirty_degrees_in_wrapper_and_generated_controller() -> None:
     source = read("Driver/Src/drv_coax_ctrl.c")
     generated = read("Driver/Generated/coax_ctrl/coax_tiltrotor_controller_codegen.c")
 
-    assert "DRV_COAX_CTRL_TILT_LIMIT_RAD 0.174533f" in source
+    assert "DRV_COAX_CTRL_TILT_LIMIT_RAD 0.523599f" in source
     assert "params->tilt_limit_rad" in generated
 
 
@@ -116,7 +116,9 @@ def test_controller_wrapper_exposes_velocity_first_vector_control_inputs() -> No
     assert "stabilizer_velocity_pid_step(&vel_pid_y,\n                                             -vel_err_y_m_s," in freertos
     assert "position_ref_x_m = 0.0f;" in freertos
     assert "reference.x_m = attitude.x_m;" in freertos
-    assert "attitude.vx_m_s = velocity_state_x_m_s;" in freertos
+    assert "stabilizer_velocity_estimator_control_ok(&vel_estimator, now)" in freertos
+    assert "attitude.vx_m_s = (velocity_control_ok != 0U) ?" in freertos
+    assert "velocity_state_x_m_s : 0.0f;" in freertos
     assert "velocity_ref_x_m_s" not in freertos
 
 
@@ -132,7 +134,7 @@ def test_roll_pitch_angle_gains_default_to_zero_as_constraints_not_primary_loop(
     assert "params->vel_x_kd = 0.0f;" in wrapper
     assert "params->vel_y_kd = 0.0f;" in wrapper
     assert "params->vel_z_kd = 0.0f;" in wrapper
-    assert "params->accel_xy_limit_m_s2 = 4.0f;" in wrapper
+    assert "params->accel_xy_limit_m_s2 = 5.66f;" in wrapper
 
 
 def test_roll_pitch_tilt_output_is_acceleration_vector_plus_rate_damping_only() -> None:

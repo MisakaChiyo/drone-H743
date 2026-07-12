@@ -14,8 +14,12 @@
 #define APP_FLOW_MIN_DT_US          1000U
 #define APP_FLOW_MAX_DT_US          100000U
 #define APP_FLOW_HEIGHT_LPF_ALPHA   0.35f
+#define APP_FLOW_RANGE_TO_SENSOR_OFFSET_M 0.09f
+#define APP_FLOW_MIN_SCALE_HEIGHT_M 0.01f
 #define APP_FLOW_MOUNT_COS_45       0.70710678118f
 #define APP_FLOW_MOUNT_SIN_45       0.70710678118f
+#define APP_FLOW_MAX_SPEED_M_S      2.50f
+#define APP_FLOW_MAX_SPEED_STEP_M_S 1.20f
 
 typedef struct {
     uint8_t initialized;
@@ -30,8 +34,11 @@ typedef struct {
     APP_OPTICAL_FLOW_Health health;
     uint32_t init_attempts;
     uint32_t recovery_count;
+    uint32_t velocity_reject_count;
     uint32_t last_init_attempt_ms;
     uint32_t last_good_ms;
+    float last_accept_vx_m_s;
+    float last_accept_vy_m_s;
     BSP_OPTICAL_FLOW_Status bsp_status;
 } APP_OpticalFlow_Context;
 
@@ -68,6 +75,43 @@ static void app_optical_flow_try_init(uint32_t now_ms)
     }
 }
 
+static float app_flow_square(float value)
+{
+    return value * value;
+}
+
+static uint8_t app_flow_velocity_plausible(float vx_m_s, float vy_m_s)
+{
+    float speed_sq = app_flow_square(vx_m_s) + app_flow_square(vy_m_s);
+    float dvx;
+    float dvy;
+    float step_sq;
+
+    if (speed_sq > app_flow_square(APP_FLOW_MAX_SPEED_M_S)) {
+        return 0U;
+    }
+
+    if (flow_ctx.last_good_ms == 0U) {
+        return 1U;
+    }
+
+    dvx = vx_m_s - flow_ctx.last_accept_vx_m_s;
+    dvy = vy_m_s - flow_ctx.last_accept_vy_m_s;
+    step_sq = app_flow_square(dvx) + app_flow_square(dvy);
+    return (step_sq <= app_flow_square(APP_FLOW_MAX_SPEED_STEP_M_S)) ? 1U : 0U;
+}
+
+static float app_flow_sensor_height_from_range(float range_height_m)
+{
+    float sensor_height_m = range_height_m - APP_FLOW_RANGE_TO_SENSOR_OFFSET_M;
+
+    if (sensor_height_m < APP_FLOW_MIN_SCALE_HEIGHT_M) {
+        sensor_height_m = APP_FLOW_MIN_SCALE_HEIGHT_M;
+    }
+
+    return sensor_height_m;
+}
+
 void APP_OpticalFlow_Init(void)
 {
     uint32_t now = HAL_GetTick();
@@ -90,7 +134,7 @@ void APP_OpticalFlow_UpdateHeightFromRange(float height_m,
                                            uint32_t sample_ms)
 {
     (void)sample_ms;
-    flow_ctx.height_m = height_m;
+    flow_ctx.height_m = app_flow_sensor_height_from_range(height_m);
     flow_ctx.height_raw_m = raw_height_m;
     flow_ctx.height_valid = valid;
 }
@@ -155,10 +199,19 @@ void APP_OpticalFlow_Step(void)
                   APP_FLOW_MOUNT_SIN_45 * sensor_vy_m_s;
     body_vy_m_s = APP_FLOW_MOUNT_SIN_45 * sensor_vx_m_s +
                   APP_FLOW_MOUNT_COS_45 * sensor_vy_m_s;
-    flow_ctx.vx_m_s = -body_vx_m_s;
-    flow_ctx.vy_m_s = -body_vy_m_s;
+    body_vx_m_s = -body_vx_m_s;
+    body_vy_m_s = -body_vy_m_s;
+    if (app_flow_velocity_plausible(body_vx_m_s, body_vy_m_s) == 0U) {
+        flow_ctx.velocity_reject_count++;
+        flow_ctx.health = APP_OPTICAL_FLOW_HEALTH_STARTING;
+        return;
+    }
+    flow_ctx.vx_m_s = body_vx_m_s;
+    flow_ctx.vy_m_s = body_vy_m_s;
     flow_ctx.velocity_valid = 1U;
     flow_ctx.last_good_ms = now;
+    flow_ctx.last_accept_vx_m_s = flow_ctx.vx_m_s;
+    flow_ctx.last_accept_vy_m_s = flow_ctx.vy_m_s;
     flow_ctx.health = APP_OPTICAL_FLOW_HEALTH_OK;
 }
 
@@ -259,6 +312,7 @@ void APP_OpticalFlow_GetStatus(APP_OPTICAL_FLOW_Status *status)
     status->health = flow_ctx.health;
     status->init_attempts = flow_ctx.init_attempts;
     status->recovery_count = flow_ctx.recovery_count;
+    status->velocity_reject_count = flow_ctx.velocity_reject_count;
     status->valid = frame->valid;
     status->version = frame->version;
     status->velocity_valid = flow_ctx.velocity_valid;
@@ -333,12 +387,13 @@ void APP_OpticalFlow_Report(void)
     height_raw_mm = (int32_t)(status.height_raw_m * 1000.0f);
     vx_mm_s = (int32_t)(status.vx_m_s * 1000.0f);
     vy_mm_s = (int32_t)(status.vy_m_s * 1000.0f);
-    APP_Control_QueueText("FLOW ok=%u init=%ld health=%u attempts=%lu recover=%lu baud=%lu bytes=%lu frames=%lu valid=0x%02X ver=%u age_ms=%lu source=%s vel_valid=%u\r\n",
+    APP_Control_QueueText("FLOW ok=%u init=%ld health=%u attempts=%lu recover=%lu vel_rej=%lu baud=%lu bytes=%lu frames=%lu valid=0x%02X ver=%u age_ms=%lu source=%s vel_valid=%u\r\n",
                           (unsigned int)status.initialized,
                           (long)status.init_status,
                           (unsigned int)status.health,
                           (unsigned long)status.init_attempts,
                           (unsigned long)status.recovery_count,
+                          (unsigned long)status.velocity_reject_count,
                           (unsigned long)status.baud_rate,
                           (unsigned long)status.bytes,
                           (unsigned long)status.frames,

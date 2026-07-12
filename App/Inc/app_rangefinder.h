@@ -26,6 +26,9 @@ typedef struct {
     uint32_t dma_events;
     uint32_t uart_errors;
     uint32_t last_uart_error;
+    uint32_t rejected_samples;
+    uint32_t strength_rejects;
+    uint32_t step_rejects;
 } APP_RangefinderStatus;
 
 void APP_Rangefinder_Init(void);

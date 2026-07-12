@@ -156,12 +156,13 @@ def test_velocity_source_prefers_flow_and_falls_back_to_imu() -> None:
     assert "velocity_imu_x_m_s = nav_state.vel_m_s[0];" in freertos
     assert "APP_OpticalFlow_GetVelocitySample(&flow_vx_m_s," in freertos
     assert "stabilizer_velocity_estimator_step(&vel_estimator," in freertos
-    assert "state->vel_m_s[0] += acc_x_m_s2 * dt_sec;" in freertos
-    assert "state->flow_lpf_m_s[0] += STABILIZER_FLOW_VEL_LPF_ALPHA *" in freertos
-    assert "STABILIZER_FLOW_CORRECTION_GAIN *" in freertos
-    assert "flow_sample_ms != state->last_flow_sample_ms" in freertos
+    assert "DRV_NAV_EKF_Predict(&state->ekf, acc_x_m_s2, acc_y_m_s2, dt_sec);" in freertos
+    assert "DRV_NAV_EKF_FuseFlow(&state->ekf," in freertos
+    assert "DRV_NAV_EKF_GetDiagnostics(&state->ekf, &state->diagnostics);" in freertos
+    assert "flow_accepted = stabilizer_velocity_estimator_step(&vel_estimator," in freertos
     assert "velocity_state_x_m_s = vel_estimator.vel_m_s[0];" in freertos
     assert "APP_OpticalFlow_SetVelocitySource(APP_OPTICAL_FLOW_VEL_SOURCE_IMU);" in freertos
+    assert "APP_OpticalFlow_SetVelocitySource(APP_OPTICAL_FLOW_VEL_SOURCE_FLOW);" in freertos
     assert "APP_OpticalFlow_GetVelocitySample" in app_flow_header
     assert "uint32_t *sample_ms" in app_flow_header
     assert "return APP_OpticalFlow_GetVelocitySample(vx_m_s, vy_m_s, &sample_ms);" in app_flow
@@ -202,11 +203,17 @@ def test_optical_flow_mount_rotation_and_range_height_are_applied_in_app_layer()
     assert "sensor_vy_m_s" in app_flow
     assert "body_vx_m_s = APP_FLOW_MOUNT_COS_45 * sensor_vx_m_s -" in app_flow
     assert "body_vy_m_s = APP_FLOW_MOUNT_SIN_45 * sensor_vx_m_s +" in app_flow
-    assert "flow_ctx.vx_m_s = -body_vx_m_s;" in app_flow
-    assert "flow_ctx.vy_m_s = -body_vy_m_s;" in app_flow
+    assert "body_vx_m_s = -body_vx_m_s;" in app_flow
+    assert "body_vy_m_s = -body_vy_m_s;" in app_flow
+    assert "app_flow_velocity_plausible(body_vx_m_s, body_vy_m_s)" in app_flow
+    assert "flow_ctx.vx_m_s = body_vx_m_s;" in app_flow
+    assert "flow_ctx.vy_m_s = body_vy_m_s;" in app_flow
     assert "APP_FLOW_HEIGHT_LPF_ALPHA" in app_flow
+    assert "#define APP_FLOW_RANGE_TO_SENSOR_OFFSET_M 0.09f" in app_flow
+    assert "#define APP_FLOW_MIN_SCALE_HEIGHT_M 0.01f" in app_flow
     assert "APP_OpticalFlow_UpdateHeightFromRange" in app_flow
-    assert "flow_ctx.height_m = height_m;" in app_flow
+    assert "app_flow_sensor_height_from_range" in app_flow
+    assert "flow_ctx.height_m = app_flow_sensor_height_from_range(height_m);" in app_flow
     assert "flow_ctx.height_raw_m = raw_height_m;" in app_flow
     assert "flow_ctx.height_valid = valid;" in app_flow
     assert "(void)pressure_pa;" in app_flow
@@ -215,6 +222,17 @@ def test_optical_flow_mount_rotation_and_range_height_are_applied_in_app_layer()
     assert "height_raw_m" in header
     assert "height_filter_alpha" in header
     assert "height_raw_mm" in app_flow
+
+
+def test_optical_flow_rejects_implausible_velocity_before_ekf() -> None:
+    app_flow = read("App/Src/app_optical_flow.c")
+    header = read("App/Inc/app_optical_flow.h")
+
+    assert "#define APP_FLOW_MAX_SPEED_M_S      2.50f" in app_flow
+    assert "#define APP_FLOW_MAX_SPEED_STEP_M_S 1.20f" in app_flow
+    assert "uint32_t velocity_reject_count;" in header
+    assert "flow_ctx.velocity_reject_count++;" in app_flow
+    assert "vel_rej=%lu" in app_flow
 
 
 def test_flow_report_includes_recent_raw_frame_statistics() -> None:

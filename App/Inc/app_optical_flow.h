@@ -25,6 +25,7 @@ typedef struct {
     APP_OPTICAL_FLOW_Health health;
     uint32_t init_attempts;
     uint32_t recovery_count;
+    uint32_t velocity_reject_count;
     uint8_t valid;
     uint8_t version;
     uint8_t velocity_valid;
